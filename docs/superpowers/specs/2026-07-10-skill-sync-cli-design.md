@@ -164,6 +164,8 @@ Responsibilities:
 
 `skill-sync deselect <skill-name>...` removes entries from the remote registry and local config. It does not delete local Skill directories.
 
+`select` and `deselect` modify `registry.yaml` in the local sync repository but do not commit immediately. The next `push` is allowed to include these expected registry changes in its commit. Other unrelated dirty sync repository changes still cause `push` to stop.
+
 ### `skill-sync status [--json]`
 
 Report local, registry, and remote state.
@@ -215,8 +217,9 @@ Responsibilities:
 - stop if remote has commits that are not present locally
 - compute local Skill hashes before copying
 - copy selected Skill directories into `skills/<skill-name>/`
-- commit only when content changed
+- commit only when Skill content or expected registry changes changed
 - push to the configured remote
+- after a successful push, update local config `last_installed_hash` for each pushed Skill to the deterministic source hash
 
 `push` operates on all selected Skills by default. `--skill <name>` may be repeated.
 
@@ -261,6 +264,7 @@ git rev-list --left-right --count HEAD...origin/<branch>
 Stop conditions:
 
 - dirty sync repository before pull, push, or sync
+- for push, dirty changes are allowed only when they are expected `registry.yaml` changes from `select` or `deselect`
 - local branch and upstream diverged
 - remote branch missing for commands that require a remote
 - unrelated histories
