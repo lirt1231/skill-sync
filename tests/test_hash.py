@@ -1,5 +1,6 @@
 import hashlib
 import os
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,19 @@ def write_file(root: Path, relative_path: str, data: bytes) -> None:
 
 
 def expected_hash(entries: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for relative_path in sorted(entries):
+        path_bytes = relative_path.encode("utf-8")
+        content = entries[relative_path]
+        digest.update(b"file\0")
+        digest.update(struct.pack(">Q", len(path_bytes)))
+        digest.update(path_bytes)
+        digest.update(struct.pack(">Q", len(content)))
+        digest.update(content)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def old_delimiter_hash(entries: dict[str, bytes]) -> str:
     digest = hashlib.sha256()
     for relative_path in sorted(entries):
         digest.update(relative_path.encode("utf-8"))
@@ -97,6 +111,30 @@ class HashSkillDirTest(unittest.TestCase):
 
             write_file(root, "data/blob.bin", bytes([0, 1, 2, 10, 13, 254]))
             self.assertNotEqual(hash_skill_dir(root), expected_hash(entries))
+
+    def test_hash_uses_length_prefixes_to_avoid_delimiter_framing_collisions(self):
+        first_entries = {
+            "SKILL.md": b"# Example\n",
+            "a": b"x\0b\0",
+        }
+        second_entries = {
+            "SKILL.md": b"# Example\n",
+            "a": b"x",
+            "b": b"",
+        }
+        self.assertEqual(old_delimiter_hash(first_entries), old_delimiter_hash(second_entries))
+
+        with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
+            first = Path(first_dir)
+            second = Path(second_dir)
+            for relative_path, data in first_entries.items():
+                write_file(first, relative_path, data)
+            for relative_path, data in second_entries.items():
+                write_file(second, relative_path, data)
+
+            self.assertEqual(hash_skill_dir(first), expected_hash(first_entries))
+            self.assertEqual(hash_skill_dir(second), expected_hash(second_entries))
+            self.assertNotEqual(hash_skill_dir(first), hash_skill_dir(second))
 
     @unittest.skipIf(not hasattr(os, "symlink"), "symlinks are unsupported on this platform")
     def test_hash_rejects_symlinks(self):

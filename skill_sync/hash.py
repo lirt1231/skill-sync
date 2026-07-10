@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import struct
 from pathlib import Path
 
 IGNORED_DIR_NAMES = frozenset({"__pycache__", ".git"})
@@ -26,8 +27,8 @@ def hash_skill_dir(path: str | Path) -> str:
     """Return the deterministic SHA-256 content hash for a Skill directory.
 
     The digest is computed over regular files in sorted POSIX relative path
-    order. For each file, the relative path, a NUL byte, the exact file bytes,
-    and another NUL byte are added to the digest.
+    order. Each file is framed with a literal tag and explicit path/content
+    byte lengths so binary content cannot create ambiguous boundaries.
     """
     root = Path(path)
     if root.is_symlink():
@@ -37,11 +38,17 @@ def hash_skill_dir(path: str | Path) -> str:
 
     digest = hashlib.sha256()
     for relative_path, file_path in _iter_hashable_files(root):
-        digest.update(relative_path.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(file_path.read_bytes())
-        digest.update(b"\0")
+        _update_file_hash(digest, relative_path, file_path.read_bytes())
     return f"sha256:{digest.hexdigest()}"
+
+
+def _update_file_hash(digest, relative_path: str, content: bytes) -> None:
+    path_bytes = relative_path.encode("utf-8")
+    digest.update(b"file\0")
+    digest.update(struct.pack(">Q", len(path_bytes)))
+    digest.update(path_bytes)
+    digest.update(struct.pack(">Q", len(content)))
+    digest.update(content)
 
 
 def _iter_hashable_files(root: Path) -> list[tuple[str, Path]]:

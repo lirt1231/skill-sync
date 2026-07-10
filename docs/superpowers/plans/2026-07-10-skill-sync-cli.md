@@ -33,7 +33,7 @@
 - Create: `skill_sync/hash.py`
 - Test: `tests/test_hash.py`
 
-- [ ] Write tests for deterministic hashes independent of creation order, ignored files, binary content, and symlink rejection.
+- [ ] Write tests for deterministic hashes independent of creation order, ignored files, binary content, binary content with NUL bytes that could collide under delimiter-only framing, and symlink rejection.
 - [ ] Run `python -m unittest tests.test_hash` and verify expected failures.
 - [ ] Implement `hash_skill_dir(path) -> str` and shared ignore predicates.
 - [ ] Run `python -m unittest tests.test_hash` and verify pass.

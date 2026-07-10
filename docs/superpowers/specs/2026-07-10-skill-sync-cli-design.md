@@ -305,12 +305,12 @@ Skill content hashes use SHA-256 and are reported as `sha256:<hex>`.
 Rules:
 
 - traverse files in sorted relative path order using POSIX-style `/` separators
-- hash each relative path as UTF-8, then a NUL byte, then file bytes, then another NUL byte
+- hash each file with unambiguous framing: the literal bytes `file\0`, an unsigned 64-bit big-endian path byte length, the UTF-8 relative path bytes, an unsigned 64-bit big-endian content byte length, and the exact file bytes
 - ignore directories and files excluded by copy rules
 - ignore empty directories
 - do not normalize line endings
 - include regular file bytes exactly as stored, including binary files
-- reject symlinks by default with a clear error; a future version may add explicit symlink policy
+- reject symlinks by default with a clear error, except inside ignored directories that are not traversed; a future version may add explicit symlink policy
 - ignore file permissions in the hash
 
 ## Error Handling
