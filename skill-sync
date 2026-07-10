@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Executable shim for the skill-sync CLI."""
+
+from skill_sync.cli import main
+
+
+raise SystemExit(main())

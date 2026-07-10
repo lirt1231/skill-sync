@@ -1,0 +1,207 @@
+"""Command-line interface for skill-sync."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections.abc import Sequence
+from typing import Any
+
+from skill_sync import core
+from skill_sync.errors import SkillSyncError
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the skill-sync CLI and return a process exit code."""
+
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        result = args.handler(args)
+    except SkillSyncError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if result is not None:
+        print(result)
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="skill-sync")
+    parser.add_argument(
+        "--config",
+        help="path to the local skill-sync config file",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = subparsers.add_parser("init", help="initialize skill-sync state")
+    init_parser.add_argument("--repo", required=True, help="Git URL or local repository path")
+    init_parser.add_argument("--sync-dir", help="local sync repository directory")
+    init_parser.add_argument("--branch", default="main", help="Git branch to synchronize")
+    init_parser.add_argument("--platform", default="codex", help="Skill platform")
+    init_parser.set_defaults(handler=_handle_init)
+
+    scan_parser = subparsers.add_parser("scan", help="list candidate local Skills")
+    scan_parser.add_argument("--platform", default="codex", help="Skill platform")
+    scan_parser.add_argument("--json", action="store_true", help="print JSON output")
+    scan_parser.set_defaults(handler=_handle_scan)
+
+    select_parser = subparsers.add_parser("select", help="select local Skills for sync")
+    select_parser.add_argument("items", nargs="+", help="Skill names or paths")
+    select_parser.add_argument("--platform", default="codex", help="Skill platform")
+    select_parser.add_argument(
+        "--allow-external",
+        action="store_true",
+        help="allow selecting a Skill outside the platform root",
+    )
+    select_parser.set_defaults(handler=_handle_select)
+
+    deselect_parser = subparsers.add_parser("deselect", help="deselect Skills")
+    deselect_parser.add_argument("names", nargs="+", help="Skill names")
+    deselect_parser.set_defaults(handler=_handle_deselect)
+
+    status_parser = subparsers.add_parser("status", help="show synchronization status")
+    status_parser.add_argument("--json", action="store_true", help="print JSON output")
+    _add_skill_filter(status_parser)
+    status_parser.set_defaults(handler=_handle_status)
+
+    pull_parser = subparsers.add_parser("pull", help="pull and install remote Skill changes")
+    _add_skill_filter(pull_parser)
+    pull_parser.set_defaults(handler=_handle_pull)
+
+    push_parser = subparsers.add_parser("push", help="push local Skill changes")
+    _add_skill_filter(push_parser)
+    push_parser.add_argument("--message", help="commit message")
+    push_parser.set_defaults(handler=_handle_push)
+
+    sync_parser = subparsers.add_parser("sync", help="run the safe default sync workflow")
+    _add_skill_filter(sync_parser)
+    sync_parser.set_defaults(handler=_handle_sync)
+
+    return parser
+
+
+def _add_skill_filter(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--skill",
+        action="append",
+        dest="skills",
+        help="restrict the command to one selected Skill; repeatable",
+    )
+
+
+def _handle_init(args: argparse.Namespace) -> str:
+    result = core.init_sync(
+        args.repo,
+        sync_dir=args.sync_dir,
+        branch=args.branch,
+        platform=args.platform,
+        config_path=args.config,
+    )
+    return (
+        f"Initialized skill-sync repo: {result['sync_repo_path']} "
+        f"(branch {result['branch']}, platform {result['platform']})"
+    )
+
+
+def _handle_scan(args: argparse.Namespace) -> str:
+    result = core.scan_skills(platform=args.platform, config_path=args.config)
+    if args.json:
+        return _json(result)
+    if not result:
+        return "No Skills found."
+    lines = []
+    for item in result:
+        flags = []
+        if item.get("selected"):
+            flags.append("selected")
+        if item.get("external"):
+            flags.append("external")
+        suffix = f" ({', '.join(flags)})" if flags else ""
+        lines.append(f"{item['name']}{suffix}: {item['path']}")
+    return "\n".join(lines)
+
+
+def _handle_select(args: argparse.Namespace) -> str:
+    result = core.select_skills(
+        args.items,
+        platform=args.platform,
+        allow_external=args.allow_external,
+        config_path=args.config,
+    )
+    return f"Selected: {_names(result.get('selected'))}"
+
+
+def _handle_deselect(args: argparse.Namespace) -> str:
+    result = core.deselect_skills(args.names, config_path=args.config)
+    return f"Deselected: {_names(result.get('deselected'))}"
+
+
+def _handle_status(args: argparse.Namespace) -> str:
+    result = core.status(skill_names=args.skills, config_path=args.config)
+    if args.json:
+        return _json(result)
+    return _format_status(result)
+
+
+def _handle_pull(args: argparse.Namespace) -> str:
+    result = core.pull(skill_names=args.skills, config_path=args.config)
+    return f"Pulled: {_names(result.get('pulled'))}"
+
+
+def _handle_push(args: argparse.Namespace) -> str:
+    result = core.push(skill_names=args.skills, config_path=args.config, message=args.message)
+    suffix = " (committed)" if result.get("committed") else " (no commit needed)"
+    return f"Pushed: {_names(result.get('pushed'))}{suffix}"
+
+
+def _handle_sync(args: argparse.Namespace) -> str:
+    result = core.sync(skill_names=args.skills, config_path=args.config)
+    if result.get("noop"):
+        return "No changes to sync."
+    if "pulled" in result:
+        return f"Pulled: {_names(result.get('pulled'))}"
+    if "pushed" in result:
+        suffix = " (committed)" if result.get("committed") else " (no commit needed)"
+        return f"Pushed: {_names(result.get('pushed'))}{suffix}"
+    return f"Synced: {_names(result.get('synced'))}"
+
+
+def _format_status(result: dict[str, Any]) -> str:
+    repo = result["repo"]
+    clean_label = "clean" if repo["clean"] else "dirty"
+    lines = [
+        (
+            f"Repo: {repo['path']} "
+            f"(branch {repo['branch']}, {clean_label}, "
+            f"ahead {repo['ahead']}, behind {repo['behind']}, diverged {repo['diverged']})"
+        )
+    ]
+    skills = result.get("skills", [])
+    if not skills:
+        lines.append("No selected Skills.")
+        return "\n".join(lines)
+
+    for skill in skills:
+        change_label = "changed" if skill.get("changed_local") else "unchanged"
+        lines.append(
+            f"- {skill['name']} [{skill['platform']}] {change_label}: {skill['local_path']}"
+        )
+    return "\n".join(lines)
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True)
+
+
+def _names(value: Any) -> str:
+    if not value:
+        return "none"
+    return ", ".join(str(item) for item in value)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
