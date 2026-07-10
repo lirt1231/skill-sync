@@ -20,7 +20,16 @@ Use a private Git repository as the canonical remote source. The CLI invokes the
 
 Use Python 3 and the standard library. Optional dependencies are avoided so the tool can run on fresh developer machines with only Python and Git installed.
 
-Use `registry.yaml` as the sole synchronization allowlist. A Skill is synced only if it is listed in the registry.
+Use `registry.yaml` as the sole remote synchronization allowlist. A Skill is synced only if it is listed in the registry.
+
+Because Python's standard library does not include a YAML parser, `registry.yaml` uses a deliberately small YAML subset that the CLI owns:
+
+- two-space indentation
+- string, boolean, and integer scalar values only
+- mappings only; no anchors, aliases, tags, multiline strings, or flow style
+- comments and blank lines allowed
+
+The CLI preserves unknown top-level and per-Skill fields when possible, but may normalize formatting when writing.
 
 Use content hashes to detect whether local Skill directories changed. Use Git commits as the durable remote version and update history.
 
@@ -32,7 +41,7 @@ Separate synchronization logic from terminal UI so a later frontend can reuse th
 
 The project repository contains the CLI implementation and tests. The user's private Skill sync repository is a separate Git repository managed by the CLI.
 
-The remote Skill sync repository stores:
+The remote Skill sync repository stores portable state only:
 
 ```text
 registry.yaml
@@ -48,12 +57,36 @@ skills/
 version: 1
 skills:
   skill-name:
-    source_platform: codex
     selected: true
-    local_path: /absolute/path/to/skill-name
+    source_platform: codex
+    display_name: skill-name
 ```
 
 The CLI must tolerate unknown registry fields so future UI metadata can be added without breaking older versions.
+
+Machine-local state is not committed to the sync repository. It is stored in a JSON config file at:
+
+```text
+${XDG_CONFIG_HOME:-~/.config}/skill-sync/config.json
+```
+
+The local config records:
+
+```json
+{
+  "sync_repo_path": "/absolute/path/to/local/sync/repo",
+  "platform": "codex",
+  "branch": "main",
+  "skills": {
+    "skill-name": {
+      "local_path": "/absolute/path/to/local/skill-name",
+      "last_installed_hash": "sha256:..."
+    }
+  }
+}
+```
+
+Absolute local paths must never be written to `registry.yaml`.
 
 ## Platform Adapters
 
@@ -74,12 +107,23 @@ The adapter does not parse or reinterpret Skill contents. A valid Skill director
 
 Initialize local CLI state and connect to a private Skill sync Git repository.
 
+Usage:
+
+```text
+skill-sync init --repo <git-url-or-local-path> [--sync-dir <path>] [--branch <name>] [--platform codex]
+```
+
 Responsibilities:
 
 - create the sync worktree if missing
-- clone or initialize the configured Git repository
+- clone the configured Git repository into `--sync-dir`, or use the existing repository at `--sync-dir`
+- if `--repo` is a local path that does not exist, initialize it as a normal non-bare Git repository
 - create `registry.yaml` if missing
 - verify `git` is available
+- store `sync_repo_path`, `branch`, and `platform` in local config
+- default `--sync-dir` to `${XDG_DATA_HOME:-~/.local/share}/skill-sync/repo`
+- default `--branch` to `main`
+- assume Git authentication is handled by the user's existing Git credential setup; report Git auth failures without trying to manage credentials
 
 ### `skill-sync scan`
 
@@ -89,18 +133,36 @@ Responsibilities:
 
 - detect directories containing `SKILL.md`
 - show whether each candidate is already selected
+- mark candidates outside the adapter's default user Skill root as `external`
 - avoid modifying registry or remote state
+
+Usage:
+
+```text
+skill-sync scan [--platform codex] [--json]
+```
 
 ### `skill-sync select`
 
 Add one or more local user-created Skills to `registry.yaml`.
+
+Usage:
+
+```text
+skill-sync select <skill-name-or-path>... [--platform codex] [--allow-external]
+```
 
 Responsibilities:
 
 - require explicit Skill names or paths
 - reject paths that do not contain `SKILL.md`
 - store the resolved local path
+- add portable selection metadata to remote `registry.yaml`
 - never select third-party Skills implicitly
+- require `--allow-external` when selecting a path outside the adapter's default user Skill root
+- if a selected name already exists with a different local path, stop and require the user to pass `skill-sync deselect <skill-name>` first
+
+`skill-sync deselect <skill-name>...` removes entries from the remote registry and local config. It does not delete local Skill directories.
 
 ### `skill-sync status [--json]`
 
@@ -114,6 +176,20 @@ Responsibilities:
 - show whether remote has commits not present locally
 - support a JSON output mode for the future frontend
 
+Status operates on all selected Skills by default. `--skill <name>` may be repeated to restrict output.
+
+The JSON output schema is versioned:
+
+```json
+{
+  "schema_version": 1,
+  "repo": {"path": "...", "branch": "main", "clean": true, "ahead": 0, "behind": 0, "diverged": false},
+  "skills": [
+    {"name": "skill-name", "platform": "codex", "local_path": "...", "local_hash": "sha256:...", "remote_hash": "sha256:...", "changed_local": false, "selected": true}
+  ]
+}
+```
+
 ### `skill-sync pull`
 
 Bring remote changes into the local sync repository and install updated selected Skills into the platform Skill directory.
@@ -122,8 +198,12 @@ Responsibilities:
 
 - fetch remote before merging
 - stop if the local sync repository has uncommitted changes
+- stop if any destination local Skill has changed relative to its recorded `last_installed_hash`
 - stop if Git reports conflicts
 - copy updated Skills into local platform directories only after Git state is clean
+- update `last_installed_hash` after a successful install
+
+`pull` operates on all selected Skills by default. `--skill <name>` may be repeated.
 
 ### `skill-sync push`
 
@@ -137,6 +217,8 @@ Responsibilities:
 - copy selected Skill directories into `skills/<skill-name>/`
 - commit only when content changed
 - push to the configured remote
+
+`push` operates on all selected Skills by default. `--skill <name>` may be repeated.
 
 ### `skill-sync sync`
 
@@ -154,7 +236,48 @@ The CLI must never overwrite when both local and remote changed.
 
 If local selected Skills changed and remote has new commits, the command stops with a clear message. The user must manually resolve by pulling, inspecting conflicts or differences, and deciding which content should win.
 
+Local changed means the current hash of the local Skill directory differs from the local config's `last_installed_hash` or, if no baseline exists, differs from the corresponding `skills/<name>/` directory in the current sync repository checkout.
+
+Remote changed means the configured branch has commits locally behind its upstream after `git fetch`.
+
 Git merge conflicts are not auto-resolved.
+
+## Git Semantics
+
+The CLI uses one configured branch, default `main`.
+
+Before operations that compare local and remote state, it runs:
+
+```text
+git fetch origin <branch>
+```
+
+It computes ahead/behind using:
+
+```text
+git rev-list --left-right --count HEAD...origin/<branch>
+```
+
+Stop conditions:
+
+- dirty sync repository before pull, push, or sync
+- local branch and upstream diverged
+- remote branch missing for commands that require a remote
+- unrelated histories
+- force-push detected as divergence
+- push rejected by Git
+
+Pull uses fast-forward only:
+
+```text
+git merge --ff-only origin/<branch>
+```
+
+Push uses:
+
+```text
+git push origin HEAD:<branch>
+```
 
 ## File Copy Rules
 
@@ -163,9 +286,28 @@ When copying Skill directories:
 - preserve relative paths and file contents
 - include hidden files inside selected Skill directories
 - exclude common generated noise such as `__pycache__/`, `.DS_Store`, and `.git/`
-- replace the destination Skill directory atomically enough to avoid mixed old/new contents on normal interruption
+- copy into a temporary directory under the destination parent, then replace the destination directory
+- keep a timestamped backup of the previous destination directory until the replacement succeeds
+- remove the backup only after the final content hash matches the source hash
 
-The implementation can stage through a temporary directory and then replace the target directory.
+If replacement fails, the CLI restores the backup when possible and reports the failure.
+
+Cross-device moves are avoided by creating the temporary directory in the same parent as the destination.
+
+## Hash Algorithm
+
+Skill content hashes use SHA-256 and are reported as `sha256:<hex>`.
+
+Rules:
+
+- traverse files in sorted relative path order using POSIX-style `/` separators
+- hash each relative path as UTF-8, then a NUL byte, then file bytes, then another NUL byte
+- ignore directories and files excluded by copy rules
+- ignore empty directories
+- do not normalize line endings
+- include regular file bytes exactly as stored, including binary files
+- reject symlinks by default with a clear error; a future version may add explicit symlink policy
+- ignore file permissions in the hash
 
 ## Error Handling
 
@@ -191,6 +333,12 @@ Test coverage should include:
 - Git wrapper behavior using temporary local bare repositories where practical
 - CLI JSON status output shape
 - conflict policy for local-changed plus remote-ahead
+- pull refusing to overwrite local changes
+- local config not leaking absolute paths into remote registry
+- remote/local divergence stop conditions
+- explicit external Skill selection guard
+- invalid or missing local paths
+- JSON schema stability
 
 ## Future Frontend Compatibility
 
