@@ -107,6 +107,7 @@ function escapeJs(value) {
 }
 
 $("#sync").onclick = () => action("/api/sync");
+$("#link-all").onclick = () => action("/api/link");
 $("#refresh").onclick = getState;
 $("#delete-selected").onclick = deleteSelected;
 getState().catch((error) => toast(error.message));

@@ -10,6 +10,8 @@ class WebUiTest(unittest.TestCase):
     def test_static_ui_assets_exist(self):
         for name in ("index.html", "style.css", "app.js"):
             self.assertTrue((STATIC_DIR / name).is_file())
+        self.assertIn('id="link-all"', (STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+        self.assertIn('action("/api/link")', (STATIC_DIR / "app.js").read_text(encoding="utf-8"))
 
     def test_state_combines_status_and_link_matrix(self):
         with mock.patch("skill_sync.web.core.doctor", return_value={

@@ -3,7 +3,7 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Skill Sync</title><link rel="stylesheet" href="/style.css"></head>
 <body>
   <main>
-    <header><div><p class="eyebrow">GLOBAL AGENT SKILLS</p><h1>Skill Sync</h1><p class="subtitle">一个目录，连接每一个 Agent。</p></div><button id="sync" class="primary">立即同步</button></header>
+    <header><div><p class="eyebrow">GLOBAL AGENT SKILLS</p><h1>Skill Sync</h1><p class="subtitle">一个目录，连接每一个 Agent。</p></div><div><button id="link-all">一键链接全部 Agents</button> <button id="sync" class="primary">立即同步</button></div></header>
     <section id="cards" class="cards"></section>
     <section class="panel"><div class="panel-head"><div><h2>从 Agent 导入</h2><p>将 Codex 或 Claude Code 中的本地 Skill 迁移到全局目录，并把原目录替换成软链接。</p></div></div><div id="imports"></div></section>
     <section class="panel"><div class="panel-head"><div><h2>Skill 安装矩阵</h2><p>真实内容保存在 ~/.agents/skills，Agent 目录仅建立链接。</p></div><div><button id="delete-selected">删除所选</button> <button id="refresh">刷新</button></div></div><div class="table-wrap"><table><thead id="head"></thead><tbody id="body"></tbody></table></div></section>
