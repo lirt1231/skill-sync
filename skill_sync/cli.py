@@ -107,6 +107,11 @@ def _build_parser() -> argparse.ArgumentParser:
     web_parser.add_argument("--no-browser", action="store_true")
     web_parser.set_defaults(handler=_handle_web)
 
+    agent_parser = subparsers.add_parser("agent", help="enable or disable an Agent sync target")
+    agent_parser.add_argument("action", choices=("enable", "disable"))
+    agent_parser.add_argument("name", choices=("codex", "workbuddy", "kimi", "claude"))
+    agent_parser.set_defaults(handler=_handle_agent)
+
     return parser
 
 
@@ -226,6 +231,14 @@ def _handle_web(args: argparse.Namespace) -> None:
 
     serve(host=args.host, port=args.port, config_path=args.config, open_browser=not args.no_browser)
     return None
+
+
+def _handle_agent(args: argparse.Namespace) -> str:
+    if args.action == "disable":
+        result = core.disable_agent_sync(args.name, config_path=args.config)
+        return f"Disabled Agent sync: {result['disabled']} (removed {len(result['unlinked'])} links)"
+    result = core.enable_agent_sync(args.name, config_path=args.config)
+    return f"Enabled Agent sync: {result['enabled']}"
 
 
 def _format_status(result: dict[str, Any]) -> str:

@@ -627,7 +627,17 @@ def link_skills(
     registry = _load_local_registry(config)
     targets = _target_names(registry, skill_names)
     requested_agents = set(agent_names or ())
-    agents = [a for a in detect_agents() if a.detected and (not requested_agents or a.name in requested_agents)]
+    disabled_agents = _disabled_agents(config)
+    if requested_agents & disabled_agents:
+        raise SkillSyncError(
+            "Agent synchronization is disabled: "
+            + ", ".join(sorted(requested_agents & disabled_agents))
+        )
+    agents = [
+        a
+        for a in detect_agents()
+        if a.detected and a.name not in disabled_agents and (not requested_agents or a.name in requested_agents)
+    ]
     unknown = requested_agents - {a.name for a in detect_agents()}
     if unknown:
         raise SkillSyncError("unknown Agent: " + ", ".join(sorted(unknown)))
@@ -676,6 +686,7 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
     config = _load_local_config(config_path)
     registry = _load_local_registry(config)
     agents = detect_agents()
+    disabled_agents = _disabled_agents(config)
     issues: list[dict[str, str]] = []
     matrix: list[dict[str, str]] = []
     for name in sorted(_selected_names(registry)):
@@ -686,16 +697,59 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
         for agent in agents:
             if not agent.detected:
                 continue
+            if agent.name in disabled_agents:
+                matrix.append({"skill": name, "agent": agent.name, "state": "disabled"})
+                continue
             state = link_state(source, agent.skills_dir / name)
             matrix.append({"skill": name, "agent": agent.name, "state": state})
             if state not in {"linked", "missing"}:
                 issues.append({"type": state, "skill": name, "agent": agent.name})
     return {
         "skills_root": str(_global_skill_root(config)),
-        "agents": [{"name": a.name, "display_name": a.display_name, "skills_dir": str(a.skills_dir), "detected": a.detected} for a in agents],
+        "agents": [{"name": a.name, "display_name": a.display_name, "skills_dir": str(a.skills_dir), "detected": a.detected, "enabled": a.name not in disabled_agents} for a in agents],
         "matrix": matrix,
         "issues": issues,
     }
+
+
+def disable_agent_sync(
+    agent_name: str,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Persistently disable an Agent target and remove its managed links."""
+    config_file = _config_path(config_path)
+    config = load_config(config_file)
+    known_agents = {agent.name for agent in detect_agents()}
+    if agent_name not in known_agents:
+        raise SkillSyncError(f"unknown Agent: {agent_name}")
+    disabled_agents = _disabled_agents(config)
+    disabled_agents.add(agent_name)
+    config["disabled_agents"] = sorted(disabled_agents)
+    save_config(config_file, config)
+    removed = unlink_skills(agent_names=[agent_name], config_path=config_file)
+    return {"disabled": agent_name, **removed}
+
+
+def enable_agent_sync(
+    agent_name: str,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Re-enable an Agent target without creating links automatically."""
+    config_file = _config_path(config_path)
+    config = load_config(config_file)
+    known_agents = {agent.name for agent in detect_agents()}
+    if agent_name not in known_agents:
+        raise SkillSyncError(f"unknown Agent: {agent_name}")
+    config["disabled_agents"] = sorted(_disabled_agents(config) - {agent_name})
+    save_config(config_file, config)
+    return {"enabled": agent_name}
+
+
+def _disabled_agents(config: dict[str, Any]) -> set[str]:
+    value = config.get("disabled_agents", [])
+    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+        raise SkillSyncError("configured disabled_agents must be a list of strings")
+    return set(value)
 
 
 def scan_import_candidates(

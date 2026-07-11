@@ -5,7 +5,14 @@ from unittest import mock
 
 from skill_sync.agents import AgentTarget
 from skill_sync.config import empty_config, save_config
-from skill_sync.core import delete_global_skills, import_agent_skills, scan_import_candidates
+from skill_sync.core import (
+    disable_agent_sync,
+    enable_agent_sync,
+    import_agent_skills,
+    delete_global_skills,
+    link_skills,
+    scan_import_candidates,
+)
 from skill_sync.errors import SkillSyncError
 from skill_sync.registry import empty_registry, load_registry, save_registry
 
@@ -90,3 +97,20 @@ class ImportAgentSkillsTest(unittest.TestCase):
             with self.assertRaisesRegex(SkillSyncError, "symlink"):
                 delete_global_skills(["alpha"], config_path=self.config_path)
         self.assertTrue(target.exists())
+
+    def test_disable_agent_removes_links_and_blocks_future_link_operations(self):
+        destination = self.write_skill(self.global_root, "alpha")
+        self.agent_root.mkdir(parents=True, exist_ok=True)
+        source = self.agent_root / "alpha"
+        source.symlink_to(destination, target_is_directory=True)
+        save_registry(self.repo / "registry.yaml", {
+            "version": 2,
+            "skills": {"alpha": {"selected": True, "display_name": "alpha", "targets": "codex"}},
+        })
+        with mock.patch("skill_sync.core.detect_agents", return_value=[self.agent]):
+            result = disable_agent_sync("codex", config_path=self.config_path)
+            self.assertEqual(result["disabled"], "codex")
+            self.assertFalse(source.exists())
+            with self.assertRaisesRegex(SkillSyncError, "disabled"):
+                link_skills(agent_names=["codex"], config_path=self.config_path)
+            self.assertEqual(enable_agent_sync("codex", config_path=self.config_path)["enabled"], "codex")

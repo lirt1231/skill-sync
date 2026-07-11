@@ -76,6 +76,7 @@ function syncCell(skill) {
 function agentCell(skill, agent) {
   if (!skill.selected) return '<td><span class="badge off">—</span></td>';
   const value = skill.agents[agent.name];
+  if (value === "disabled") return '<td><span class="badge off">已禁用</span></td>';
   const linked = value === "linked";
   return `<td><span class="badge ${linked ? "" : "off"}">${linked ? "已链接" : value}</span><button class="link-action" onclick="action('/api/${linked ? "unlink" : "link"}',{skills:['${escapeJs(skill.name)}'],agents:['${escapeJs(agent.name)}']})">${linked ? "移除" : "链接"}</button></td>`;
 }

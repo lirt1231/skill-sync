@@ -140,6 +140,16 @@ class CliTest(unittest.TestCase):
         import_skills.assert_called_once_with(["alpha"], "codex", config_path="/tmp/config.json")
         self.assertIn("Imported: alpha", stdout)
 
+    def test_agent_disable_dispatches_to_core(self):
+        with mock.patch.object(
+            cli.core, "disable_agent_sync", return_value={"disabled": "kimi", "unlinked": []}
+        ) as disable:
+            code, stdout, stderr = run_cli(["agent", "disable", "kimi"])
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        disable.assert_called_once_with("kimi", config_path=None)
+        self.assertIn("Disabled Agent sync: kimi", stdout)
+
     def test_repeated_skill_filters_dispatch_to_status_pull_push(self):
         status_result = {
             "schema_version": 1,

@@ -36,6 +36,7 @@ def empty_config() -> dict[str, Any]:
         "platform": "codex",
         "skills_root": str(Path.home() / ".agents" / "skills"),
         "branch": "main",
+        "disabled_agents": [],
         "skills": {},
     }
 
@@ -90,3 +91,8 @@ def _validate_config_shape(config: Any) -> None:
     skills = config.get("skills")
     if not isinstance(skills, dict):
         raise ValueError("Config skills must be a mapping")
+    disabled_agents = config.get("disabled_agents", [])
+    if not isinstance(disabled_agents, list) or not all(
+        isinstance(name, str) for name in disabled_agents
+    ):
+        raise ValueError("Config disabled_agents must be a list of strings")
