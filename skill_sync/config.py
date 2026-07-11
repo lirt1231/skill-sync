@@ -29,11 +29,12 @@ def default_config_path(
 
 
 def empty_config() -> dict[str, Any]:
-    """Return a new empty local config with default platform settings."""
+    """Return a new empty local config."""
 
     return {
         "sync_repo_path": None,
         "platform": "codex",
+        "skills_root": str(Path.home() / ".agents" / "skills"),
         "branch": "main",
         "skills": {},
     }

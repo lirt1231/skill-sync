@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from skill_sync import git
+from skill_sync.agents import detect_agents
 from skill_sync.config import default_config_path, load_config, save_config
 from skill_sync.copying import copy_skill_dir
 from skill_sync.errors import SkillSyncError
 from skill_sync.hash import hash_skill_dir
+from skill_sync.linking import create_directory_link, link_state, remove_directory_link
 from skill_sync.platforms import get_adapter
 from skill_sync.registry import empty_registry, load_registry, save_registry
 
@@ -26,14 +28,16 @@ def init_sync(
     repo: str | Path,
     sync_dir: str | Path | None = None,
     branch: str = "main",
-    platform: str = "codex",
+    platform: str | None = "codex",
+    skills_root: str | Path | None = None,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Initialize local state and connect it to a sync repository."""
 
     try:
         git.ensure_git_available()
-        get_adapter(platform)
+        if platform is not None:
+            get_adapter(platform)
 
         repo_text = str(repo)
         repo_path = Path(repo_text).expanduser()
@@ -62,7 +66,19 @@ def init_sync(
         config = load_config(config_file)
         config["sync_repo_path"] = str(destination.absolute())
         config["branch"] = branch
-        config["platform"] = platform
+        if platform is not None:
+            config["platform"] = platform
+        else:
+            config.pop("platform", None)
+        config["skills_root"] = str(
+            Path(skills_root).expanduser().resolve()
+            if skills_root is not None
+            else (
+                get_adapter(platform).default_skill_dir()
+                if platform is not None
+                else Path.home() / ".agents" / "skills"
+            )
+        )
         config.setdefault("skills", {})
         save_config(config_file, config)
 
@@ -70,6 +86,7 @@ def init_sync(
             "sync_repo_path": str(destination.absolute()),
             "branch": branch,
             "platform": platform,
+            "skills_root": config["skills_root"],
             "registry_path": str(registry_path.absolute()),
         }
     except (git.GitError, ValueError, OSError) as exc:
@@ -77,7 +94,7 @@ def init_sync(
 
 
 def scan_skills(
-    platform: str = "codex",
+    platform: str | None = "codex",
     skill_dir: str | Path | None = None,
     config_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
@@ -87,7 +104,12 @@ def scan_skills(
         config = _load_local_config(config_path)
         registry = _load_local_registry(config)
         selected_names = _selected_names(registry)
-        adapter = get_adapter(platform)
+        if platform is None:
+            root = _global_skill_root(config, skill_dir)
+            adapter = get_adapter("codex")
+            skill_dir = root
+        else:
+            adapter = get_adapter(platform)
         candidates = adapter.discover(skill_dir=skill_dir, selected_names=selected_names)
         return [
             {
@@ -104,7 +126,7 @@ def scan_skills(
 
 def select_skills(
     items: Iterable[str | Path],
-    platform: str = "codex",
+    platform: str | None = "codex",
     allow_external: bool = False,
     config_path: str | Path | None = None,
     skill_dir: str | Path | None = None,
@@ -123,14 +145,14 @@ def select_skills(
         registry = _read_or_empty_registry(registry_path)
         registry.setdefault("skills", {})
         skills_config = config.setdefault("skills", {})
-        root = _skill_root(platform, skill_dir)
+        root = _global_skill_root(config, skill_dir) if platform is None else _skill_root(platform, skill_dir)
 
         for item in item_list:
             skill_path = _resolve_skill_item(item, root)
             _validate_skill_path(skill_path)
             if not _is_inside(skill_path.resolve(), root.resolve()) and not allow_external:
                 raise SkillSyncError(
-                    f"{skill_path} is outside the platform Skill root; pass allow_external to select it"
+                    f"{skill_path} is outside the global Skill root; pass allow_external to select it"
                 )
             name = skill_path.name
             existing = skills_config.get(name, {})
@@ -144,11 +166,15 @@ def select_skills(
                 raise SkillSyncError(
                     f"{name} is already selected from a different path; deselect it first"
                 )
+            registry["version"] = 2 if platform is None else registry.get("version", 1)
             registry["skills"][name] = {
                 "selected": True,
-                "source_platform": platform,
                 "display_name": name,
             }
+            if platform is not None:
+                registry["skills"][name]["source_platform"] = platform
+            else:
+                registry["skills"][name]["targets"] = "codex,workbuddy"
             skill_config = dict(existing) if isinstance(existing, dict) else {}
             skill_config["local_path"] = str(skill_path.resolve())
             skills_config[name] = skill_config
@@ -329,10 +355,16 @@ def sync(
         if current.diverged or (remote_changed and local_changed):
             raise SkillSyncError("both remote and local selected Skills changed; resolve manually")
         if remote_changed:
-            return pull(skill_names=skill_names, config_path=config_path)
+            result = pull(skill_names=skill_names, config_path=config_path)
+            if "platform" not in config:
+                result["links"] = link_skills(skill_names=skill_names, config_path=config_path)["links"]
+            return result
         if local_changed:
             return push(skill_names=targets, config_path=config_path)
-        return {"synced": [], "noop": True}
+        result: dict[str, Any] = {"synced": [], "noop": True}
+        if "platform" not in config:
+            result["links"] = link_skills(skill_names=skill_names, config_path=config_path)["links"]
+        return result
     except SkillSyncError:
         raise
     except (git.GitError, ValueError, OSError) as exc:
@@ -428,6 +460,12 @@ def _skill_root(platform: str, skill_dir: str | Path | None) -> Path:
     return get_adapter(platform).default_skill_dir().resolve()
 
 
+def _global_skill_root(config: dict[str, Any], skill_dir: str | Path | None = None) -> Path:
+    if skill_dir is not None:
+        return Path(skill_dir).expanduser().resolve()
+    return Path(config.get("skills_root") or Path.home() / ".agents" / "skills").expanduser().resolve()
+
+
 def _resolve_skill_item(item: str | Path, root: Path) -> Path:
     raw = Path(item).expanduser()
     if raw.is_absolute() or len(raw.parts) > 1:
@@ -471,6 +509,8 @@ def _local_skill_path_or_default(
         if isinstance(local_path, str) and local_path:
             return Path(local_path)
 
+    if config.get("skills_root") and "platform" not in config:
+        return _global_skill_root(config) / name
     registry_entry = registry.get("skills", {}).get(name, {})
     platform = config.get("platform", "codex")
     if isinstance(registry_entry, dict):
@@ -490,7 +530,7 @@ def _skill_status(config: dict[str, Any], registry: dict[str, Any], name: str) -
     baseline = config.get("skills", {}).get(name, {}).get("last_installed_hash")
     changed_local = local_hash != (baseline or remote_hash)
     entry = registry.get("skills", {}).get(name, {})
-    platform = entry.get("source_platform", config.get("platform", "codex")) if isinstance(entry, dict) else config.get("platform", "codex")
+    platform = entry.get("source_platform", config.get("platform", "global")) if isinstance(entry, dict) else config.get("platform", "global")
     return {
         "name": name,
         "platform": platform,
@@ -572,3 +612,84 @@ def _ensure_only_expected_registry_dirty(repo: Path) -> None:
         raise SkillSyncError(
             "sync repository has unexpected dirty changes: " + ", ".join(unexpected)
         )
+
+
+def link_skills(
+    skill_names: Iterable[str] | None = None,
+    agent_names: Iterable[str] | None = None,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Link selected canonical Skills into detected Agent directories."""
+    config = _load_local_config(config_path)
+    registry = _load_local_registry(config)
+    targets = _target_names(registry, skill_names)
+    requested_agents = set(agent_names or ())
+    agents = [a for a in detect_agents() if a.detected and (not requested_agents or a.name in requested_agents)]
+    unknown = requested_agents - {a.name for a in detect_agents()}
+    if unknown:
+        raise SkillSyncError("unknown Agent: " + ", ".join(sorted(unknown)))
+    results: list[dict[str, str]] = []
+    for name in targets:
+        source = _local_skill_path_or_default(config, registry, name)
+        _validate_skill_path(source)
+        entry = registry.get("skills", {}).get(name, {})
+        configured = set(str(entry.get("targets", "codex,workbuddy")).split(",")) if isinstance(entry, dict) else set()
+        for agent in agents:
+            if configured and agent.name not in configured:
+                continue
+            destination = agent.skills_dir / name
+            try:
+                method = create_directory_link(source, destination)
+                state = "linked"
+            except FileExistsError:
+                method = "none"
+                state = link_state(source, destination)
+            results.append({"skill": name, "agent": agent.name, "state": state, "method": method, "path": str(destination)})
+    return {"links": results}
+
+
+def unlink_skills(
+    skill_names: Iterable[str] | None = None,
+    agent_names: Iterable[str] | None = None,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    config = _load_local_config(config_path)
+    registry = _load_local_registry(config)
+    targets = _target_names(registry, skill_names)
+    requested = set(agent_names or ())
+    removed: list[dict[str, str]] = []
+    for agent in detect_agents():
+        if requested and agent.name not in requested:
+            continue
+        for name in targets:
+            source = _local_skill_path_or_default(config, registry, name)
+            destination = agent.skills_dir / name
+            if remove_directory_link(source, destination):
+                removed.append({"skill": name, "agent": agent.name, "path": str(destination)})
+    return {"unlinked": removed}
+
+
+def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
+    config = _load_local_config(config_path)
+    registry = _load_local_registry(config)
+    agents = detect_agents()
+    issues: list[dict[str, str]] = []
+    matrix: list[dict[str, str]] = []
+    for name in sorted(_selected_names(registry)):
+        source = _local_skill_path_or_default(config, registry, name)
+        if not (source / "SKILL.md").is_file():
+            issues.append({"type": "missing-skill", "skill": name, "path": str(source)})
+            continue
+        for agent in agents:
+            if not agent.detected:
+                continue
+            state = link_state(source, agent.skills_dir / name)
+            matrix.append({"skill": name, "agent": agent.name, "state": state})
+            if state not in {"linked", "missing"}:
+                issues.append({"type": state, "skill": name, "agent": agent.name})
+    return {
+        "skills_root": str(_global_skill_root(config)),
+        "agents": [{"name": a.name, "display_name": a.display_name, "skills_dir": str(a.skills_dir), "detected": a.detected} for a in agents],
+        "matrix": matrix,
+        "issues": issues,
+    }

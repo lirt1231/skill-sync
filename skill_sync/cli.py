@@ -41,17 +41,18 @@ def _build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--repo", required=True, help="Git URL or local repository path")
     init_parser.add_argument("--sync-dir", help="local sync repository directory")
     init_parser.add_argument("--branch", default="main", help="Git branch to synchronize")
-    init_parser.add_argument("--platform", default="codex", help="Skill platform")
+    init_parser.add_argument("--skills-root", help="canonical Skill directory (default: ~/.agents/skills)")
+    init_parser.add_argument("--platform", help=argparse.SUPPRESS)
     init_parser.set_defaults(handler=_handle_init)
 
     scan_parser = subparsers.add_parser("scan", help="list candidate local Skills")
-    scan_parser.add_argument("--platform", default="codex", help="Skill platform")
+    scan_parser.add_argument("--platform", help=argparse.SUPPRESS)
     scan_parser.add_argument("--json", action="store_true", help="print JSON output")
     scan_parser.set_defaults(handler=_handle_scan)
 
     select_parser = subparsers.add_parser("select", help="select local Skills for sync")
+    select_parser.add_argument("--platform", help=argparse.SUPPRESS)
     select_parser.add_argument("items", nargs="+", help="Skill names or paths")
-    select_parser.add_argument("--platform", default="codex", help="Skill platform")
     select_parser.add_argument(
         "--allow-external",
         action="store_true",
@@ -81,6 +82,26 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_skill_filter(sync_parser)
     sync_parser.set_defaults(handler=_handle_sync)
 
+    link_parser = subparsers.add_parser("link", help="link selected Skills into detected Agents")
+    _add_skill_filter(link_parser)
+    _add_agent_filter(link_parser)
+    link_parser.set_defaults(handler=_handle_link)
+
+    unlink_parser = subparsers.add_parser("unlink", help="remove managed Agent links")
+    _add_skill_filter(unlink_parser)
+    _add_agent_filter(unlink_parser)
+    unlink_parser.set_defaults(handler=_handle_unlink)
+
+    doctor_parser = subparsers.add_parser("doctor", help="diagnose Agent links and global Skills")
+    doctor_parser.add_argument("--json", action="store_true", help="print JSON output")
+    doctor_parser.set_defaults(handler=_handle_doctor)
+
+    web_parser = subparsers.add_parser("web", help="start the local management Web UI")
+    web_parser.add_argument("--host", default="127.0.0.1")
+    web_parser.add_argument("--port", type=int, default=8765)
+    web_parser.add_argument("--no-browser", action="store_true")
+    web_parser.set_defaults(handler=_handle_web)
+
     return parser
 
 
@@ -93,17 +114,19 @@ def _add_skill_filter(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_agent_filter(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--agent", action="append", dest="agents", help="restrict to an Agent; repeatable")
+
+
 def _handle_init(args: argparse.Namespace) -> str:
-    result = core.init_sync(
-        args.repo,
-        sync_dir=args.sync_dir,
-        branch=args.branch,
-        platform=args.platform,
-        config_path=args.config,
-    )
+    kwargs = {"sync_dir": args.sync_dir, "branch": args.branch, "platform": args.platform, "config_path": args.config}
+    if args.skills_root is not None:
+        kwargs["skills_root"] = args.skills_root
+    result = core.init_sync(args.repo, **kwargs)
+    location = result.get("skills_root") or result.get("platform", "global")
     return (
         f"Initialized skill-sync repo: {result['sync_repo_path']} "
-        f"(branch {result['branch']}, platform {result['platform']})"
+        f"(branch {result['branch']}, skills {location})"
     )
 
 
@@ -168,6 +191,31 @@ def _handle_sync(args: argparse.Namespace) -> str:
         suffix = " (committed)" if result.get("committed") else " (no commit needed)"
         return f"Pushed: {_names(result.get('pushed'))}{suffix}"
     return f"Synced: {_names(result.get('synced'))}"
+
+
+def _handle_link(args: argparse.Namespace) -> str:
+    result = core.link_skills(skill_names=args.skills, agent_names=args.agents, config_path=args.config)
+    return f"Links checked: {len(result['links'])}"
+
+
+def _handle_unlink(args: argparse.Namespace) -> str:
+    result = core.unlink_skills(skill_names=args.skills, agent_names=args.agents, config_path=args.config)
+    return f"Links removed: {len(result['unlinked'])}"
+
+
+def _handle_doctor(args: argparse.Namespace) -> str:
+    result = core.doctor(config_path=args.config)
+    if args.json:
+        return _json(result)
+    detected = ", ".join(a["display_name"] for a in result["agents"] if a["detected"]) or "none"
+    return f"Detected Agents: {detected}\nIssues: {len(result['issues'])}"
+
+
+def _handle_web(args: argparse.Namespace) -> None:
+    from skill_sync.web import serve
+
+    serve(host=args.host, port=args.port, config_path=args.config, open_browser=not args.no_browser)
+    return None
 
 
 def _format_status(result: dict[str, Any]) -> str:
