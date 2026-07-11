@@ -174,7 +174,7 @@ def select_skills(
             if platform is not None:
                 registry["skills"][name]["source_platform"] = platform
             else:
-                registry["skills"][name]["targets"] = "codex,workbuddy"
+                registry["skills"][name]["targets"] = "codex,workbuddy,kimi"
             skill_config = dict(existing) if isinstance(existing, dict) else {}
             skill_config["local_path"] = str(skill_path.resolve())
             skills_config[name] = skill_config
@@ -633,7 +633,7 @@ def link_skills(
         source = _local_skill_path_or_default(config, registry, name)
         _validate_skill_path(source)
         entry = registry.get("skills", {}).get(name, {})
-        configured = set(str(entry.get("targets", "codex,workbuddy")).split(",")) if isinstance(entry, dict) else set()
+        configured = set(str(entry.get("targets", "codex,workbuddy,kimi")).split(",")) if isinstance(entry, dict) else set()
         for agent in agents:
             if configured and agent.name not in configured:
                 continue

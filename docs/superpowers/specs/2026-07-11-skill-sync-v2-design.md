@@ -18,6 +18,7 @@ The first release detects:
 
 - Codex: `$CODEX_HOME/skills` or `~/.codex/skills`
 - WorkBuddy: `$WORKBUDDY_HOME/skills` or `~/.workbuddy/skills`
+- Kimi: `$KIMI_SKILLS_DIR` or `~/.config/agents/skills` (recommended by Kimi's bundled Skill creator)
 
 Detection is conservative. An adapter is installed when its home directory, Skill directory, or executable/application marker exists. Tests may inject environment and home paths.
 

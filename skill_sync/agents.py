@@ -25,6 +25,9 @@ def detect_agents(
     root = Path.home() if home is None else home
     codex_home = Path(environ.get("CODEX_HOME", root / ".codex"))
     workbuddy_home = Path(environ.get("WORKBUDDY_HOME", root / ".workbuddy"))
+    kimi_skills = Path(
+        environ.get("KIMI_SKILLS_DIR", root / ".config" / "agents" / "skills")
+    )
     return [
         AgentTarget(
             "codex",
@@ -37,6 +40,15 @@ def detect_agents(
             "WorkBuddy",
             workbuddy_home / "skills",
             workbuddy_home.exists() or (root / ".workbuddy-ai").exists(),
+        ),
+        AgentTarget(
+            "kimi",
+            "Kimi",
+            kimi_skills,
+            (root / ".kimi").exists()
+            or (root / ".kimi-code").exists()
+            or (root / "Library" / "Application Support" / "kimi-desktop").exists()
+            or shutil.which("kimi") is not None,
         ),
     ]
 
