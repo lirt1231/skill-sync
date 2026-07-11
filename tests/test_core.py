@@ -394,6 +394,25 @@ class CoreWorkflowTest(unittest.TestCase):
             "# new remote\n",
         )
 
+    def test_sync_fresh_machine_installs_existing_remote_selection_without_local_path(self):
+        source, remote = create_remote_with_registry(self.work)
+        add_remote_skill(source, "alpha", "# alpha remote\n")
+        sync_repo = self.work / "sync"
+        init_sync(str(remote), sync_dir=sync_repo, config_path=self.config_path)
+        configure_identity(sync_repo)
+
+        result = sync(config_path=self.config_path)
+
+        destination = self.skill_root / "alpha"
+        config = load_config(self.config_path)
+        self.assertEqual(result["pulled"], ["alpha"])
+        self.assertEqual(read_file(destination, "SKILL.md"), "# alpha remote\n")
+        self.assertEqual(config["skills"]["alpha"]["local_path"], str(destination))
+        self.assertEqual(
+            config["skills"]["alpha"]["last_installed_hash"],
+            hash_skill_dir(destination),
+        )
+
     def test_pull_refuses_overwrite_when_baseline_missing_and_destination_differs_from_repo_copy(self):
         self.init_from_remote()
         skill = self.select_default_skill("alpha", "# alpha v1\n")

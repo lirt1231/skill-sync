@@ -319,8 +319,13 @@ def sync(
 
         git.fetch(repo, branch)
         current = git.state(repo, branch)
-        local_changed = _any_local_changed(config, registry, targets)
-        remote_changed = current.behind > 0
+        install_needed = _any_missing_local_install(config, registry, targets)
+        local_changed = _any_local_changed(
+            config,
+            registry,
+            [name for name in targets if not _needs_local_install(config, registry, name)],
+        )
+        remote_changed = current.behind > 0 or install_needed
         if current.diverged or (remote_changed and local_changed):
             raise SkillSyncError("both remote and local selected Skills changed; resolve manually")
         if remote_changed:
@@ -499,6 +504,17 @@ def _skill_status(config: dict[str, Any], registry: dict[str, Any], name: str) -
 
 def _any_local_changed(config: dict[str, Any], registry: dict[str, Any], targets: list[str]) -> bool:
     return any(_skill_status(config, registry, name)["changed_local"] for name in targets)
+
+
+def _any_missing_local_install(
+    config: dict[str, Any], registry: dict[str, Any], targets: list[str]
+) -> bool:
+    return any(_needs_local_install(config, registry, name) for name in targets)
+
+
+def _needs_local_install(config: dict[str, Any], registry: dict[str, Any], name: str) -> bool:
+    local_path = _local_skill_path_or_default(config, registry, name)
+    return not local_path.exists()
 
 
 def _reconcile_config_to_registry(config: dict[str, Any], registry: dict[str, Any]) -> None:
