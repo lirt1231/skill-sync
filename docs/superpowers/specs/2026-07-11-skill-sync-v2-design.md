@@ -49,6 +49,7 @@ The owned YAML subset continues to use scalar values, so `targets` is a comma-se
 
 - `init --repo ...`: configure the private repository and canonical Skill root.
 - `scan`: list valid canonical Skills.
+- `import --agent codex|claude <name>...`: safely globalize existing Agent-local Skills, replacing the verified source directory with a link.
 - `select <name-or-path>`: select a canonical Skill; an external path must be imported explicitly before selection.
 - `deselect <name>`: stop synchronization without deleting the canonical directory.
 - `status`: report Git, canonical content, Agent detection, and link states.

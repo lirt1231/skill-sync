@@ -77,6 +77,10 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                     result = core.select_skills(body.get("skills", []), platform=None, config_path=config_path)
                 elif path == "/api/deselect":
                     result = core.deselect_skills(body.get("skills", []), config_path=config_path)
+                elif path == "/api/import":
+                    result = core.import_agent_skills(
+                        body.get("skills", []), body.get("agent", ""), config_path=config_path
+                    )
                 else:
                     self._json({"error": "unknown action"}, HTTPStatus.NOT_FOUND)
                     return
@@ -123,4 +127,8 @@ def _state(config_path: str | None) -> dict[str, Any]:
     for skill in skills.values():
         skill["agents"] = {agent["name"]: matrix.get((skill["name"], agent["name"]), "not-detected") for agent in diagnosis["agents"]}
     sync_status["skills"] = [skills[name] for name in sorted(skills)]
-    return {"status": sync_status, "doctor": diagnosis}
+    try:
+        import_candidates = core.scan_import_candidates(config_path=config_path)
+    except SkillSyncError:
+        import_candidates = []
+    return {"status": sync_status, "doctor": diagnosis, "import_candidates": import_candidates}

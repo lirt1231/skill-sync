@@ -82,6 +82,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_skill_filter(sync_parser)
     sync_parser.set_defaults(handler=_handle_sync)
 
+    import_parser = subparsers.add_parser("import", help="import Agent-local Skills into the global root")
+    import_parser.add_argument("items", nargs="+", help="Skill names to import")
+    import_parser.add_argument("--agent", required=True, choices=("codex", "claude"))
+    import_parser.set_defaults(handler=_handle_import)
+
     link_parser = subparsers.add_parser("link", help="link selected Skills into detected Agents")
     _add_skill_filter(link_parser)
     _add_agent_filter(link_parser)
@@ -191,6 +196,11 @@ def _handle_sync(args: argparse.Namespace) -> str:
         suffix = " (committed)" if result.get("committed") else " (no commit needed)"
         return f"Pushed: {_names(result.get('pushed'))}{suffix}"
     return f"Synced: {_names(result.get('synced'))}"
+
+
+def _handle_import(args: argparse.Namespace) -> str:
+    result = core.import_agent_skills(args.items, args.agent, config_path=args.config)
+    return f"Imported: {_names(item['name'] for item in result['imported'])}"
 
 
 def _handle_link(args: argparse.Namespace) -> str:

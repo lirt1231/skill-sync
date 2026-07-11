@@ -7,6 +7,8 @@ reuse the same behavior and handle :class:`SkillSyncError` consistently.
 from __future__ import annotations
 
 import os
+import shutil
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -693,3 +695,89 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
         "matrix": matrix,
         "issues": issues,
     }
+
+
+def scan_import_candidates(
+    agent_names: Iterable[str] = ("codex", "claude"),
+    config_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """List real Agent-local Skill directories that can be globalized."""
+    config = _load_local_config(config_path)
+    global_root = _global_skill_root(config)
+    requested = set(agent_names)
+    agents = {agent.name: agent for agent in detect_agents()}
+    unknown = requested - set(agents)
+    if unknown:
+        raise SkillSyncError("unknown Agent: " + ", ".join(sorted(unknown)))
+    candidates: list[dict[str, Any]] = []
+    for agent_name in sorted(requested):
+        agent = agents[agent_name]
+        if not agent.detected or not agent.skills_dir.exists():
+            continue
+        for source in sorted(agent.skills_dir.iterdir(), key=lambda path: path.name):
+            if source.is_symlink() or not source.is_dir() or not (source / "SKILL.md").is_file():
+                continue
+            destination = global_root / source.name
+            state = "importable"
+            if destination.exists():
+                state = "same" if hash_skill_dir(source) == hash_skill_dir(destination) else "conflict"
+            candidates.append(
+                {"name": source.name, "agent": agent_name, "path": str(source), "state": state}
+            )
+    return candidates
+
+
+def import_agent_skills(
+    names: Iterable[str],
+    agent_name: str,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Move Agent-local Skills into the global root and replace them with links."""
+    name_list = list(names)
+    if not name_list:
+        raise SkillSyncError("import requires at least one Skill name")
+    config = _load_local_config(config_path)
+    agents = {agent.name: agent for agent in detect_agents()}
+    agent = agents.get(agent_name)
+    if agent is None:
+        raise SkillSyncError(f"unknown Agent: {agent_name}")
+    if not agent.detected:
+        raise SkillSyncError(f"Agent is not detected: {agent_name}")
+    global_root = _global_skill_root(config)
+    imported: list[dict[str, str]] = []
+    for name in name_list:
+        if Path(name).name != name or name in {".", ".."}:
+            raise SkillSyncError(f"invalid Skill name: {name}")
+        source = agent.skills_dir / name
+        destination = global_root / name
+        if source.is_symlink():
+            if link_state(destination, source) != "linked":
+                raise SkillSyncError(f"{name} is linked to a different location")
+            imported.append({"name": name, "agent": agent_name, "state": "already-linked"})
+            continue
+        _validate_skill_path(source)
+        destination_existed = destination.exists()
+        if destination_existed:
+            _validate_skill_path(destination)
+            if hash_skill_dir(source) != hash_skill_dir(destination):
+                raise SkillSyncError(f"global Skill has different content: {name}")
+        else:
+            copy_skill_dir(source, destination)
+        backup = source.parent / f".{name}.skill-sync-import-{time.time_ns()}"
+        try:
+            os.replace(source, backup)
+            create_directory_link(destination, source)
+            if link_state(destination, source) != "linked":
+                raise SkillSyncError(f"failed to verify imported Skill link: {name}")
+        except Exception:
+            if source.is_symlink():
+                source.unlink()
+            if backup.exists():
+                os.replace(backup, source)
+            if not destination_existed and destination.exists():
+                shutil.rmtree(destination)
+            raise
+        shutil.rmtree(backup)
+        imported.append({"name": name, "agent": agent_name, "state": "imported"})
+    select_skills(name_list, platform=None, config_path=config_path)
+    return {"imported": imported}

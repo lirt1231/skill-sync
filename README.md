@@ -19,6 +19,15 @@ Synchronize selected user-authored Agent Skills across devices. Managed Skills h
 ./skill-sync web
 ```
 
+Import an existing real Skill directory from Codex or Claude Code into the canonical root:
+
+```bash
+skill-sync import --agent codex my-skill
+skill-sync import --agent claude another-skill
+```
+
+The import copies and hash-verifies the Skill under `~/.agents/skills`, replaces the original Agent directory with a link, and selects the Skill for synchronization. A different same-name global Skill is reported as a conflict and neither copy is changed.
+
 Open <http://127.0.0.1:8765> to view the Skill-by-Agent matrix.
 
 On another computer:

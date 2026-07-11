@@ -126,6 +126,20 @@ class CliTest(unittest.TestCase):
         deselect.assert_called_once_with(["alpha"], config_path="/tmp/config.json")
         self.assertIn("Deselected: alpha", stdout)
 
+    def test_import_dispatches_agent_and_skill_names(self):
+        with mock.patch.object(
+            cli.core,
+            "import_agent_skills",
+            return_value={"imported": [{"name": "alpha", "agent": "codex", "state": "imported"}]},
+        ) as import_skills:
+            code, stdout, stderr = run_cli(
+                ["--config", "/tmp/config.json", "import", "--agent", "codex", "alpha"]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        import_skills.assert_called_once_with(["alpha"], "codex", config_path="/tmp/config.json")
+        self.assertIn("Imported: alpha", stdout)
+
     def test_repeated_skill_filters_dispatch_to_status_pull_push(self):
         status_result = {
             "schema_version": 1,
