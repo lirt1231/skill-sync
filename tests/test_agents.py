@@ -19,7 +19,7 @@ class AgentDetectionTest(unittest.TestCase):
             self.assertEqual(agents["codex"].skills_dir, home / ".codex" / "skills")
             self.assertEqual(agents["workbuddy"].skills_dir, home / ".workbuddy" / "skills")
 
-    def test_detects_kimi_and_uses_recommended_user_skill_directory(self):
+    def test_kimi_code_falls_back_to_recommended_user_skill_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             (home / ".kimi-code").mkdir()
@@ -31,12 +31,32 @@ class AgentDetectionTest(unittest.TestCase):
                 home / ".config" / "agents" / "skills",
             )
 
+    def test_kimi_desktop_prefers_effective_daimon_managed_skill_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            managed = home / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "skills"
+            managed.mkdir(parents=True)
+            with mock.patch("skill_sync.agents.shutil.which", return_value=None):
+                agents = {item.name: item for item in detect_agents(env={}, home=home)}
+            self.assertTrue(agents["kimi"].detected)
+            self.assertEqual(agents["kimi"].skills_dir, managed)
+
+    def test_detects_claude_code_skill_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".claude").mkdir()
+            with mock.patch("skill_sync.agents.shutil.which", return_value=None):
+                agents = {item.name: item for item in detect_agents(env={}, home=home)}
+            self.assertTrue(agents["claude"].detected)
+            self.assertEqual(agents["claude"].skills_dir, home / ".claude" / "skills")
+
     def test_environment_overrides_agent_homes(self):
         with mock.patch("skill_sync.agents.shutil.which", return_value=None):
             agents = {item.name: item for item in detect_agents(
-                env={"CODEX_HOME": "/custom/codex", "WORKBUDDY_HOME": "/custom/workbuddy", "KIMI_SKILLS_DIR": "/custom/kimi-skills"},
+                env={"CODEX_HOME": "/custom/codex", "WORKBUDDY_HOME": "/custom/workbuddy", "KIMI_SKILLS_DIR": "/custom/kimi-skills", "CLAUDE_HOME": "/custom/claude"},
                 home=Path("/home/example"),
             )}
         self.assertEqual(agents["codex"].skills_dir, Path("/custom/codex/skills"))
         self.assertEqual(agents["workbuddy"].skills_dir, Path("/custom/workbuddy/skills"))
         self.assertEqual(agents["kimi"].skills_dir, Path("/custom/kimi-skills"))
+        self.assertEqual(agents["claude"].skills_dir, Path("/custom/claude/skills"))
