@@ -1,6 +1,6 @@
 # Skill Sync
 
-Synchronize selected user-authored Agent Skills across devices. Managed Skills have one canonical local copy under `~/.agents/skills`; Codex, WorkBuddy, Kimi Desktop, and Claude Code consume them through directory links.
+Synchronize selected user-authored Agent Skills across devices. Managed Skills have one canonical local copy under `~/.agents/skills`; Codex, WorkBuddy, Kimi Code, Kimi Desktop, and Claude Code consume them through directory links.
 
 ## Requirements
 
@@ -43,7 +43,8 @@ skill-sync sync
 
 - Codex: `${CODEX_HOME:-~/.codex}/skills`
 - WorkBuddy: `${WORKBUDDY_HOME:-~/.workbuddy}/skills`
-- Kimi Desktop: `$KIMI_SKILLS_DIR` or `~/Library/Application Support/kimi-desktop/daimon-share/daimon/skills`; Kimi Code falls back to `~/.config/agents/skills`
+- Kimi Code: `$KIMI_CODE_SKILLS_DIR` or `~/.config/agents/skills`
+- Kimi Desktop: `$KIMI_DESKTOP_SKILLS_DIR` or `~/Library/Application Support/kimi-desktop/daimon-share/daimon/skills`
 - Claude Code: `${CLAUDE_HOME:-~/.claude}/skills`
 
 On macOS/Linux the links are symbolic links. On Windows the tool first tries a directory symbolic link and falls back to a directory junction. Windows `.lnk` shortcuts are intentionally unsupported.

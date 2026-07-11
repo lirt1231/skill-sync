@@ -109,7 +109,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     agent_parser = subparsers.add_parser("agent", help="enable or disable an Agent sync target")
     agent_parser.add_argument("action", choices=("enable", "disable"))
-    agent_parser.add_argument("name", choices=("codex", "workbuddy", "kimi", "claude"))
+    agent_parser.add_argument(
+        "name",
+        choices=("codex", "workbuddy", "kimi-code", "kimi-desktop", "claude"),
+    )
     agent_parser.set_defaults(handler=_handle_agent)
 
     return parser

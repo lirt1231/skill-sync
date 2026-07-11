@@ -24,6 +24,7 @@ from skill_sync.registry import empty_registry, load_registry, save_registry
 
 
 REGISTRY_FILE = "registry.yaml"
+DEFAULT_AGENT_TARGETS = "codex,workbuddy,kimi-code,kimi-desktop,claude"
 
 
 def init_sync(
@@ -176,7 +177,7 @@ def select_skills(
             if platform is not None:
                 registry["skills"][name]["source_platform"] = platform
             else:
-                registry["skills"][name]["targets"] = "codex,workbuddy,kimi,claude"
+                registry["skills"][name]["targets"] = DEFAULT_AGENT_TARGETS
             skill_config = dict(existing) if isinstance(existing, dict) else {}
             skill_config["local_path"] = str(skill_path.resolve())
             skills_config[name] = skill_config
@@ -646,7 +647,7 @@ def link_skills(
         source = _local_skill_path_or_default(config, registry, name)
         _validate_skill_path(source)
         entry = registry.get("skills", {}).get(name, {})
-        configured = set(str(entry.get("targets", "codex,workbuddy,kimi,claude")).split(",")) if isinstance(entry, dict) else set()
+        configured = set(str(entry.get("targets", DEFAULT_AGENT_TARGETS)).split(",")) if isinstance(entry, dict) else set()
         for agent in agents:
             if configured and agent.name not in configured:
                 continue

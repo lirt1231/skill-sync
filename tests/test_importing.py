@@ -52,7 +52,11 @@ class ImportAgentSkillsTest(unittest.TestCase):
         self.assertTrue(source.is_symlink())
         self.assertEqual(source.resolve(), destination.resolve())
         self.assertEqual((destination / "SKILL.md").read_text(), "# alpha\n")
-        self.assertIn("alpha", load_registry(self.repo / "registry.yaml")["skills"])
+        registry_entry = load_registry(self.repo / "registry.yaml")["skills"]["alpha"]
+        self.assertEqual(
+            registry_entry["targets"],
+            "codex,workbuddy,kimi-code,kimi-desktop,claude",
+        )
 
     def test_import_refuses_different_global_content_without_touching_source(self):
         source = self.write_skill(self.agent_root, "alpha", "# local\n")

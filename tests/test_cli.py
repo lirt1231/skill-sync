@@ -142,13 +142,13 @@ class CliTest(unittest.TestCase):
 
     def test_agent_disable_dispatches_to_core(self):
         with mock.patch.object(
-            cli.core, "disable_agent_sync", return_value={"disabled": "kimi", "unlinked": []}
+            cli.core, "disable_agent_sync", return_value={"disabled": "kimi-desktop", "unlinked": []}
         ) as disable:
-            code, stdout, stderr = run_cli(["agent", "disable", "kimi"])
+            code, stdout, stderr = run_cli(["agent", "disable", "kimi-desktop"])
         self.assertEqual(code, 0)
         self.assertEqual(stderr, "")
-        disable.assert_called_once_with("kimi", config_path=None)
-        self.assertIn("Disabled Agent sync: kimi", stdout)
+        disable.assert_called_once_with("kimi-desktop", config_path=None)
+        self.assertIn("Disabled Agent sync: kimi-desktop", stdout)
 
     def test_repeated_skill_filters_dispatch_to_status_pull_push(self):
         status_result = {

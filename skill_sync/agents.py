@@ -25,22 +25,26 @@ def detect_agents(
     root = Path.home() if home is None else home
     codex_home = Path(environ.get("CODEX_HOME", root / ".codex"))
     workbuddy_home = Path(environ.get("WORKBUDDY_HOME", root / ".workbuddy"))
-    kimi_managed_skills = (
+    kimi_code_skills = Path(
+        environ.get("KIMI_CODE_SKILLS_DIR", root / ".config" / "agents" / "skills")
+    )
+    kimi_desktop_skills = Path(
+        environ.get(
+            "KIMI_DESKTOP_SKILLS_DIR",
+            root
+            / "Library"
+            / "Application Support"
+            / "kimi-desktop"
+            / "daimon-share"
+            / "daimon"
+            / "skills",
+        )
+    )
+    kimi_desktop_home = (
         root
         / "Library"
         / "Application Support"
         / "kimi-desktop"
-        / "daimon-share"
-        / "daimon"
-        / "skills"
-    )
-    kimi_skills = Path(
-        environ.get(
-            "KIMI_SKILLS_DIR",
-            kimi_managed_skills
-            if kimi_managed_skills.exists()
-            else root / ".config" / "agents" / "skills",
-        )
     )
     claude_home = Path(environ.get("CLAUDE_HOME", root / ".claude"))
     return [
@@ -57,13 +61,18 @@ def detect_agents(
             workbuddy_home.exists() or (root / ".workbuddy-ai").exists(),
         ),
         AgentTarget(
-            "kimi",
-            "Kimi",
-            kimi_skills,
-            (root / ".kimi").exists()
-            or (root / ".kimi-code").exists()
-            or (root / "Library" / "Application Support" / "kimi-desktop").exists()
+            "kimi-code",
+            "Kimi Code",
+            kimi_code_skills,
+            (root / ".kimi-code").exists()
+            or kimi_code_skills.exists()
             or shutil.which("kimi") is not None,
+        ),
+        AgentTarget(
+            "kimi-desktop",
+            "Kimi Desktop",
+            kimi_desktop_skills,
+            kimi_desktop_home.exists() or kimi_desktop_skills.exists(),
         ),
         AgentTarget(
             "claude",
