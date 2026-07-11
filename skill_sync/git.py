@@ -130,12 +130,13 @@ def fetch(repo: Path, branch: str = "main") -> None:
         raise GitError(f"missing remote branch origin/{branch}") from exc
 
 
-def state(repo: Path, branch: str = "main") -> GitState:
+def state(repo: Path, branch: str = "main", *, fetch_remote: bool = True) -> GitState:
     clean = is_clean(repo)
     if not _has_origin(repo):
         return GitState(clean=clean, ahead=0, behind=0, diverged=False)
 
-    fetch(repo, branch)
+    if fetch_remote:
+        fetch(repo, branch)
     counts = run_git(repo, ["rev-list", "--left-right", "--count", f"HEAD...origin/{branch}"])
     ahead_text, behind_text = counts.split()
     ahead = int(ahead_text)

@@ -30,6 +30,8 @@ The import copies and hash-verifies the Skill under `~/.agents/skills`, replaces
 
 Open <http://127.0.0.1:8765> to view the Skill-by-Agent matrix.
 
+The Web UI can select multiple canonical Skills and permanently delete them. Deletion removes only verified managed Agent links, removes the Skill from the registry, and asks for browser confirmation before the request. Ordinary UI refreshes use cached Git refs for fast local responses; explicit synchronization performs the network fetch.
+
 On another computer:
 
 ```bash

@@ -222,6 +222,7 @@ def deselect_skills(
 def status(
     skill_names: Iterable[str] | None = None,
     config_path: str | Path | None = None,
+    fetch_remote: bool = True,
 ) -> dict[str, Any]:
     """Return a JSON-friendly status object."""
 
@@ -230,7 +231,7 @@ def status(
         repo = _repo_path(config)
         branch = _branch(config)
         registry = _load_local_registry(config)
-        git_state = git.state(repo, branch)
+        git_state = git.state(repo, branch, fetch_remote=fetch_remote)
         skills = [_skill_status(config, registry, name) for name in _target_names(registry, skill_names)]
         return {
             "schema_version": 1,
@@ -781,3 +782,55 @@ def import_agent_skills(
         imported.append({"name": name, "agent": agent_name, "state": "imported"})
     select_skills(name_list, platform=None, config_path=config_path)
     return {"imported": imported}
+
+
+def delete_global_skills(
+    names: Iterable[str],
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Permanently delete canonical Skills and their managed Agent links."""
+    name_list = list(dict.fromkeys(names))
+    if not name_list:
+        raise SkillSyncError("delete requires at least one Skill name")
+    config_file = _config_path(config_path)
+    config = load_config(config_file)
+    repo = _repo_path(config)
+    registry_path = repo / REGISTRY_FILE
+    registry = _read_or_empty_registry(registry_path)
+    global_root = _global_skill_root(config)
+    agents = detect_agents()
+    moved: list[tuple[str, Path, Path]] = []
+    removed_links: list[tuple[Path, Path]] = []
+    try:
+        for name in name_list:
+            if Path(name).name != name or name in {".", ".."}:
+                raise SkillSyncError(f"invalid Skill name: {name}")
+            source = global_root / name
+            if source.is_symlink():
+                raise SkillSyncError(f"refusing to delete global Skill symlink: {name}")
+            _validate_skill_path(source)
+            backup = global_root / f".{name}.skill-sync-delete-{time.time_ns()}"
+            os.replace(source, backup)
+            moved.append((name, source, backup))
+            for agent in agents:
+                destination = agent.skills_dir / name
+                if remove_directory_link(source, destination):
+                    removed_links.append((source, destination))
+        skills = registry.setdefault("skills", {})
+        local_skills = config.setdefault("skills", {})
+        for name in name_list:
+            skills.pop(name, None)
+            local_skills.pop(name, None)
+        save_registry(registry_path, registry)
+        save_config(config_file, config)
+    except Exception:
+        for _, source, backup in reversed(moved):
+            if backup.exists() and not source.exists():
+                os.replace(backup, source)
+        for source, destination in removed_links:
+            if source.exists() and not destination.exists():
+                create_directory_link(source, destination)
+        raise
+    for _, _, backup in moved:
+        shutil.rmtree(backup)
+    return {"deleted": name_list}

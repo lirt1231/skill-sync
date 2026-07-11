@@ -5,7 +5,7 @@ from unittest import mock
 
 from skill_sync.agents import AgentTarget
 from skill_sync.config import empty_config, save_config
-from skill_sync.core import import_agent_skills, scan_import_candidates
+from skill_sync.core import delete_global_skills, import_agent_skills, scan_import_candidates
 from skill_sync.errors import SkillSyncError
 from skill_sync.registry import empty_registry, load_registry, save_registry
 
@@ -65,3 +65,28 @@ class ImportAgentSkillsTest(unittest.TestCase):
         with mock.patch("skill_sync.core.detect_agents", return_value=[self.agent]):
             result = scan_import_candidates(["codex"], config_path=self.config_path)
         self.assertEqual([(item["name"], item["state"]) for item in result], [("alpha", "importable"), ("beta", "conflict")])
+
+    def test_delete_global_skill_removes_managed_link_and_registry_entry(self):
+        destination = self.write_skill(self.global_root, "alpha", "# alpha\n")
+        self.agent_root.mkdir(parents=True, exist_ok=True)
+        source = self.agent_root / "alpha"
+        source.symlink_to(destination, target_is_directory=True)
+        save_registry(self.repo / "registry.yaml", {
+            "version": 2,
+            "skills": {"alpha": {"selected": True, "display_name": "alpha", "targets": "codex"}},
+        })
+        with mock.patch("skill_sync.core.detect_agents", return_value=[self.agent]):
+            result = delete_global_skills(["alpha"], config_path=self.config_path)
+        self.assertEqual(result["deleted"], ["alpha"])
+        self.assertFalse(destination.exists())
+        self.assertFalse(source.exists())
+        self.assertNotIn("alpha", load_registry(self.repo / "registry.yaml")["skills"])
+
+    def test_delete_rejects_global_symlink(self):
+        target = self.write_skill(self.root / "elsewhere", "alpha")
+        self.global_root.mkdir(parents=True, exist_ok=True)
+        (self.global_root / "alpha").symlink_to(target, target_is_directory=True)
+        with mock.patch("skill_sync.core.detect_agents", return_value=[self.agent]):
+            with self.assertRaisesRegex(SkillSyncError, "symlink"):
+                delete_global_skills(["alpha"], config_path=self.config_path)
+        self.assertTrue(target.exists())

@@ -18,13 +18,14 @@ class WebUiTest(unittest.TestCase):
             "issues": [],
         }), mock.patch("skill_sync.web.core.status", return_value={
             "repo": {"clean": True}, "skills": [{"name": "alpha"}]
-        }), mock.patch("skill_sync.web.core.scan_skills", return_value=[
+        }) as status, mock.patch("skill_sync.web.core.scan_skills", return_value=[
             {"name": "alpha", "path": "/skills/alpha", "selected": True, "external": False},
             {"name": "beta", "path": "/skills/beta", "selected": False, "external": False},
         ]), mock.patch("skill_sync.web.core.scan_import_candidates", return_value=[
             {"name": "legacy", "agent": "codex", "path": "/codex/legacy", "state": "importable"}
         ]):
             value = _state(None)
+        status.assert_called_once_with(config_path=None, fetch_remote=False)
         self.assertEqual(value["status"]["skills"][0]["agents"]["codex"], "linked")
         self.assertEqual([item["name"] for item in value["status"]["skills"]], ["alpha", "beta"])
         self.assertEqual(value["import_candidates"][0]["name"], "legacy")

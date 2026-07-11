@@ -68,7 +68,12 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                 path = urlparse(self.path).path
                 kwargs = {"skill_names": body.get("skills"), "config_path": config_path}
                 if path == "/api/sync":
-                    result = core.sync(**kwargs)
+                    try:
+                        result = core.sync(**kwargs)
+                    except SkillSyncError as exc:
+                        if "sync repository is dirty" not in str(exc):
+                            raise
+                        result = core.push(**kwargs)
                 elif path == "/api/link":
                     result = core.link_skills(agent_names=body.get("agents"), **kwargs)
                 elif path == "/api/unlink":
@@ -80,6 +85,10 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                 elif path == "/api/import":
                     result = core.import_agent_skills(
                         body.get("skills", []), body.get("agent", ""), config_path=config_path
+                    )
+                elif path == "/api/delete":
+                    result = core.delete_global_skills(
+                        body.get("skills", []), config_path=config_path
                     )
                 else:
                     self._json({"error": "unknown action"}, HTTPStatus.NOT_FOUND)
@@ -105,7 +114,7 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
 def _state(config_path: str | None) -> dict[str, Any]:
     diagnosis = core.doctor(config_path=config_path)
     try:
-        sync_status = core.status(config_path=config_path)
+        sync_status = core.status(config_path=config_path, fetch_remote=False)
     except SkillSyncError as exc:
         sync_status = {"error": str(exc), "skills": []}
     selected = {item["name"]: item for item in sync_status.get("skills", [])}

@@ -256,6 +256,19 @@ class GitWrapperTest(unittest.TestCase):
             self.assertEqual(result.behind, 1)
             self.assertTrue(result.diverged)
 
+    def test_state_can_use_cached_remote_ref_without_fetching(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            work = Path(tmp_dir)
+            source, remote = create_remote_with_initial_commit(work)
+            clone = work / "clone"
+            clone_repo(str(remote), clone)
+            make_commit(source, "remote.txt", "remote\n", "remote change")
+            push(source)
+
+            result = state(clone, fetch_remote=False)
+
+            self.assertEqual(result.behind, 0)
+
     def test_merge_ff_only_pulls_remote_changes(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             work = Path(tmp_dir)
