@@ -24,7 +24,87 @@ from skill_sync.registry import empty_registry, load_registry, save_registry
 
 
 REGISTRY_FILE = "registry.yaml"
-DEFAULT_AGENT_TARGETS = "codex,workbuddy,kimi-code,kimi-desktop,claude"
+DEFAULT_AGENT_TARGETS = "codex,workbuddy,kimi,claude"
+
+
+def is_initialized(config_path: str | Path | None = None) -> bool:
+    """Return whether this machine has a usable local sync checkout configured."""
+    config = load_config(_config_path(config_path))
+    repo_text = config.get("sync_repo_path")
+    return isinstance(repo_text, str) and bool(repo_text) and (Path(repo_text) / ".git").is_dir()
+
+
+def sync_preview(
+    skill_names: Iterable[str] | None = None,
+    config_path: str | Path | None = None,
+    *,
+    fetch_remote: bool = False,
+) -> dict[str, Any]:
+    """Describe the next safe synchronization action without changing state.
+
+    ``fetch_remote`` is deliberately opt-in: dashboards stay fast and offline,
+    while an explicit sync operation asks Git for fresh remote state.
+    """
+    if not is_initialized(config_path):
+        return {
+            "schema_version": 1,
+            "initialized": False,
+            "action": "setup",
+            "summary": "Set up a private Git repository before syncing.",
+            "skills": [],
+            "issues": [],
+        }
+    try:
+        config = _load_local_config(config_path)
+        repo = _repo_path(config)
+        branch = _branch(config)
+        registry = _load_local_registry(config)
+        if fetch_remote:
+            git.fetch(repo, branch)
+        git_state = git.state(repo, branch, fetch_remote=False)
+        targets = _target_names(registry, skill_names)
+        issues: list[dict[str, str]] = []
+        unexpected_dirty = _unexpected_dirty_paths(repo)
+        if unexpected_dirty:
+            issues.append({"type": "dirty-repository", "detail": ", ".join(unexpected_dirty)})
+        install_needed = _any_missing_local_install(config, registry, targets)
+        local_changed = _any_local_changed(
+            config, registry, [name for name in targets if not _needs_local_install(config, registry, name)]
+        )
+        link_issues = [
+            issue for issue in doctor(config_path=config_path)["issues"]
+            if issue.get("type") not in {"missing-skill"}
+        ]
+        issues.extend(link_issues)
+        registry_dirty = not git_state.clean and not unexpected_dirty
+        if unexpected_dirty:
+            action, summary = "blocked", "The sync repository has unrelated local changes."
+        elif git_state.diverged or (git_state.behind > 0 and local_changed):
+            action, summary = "conflict", "Both the remote repository and local Skills changed."
+            issues.append({"type": "content-conflict", "detail": "Choose and merge content manually."})
+        elif git_state.behind > 0 or install_needed:
+            action, summary = "pull", "Remote Skill changes are ready to install."
+        elif local_changed or registry_dirty or git_state.ahead > 0:
+            action, summary = "push", "Local Skill or selection changes are ready to publish."
+        elif link_issues:
+            action, summary = "repair-links", "Skill contents are current; some Agent links need repair."
+        else:
+            action, summary = "noop", "Everything is up to date."
+        return {
+            "schema_version": 1,
+            "initialized": True,
+            "action": action,
+            "summary": summary,
+            "skills": targets,
+            "repo": {
+                "path": str(repo), "branch": branch, "clean": git_state.clean,
+                "ahead": git_state.ahead, "behind": git_state.behind, "diverged": git_state.diverged,
+                "remote_checked": fetch_remote,
+            },
+            "issues": issues,
+        }
+    except (git.GitError, ValueError, OSError) as exc:
+        raise SkillSyncError(str(exc)) from exc
 
 
 def init_sync(
@@ -339,34 +419,25 @@ def sync(
     """Run the safe default synchronization workflow."""
 
     try:
-        config = _load_local_config(config_path)
-        repo = _repo_path(config)
-        branch = _branch(config)
-        registry = _load_local_registry(config)
-        if not git.is_clean(repo):
-            raise SkillSyncError("sync repository is dirty; commit or discard changes before sync")
-        targets = _target_names(registry, skill_names)
-
-        git.fetch(repo, branch)
-        current = git.state(repo, branch)
-        install_needed = _any_missing_local_install(config, registry, targets)
-        local_changed = _any_local_changed(
-            config,
-            registry,
-            [name for name in targets if not _needs_local_install(config, registry, name)],
-        )
-        remote_changed = current.behind > 0 or install_needed
-        if current.diverged or (remote_changed and local_changed):
+        preview = sync_preview(skill_names=skill_names, config_path=config_path, fetch_remote=True)
+        action = preview["action"]
+        if action == "setup":
+            raise SkillSyncError("skill-sync is not initialized; run init first")
+        if action == "blocked":
+            raise SkillSyncError("sync repository is dirty: " + preview["summary"])
+        if action == "conflict":
             raise SkillSyncError("both remote and local selected Skills changed; resolve manually")
-        if remote_changed:
+        if action == "pull":
             result = pull(skill_names=skill_names, config_path=config_path)
-            if "platform" not in config:
+            if "platform" not in _load_local_config(config_path):
                 result["links"] = link_skills(skill_names=skill_names, config_path=config_path)["links"]
             return result
-        if local_changed:
-            return push(skill_names=targets, config_path=config_path)
+        if action == "push":
+            return push(skill_names=skill_names, config_path=config_path)
+        if action == "repair-links":
+            return {"synced": [], "links": link_skills(skill_names=skill_names, config_path=config_path)["links"]}
         result: dict[str, Any] = {"synced": [], "noop": True}
-        if "platform" not in config:
+        if "platform" not in _load_local_config(config_path):
             result["links"] = link_skills(skill_names=skill_names, config_path=config_path)["links"]
         return result
     except SkillSyncError:
@@ -604,6 +675,14 @@ def _refuse_local_overwrite(
 
 
 def _ensure_only_expected_registry_dirty(repo: Path) -> None:
+    unexpected = _unexpected_dirty_paths(repo)
+    if unexpected:
+        raise SkillSyncError(
+            "sync repository has unexpected dirty changes: " + ", ".join(unexpected)
+        )
+
+
+def _unexpected_dirty_paths(repo: Path) -> list[str]:
     porcelain = git.run_git(repo, ["status", "--porcelain"])
     unexpected: list[str] = []
     for line in porcelain.splitlines():
@@ -612,10 +691,7 @@ def _ensure_only_expected_registry_dirty(repo: Path) -> None:
             path_text = path_text.split(" -> ", 1)[1]
         if path_text != REGISTRY_FILE:
             unexpected.append(path_text or line)
-    if unexpected:
-        raise SkillSyncError(
-            "sync repository has unexpected dirty changes: " + ", ".join(unexpected)
-        )
+    return unexpected
 
 
 def link_skills(
@@ -647,18 +723,19 @@ def link_skills(
         source = _local_skill_path_or_default(config, registry, name)
         _validate_skill_path(source)
         entry = registry.get("skills", {}).get(name, {})
-        configured = set(str(entry.get("targets", DEFAULT_AGENT_TARGETS)).split(",")) if isinstance(entry, dict) else set()
+        configured = _configured_agent_targets(entry)
         for agent in agents:
             if configured and agent.name not in configured:
                 continue
-            destination = agent.skills_dir / name
-            try:
-                method = create_directory_link(source, destination)
-                state = "linked"
-            except FileExistsError:
-                method = "none"
-                state = link_state(source, destination)
-            results.append({"skill": name, "agent": agent.name, "state": state, "method": method, "path": str(destination)})
+            for skills_dir in agent.skill_dirs:
+                destination = skills_dir / name
+                try:
+                    method = create_directory_link(source, destination)
+                    state = "linked"
+                except FileExistsError:
+                    method = "none"
+                    state = link_state(source, destination)
+                results.append({"skill": name, "agent": agent.name, "state": state, "method": method, "path": str(destination)})
     return {"links": results}
 
 
@@ -677,9 +754,10 @@ def unlink_skills(
             continue
         for name in targets:
             source = _local_skill_path_or_default(config, registry, name)
-            destination = agent.skills_dir / name
-            if remove_directory_link(source, destination):
-                removed.append({"skill": name, "agent": agent.name, "path": str(destination)})
+            for skills_dir in agent.skill_dirs:
+                destination = skills_dir / name
+                if remove_directory_link(source, destination):
+                    removed.append({"skill": name, "agent": agent.name, "path": str(destination)})
     return {"unlinked": removed}
 
 
@@ -701,13 +779,14 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
             if agent.name in disabled_agents:
                 matrix.append({"skill": name, "agent": agent.name, "state": "disabled"})
                 continue
-            state = link_state(source, agent.skills_dir / name)
+            states = [_agent_skill_state(source, skills_dir / name) for skills_dir in agent.skill_dirs]
+            state = _combined_link_state(states)
             matrix.append({"skill": name, "agent": agent.name, "state": state})
-            if state not in {"linked", "missing"}:
+            if state not in {"linked", "missing", "copied"}:
                 issues.append({"type": state, "skill": name, "agent": agent.name})
     return {
         "skills_root": str(_global_skill_root(config)),
-        "agents": [{"name": a.name, "display_name": a.display_name, "skills_dir": str(a.skills_dir), "detected": a.detected, "enabled": a.name not in disabled_agents} for a in agents],
+        "agents": [{"name": a.name, "display_name": a.display_name, "skills_dir": str(a.skills_dir), "skills_dirs": [str(path) for path in a.skill_dirs], "detected": a.detected, "enabled": a.name not in disabled_agents} for a in agents],
         "matrix": matrix,
         "issues": issues,
     }
@@ -750,18 +829,54 @@ def _disabled_agents(config: dict[str, Any]) -> set[str]:
     value = config.get("disabled_agents", [])
     if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
         raise SkillSyncError("configured disabled_agents must be a list of strings")
-    return set(value)
+    return {_normalize_agent_name(name) for name in value}
+
+
+def _configured_agent_targets(entry: Any) -> set[str]:
+    if not isinstance(entry, dict):
+        return set()
+    raw_targets = str(entry.get("targets", DEFAULT_AGENT_TARGETS)).split(",")
+    return {_normalize_agent_name(name.strip()) for name in raw_targets if name.strip()}
+
+
+def _normalize_agent_name(name: str) -> str:
+    if name in {"kimi-code", "kimi-desktop"}:
+        return "kimi"
+    return name
+
+
+def _combined_link_state(states: list[str]) -> str:
+    if not states:
+        return "missing"
+    unique = set(states)
+    if len(unique) == 1:
+        return states[0]
+    if unique <= {"linked", "missing"}:
+        return "partial"
+    if unique <= {"linked", "copied"}:
+        return "copied"
+    return next(state for state in states if state not in {"linked", "missing"})
+
+
+def _agent_skill_state(source: Path, destination: Path) -> str:
+    state = link_state(source, destination)
+    if state != "conflict" or not destination.is_dir() or destination.is_symlink():
+        return state
+    try:
+        return "copied" if hash_skill_dir(source) == hash_skill_dir(destination) else state
+    except (OSError, ValueError):
+        return state
 
 
 def scan_import_candidates(
-    agent_names: Iterable[str] = ("codex", "claude"),
+    agent_names: Iterable[str] | None = None,
     config_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """List real Agent-local Skill directories that can be globalized."""
     config = _load_local_config(config_path)
     global_root = _global_skill_root(config)
-    requested = set(agent_names)
     agents = {agent.name: agent for agent in detect_agents()}
+    requested = set(agent_names) if agent_names is not None else {"codex", "claude", "workbuddy"} & set(agents)
     unknown = requested - set(agents)
     if unknown:
         raise SkillSyncError("unknown Agent: " + ", ".join(sorted(unknown)))
@@ -839,6 +954,60 @@ def import_agent_skills(
     return {"imported": imported}
 
 
+def copy_global_skills_to_agents(
+    names: Iterable[str],
+    agent_names: Iterable[str],
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Copy canonical Skills into Agent directories without creating links.
+
+    A matching managed link is safely replaced with a real copy. Existing real
+    directories are never overwritten, including directories with the same
+    content, so this operation can also be used to detach a previously imported
+    Skill before it is removed from the global library.
+    """
+    name_list = list(dict.fromkeys(names))
+    requested_agents = set(agent_names)
+    if not name_list:
+        raise SkillSyncError("copy requires at least one Skill name")
+    if not requested_agents:
+        raise SkillSyncError("copy requires at least one Agent")
+    config = _load_local_config(config_path)
+    registry = _load_local_registry(config)
+    agents = {agent.name: agent for agent in detect_agents()}
+    unknown = requested_agents - set(agents)
+    if unknown:
+        raise SkillSyncError("unknown Agent: " + ", ".join(sorted(unknown)))
+    unavailable = [name for name in requested_agents if not agents[name].detected]
+    if unavailable:
+        raise SkillSyncError("Agent is not detected: " + ", ".join(sorted(unavailable)))
+    copied: list[dict[str, str]] = []
+    for name in name_list:
+        if Path(name).name != name or name in {".", ".."}:
+            raise SkillSyncError(f"invalid Skill name: {name}")
+        source = _local_skill_path_or_default(config, registry, name)
+        _validate_skill_path(source)
+        for agent_name in sorted(requested_agents):
+            agent = agents[agent_name]
+            for skills_dir in agent.skill_dirs:
+                destination = skills_dir / name
+                state = link_state(source, destination)
+                if state == "linked":
+                    remove_directory_link(source, destination)
+                elif state != "missing":
+                    raise SkillSyncError(
+                        f"refusing to overwrite existing {state} directory: {destination}"
+                    )
+                try:
+                    copy_skill_dir(source, destination)
+                except Exception:
+                    if not destination.exists() and state == "linked":
+                        create_directory_link(source, destination)
+                    raise
+                copied.append({"skill": name, "agent": agent_name, "path": str(destination), "state": "copied"})
+    return {"copied": copied}
+
+
 def delete_global_skills(
     names: Iterable[str],
     config_path: str | Path | None = None,
@@ -868,9 +1037,10 @@ def delete_global_skills(
             os.replace(source, backup)
             moved.append((name, source, backup))
             for agent in agents:
-                destination = agent.skills_dir / name
-                if remove_directory_link(source, destination):
-                    removed_links.append((source, destination))
+                for skills_dir in agent.skill_dirs:
+                    destination = skills_dir / name
+                    if remove_directory_link(source, destination):
+                        removed_links.append((source, destination))
         skills = registry.setdefault("skills", {})
         local_skills = config.setdefault("skills", {})
         for name in name_list:
@@ -889,3 +1059,20 @@ def delete_global_skills(
     for _, _, backup in moved:
         shutil.rmtree(backup)
     return {"deleted": name_list}
+
+
+def backup_global_skill(
+    name: str,
+    config_path: str | Path | None = None,
+) -> dict[str, str]:
+    """Create a timestamped local backup without changing the live Skill."""
+    if Path(name).name != name or name in {".", ".."}:
+        raise SkillSyncError(f"invalid Skill name: {name}")
+    config = _load_local_config(config_path)
+    source = _global_skill_root(config) / name
+    if source.is_symlink():
+        raise SkillSyncError(f"refusing to back up global Skill symlink: {name}")
+    _validate_skill_path(source)
+    destination = _global_skill_root(config) / ".skill-sync-backups" / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    copy_skill_dir(source, destination)
+    return {"skill": name, "backup_path": str(destination)}

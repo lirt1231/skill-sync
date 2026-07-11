@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-skill-sync"
+version = "0.1.0"
+description = "Synchronize selected Agent Skills across devices and Agent clients"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "lijiaming" },
+]
+dependencies = []
+
+[project.scripts]
+skill-sync = "skill_sync.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["skill_sync*"]
+
+[tool.setuptools.package-data]
+skill_sync = ["web_static/*.html", "web_static/*.js", "web_static/*.css"]

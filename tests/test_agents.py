@@ -19,27 +19,38 @@ class AgentDetectionTest(unittest.TestCase):
             self.assertEqual(agents["codex"].skills_dir, home / ".codex" / "skills")
             self.assertEqual(agents["workbuddy"].skills_dir, home / ".workbuddy" / "skills")
 
-    def test_kimi_code_falls_back_to_recommended_user_skill_directory(self):
+    def test_kimi_detects_code_user_skill_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             (home / ".kimi-code").mkdir()
             with mock.patch("skill_sync.agents.shutil.which", return_value=None):
                 agents = {item.name: item for item in detect_agents(env={}, home=home)}
-            self.assertTrue(agents["kimi-code"].detected)
+            self.assertTrue(agents["kimi"].detected)
             self.assertEqual(
-                agents["kimi-code"].skills_dir,
+                agents["kimi"].skills_dir,
                 home / ".config" / "agents" / "skills",
             )
 
-    def test_kimi_desktop_uses_effective_daimon_managed_skill_directory(self):
+    def test_kimi_detects_desktop_daimon_managed_skill_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             managed = home / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "skills"
             managed.mkdir(parents=True)
             with mock.patch("skill_sync.agents.shutil.which", return_value=None):
                 agents = {item.name: item for item in detect_agents(env={}, home=home)}
-            self.assertTrue(agents["kimi-desktop"].detected)
-            self.assertEqual(agents["kimi-desktop"].skills_dir, managed)
+            self.assertTrue(agents["kimi"].detected)
+            self.assertEqual(agents["kimi"].skills_dir, managed)
+
+    def test_kimi_combines_code_and_desktop_skill_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code = home / ".config" / "agents" / "skills"
+            desktop = home / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "skills"
+            (home / ".kimi-code").mkdir()
+            desktop.mkdir(parents=True)
+            with mock.patch("skill_sync.agents.shutil.which", return_value=None):
+                agents = {item.name: item for item in detect_agents(env={}, home=home)}
+            self.assertEqual(agents["kimi"].skill_dirs, (code, desktop))
 
     def test_detects_claude_code_skill_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -64,6 +75,8 @@ class AgentDetectionTest(unittest.TestCase):
             )}
         self.assertEqual(agents["codex"].skills_dir, Path("/custom/codex/skills"))
         self.assertEqual(agents["workbuddy"].skills_dir, Path("/custom/workbuddy/skills"))
-        self.assertEqual(agents["kimi-code"].skills_dir, Path("/custom/kimi-code-skills"))
-        self.assertEqual(agents["kimi-desktop"].skills_dir, Path("/custom/kimi-desktop-skills"))
+        self.assertEqual(
+            agents["kimi"].skill_dirs,
+            (Path("/custom/kimi-code-skills"), Path("/custom/kimi-desktop-skills")),
+        )
         self.assertEqual(agents["claude"].skills_dir, Path("/custom/claude/skills"))

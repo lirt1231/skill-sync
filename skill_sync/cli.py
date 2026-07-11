@@ -69,6 +69,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_skill_filter(status_parser)
     status_parser.set_defaults(handler=_handle_status)
 
+    preview_parser = subparsers.add_parser("preview", help="show the next safe synchronization action")
+    preview_parser.add_argument("--json", action="store_true", help="print JSON output")
+    _add_skill_filter(preview_parser)
+    preview_parser.set_defaults(handler=_handle_preview)
+
     pull_parser = subparsers.add_parser("pull", help="pull and install remote Skill changes")
     _add_skill_filter(pull_parser)
     pull_parser.set_defaults(handler=_handle_pull)
@@ -84,8 +89,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     import_parser = subparsers.add_parser("import", help="import Agent-local Skills into the global root")
     import_parser.add_argument("items", nargs="+", help="Skill names to import")
-    import_parser.add_argument("--agent", required=True, choices=("codex", "claude"))
+    import_parser.add_argument("--agent", required=True, choices=("codex", "claude", "workbuddy"))
     import_parser.set_defaults(handler=_handle_import)
+
+    copy_parser = subparsers.add_parser("copy", help="copy global Skills into an Agent without linking")
+    _add_skill_filter(copy_parser)
+    _add_agent_filter(copy_parser)
+    copy_parser.set_defaults(handler=_handle_copy)
 
     link_parser = subparsers.add_parser("link", help="link selected Skills into detected Agents")
     _add_skill_filter(link_parser)
@@ -111,7 +121,7 @@ def _build_parser() -> argparse.ArgumentParser:
     agent_parser.add_argument("action", choices=("enable", "disable"))
     agent_parser.add_argument(
         "name",
-        choices=("codex", "workbuddy", "kimi-code", "kimi-desktop", "claude"),
+        choices=("codex", "workbuddy", "kimi", "claude"),
     )
     agent_parser.set_defaults(handler=_handle_agent)
 
@@ -183,6 +193,13 @@ def _handle_status(args: argparse.Namespace) -> str:
     return _format_status(result)
 
 
+def _handle_preview(args: argparse.Namespace) -> str:
+    result = core.sync_preview(skill_names=args.skills, config_path=args.config, fetch_remote=False)
+    if args.json:
+        return _json(result)
+    return f"Next action: {result['action']}\n{result['summary']}"
+
+
 def _handle_pull(args: argparse.Namespace) -> str:
     result = core.pull(skill_names=args.skills, config_path=args.config)
     return f"Pulled: {_names(result.get('pulled'))}"
@@ -209,6 +226,13 @@ def _handle_sync(args: argparse.Namespace) -> str:
 def _handle_import(args: argparse.Namespace) -> str:
     result = core.import_agent_skills(args.items, args.agent, config_path=args.config)
     return f"Imported: {_names(item['name'] for item in result['imported'])}"
+
+
+def _handle_copy(args: argparse.Namespace) -> str:
+    if not args.skills or not args.agents:
+        raise SkillSyncError("copy requires at least one --skill and one --agent")
+    result = core.copy_global_skills_to_agents(args.skills, args.agents, config_path=args.config)
+    return f"Copied: {len(result['copied'])} Agent Skill directories"
 
 
 def _handle_link(args: argparse.Namespace) -> str:

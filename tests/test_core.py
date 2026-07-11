@@ -15,6 +15,7 @@ try:
         select_skills,
         status,
         sync,
+        sync_preview,
     )
     from skill_sync.errors import SkillSyncError
 except ImportError as exc:  # pragma: no cover - exercised by initial TDD red run
@@ -29,6 +30,7 @@ except ImportError as exc:  # pragma: no cover - exercised by initial TDD red ru
     pull = None
     push = None
     sync = None
+    sync_preview = None
     SkillSyncError = Exception
 
 from skill_sync.config import load_config, save_config
@@ -475,11 +477,20 @@ class CoreWorkflowTest(unittest.TestCase):
         self.init_from_remote()
         self.select_default_skill("alpha", "# alpha v1\n")
 
-        with self.assertRaisesRegex(SkillSyncError, "dirty|clean"):
-            sync(config_path=self.config_path, skill_names=["alpha"])
-
-        result = push(config_path=self.config_path, skill_names=["alpha"])
+        preview = sync_preview(config_path=self.config_path, skill_names=["alpha"])
+        self.assertEqual(preview["action"], "push")
+        result = sync(config_path=self.config_path, skill_names=["alpha"])
         self.assertEqual(result["pushed"], ["alpha"])
+
+    def test_sync_preview_is_cached_and_reports_link_repairs(self):
+        self.init_from_remote()
+        self.select_default_skill("alpha", "# alpha v1\n")
+        push(config_path=self.config_path, skill_names=["alpha"])
+        with mock.patch.object(core_module.git, "fetch") as fetch:
+            preview = sync_preview(config_path=self.config_path)
+        fetch.assert_not_called()
+        self.assertEqual(preview["action"], "noop")
+        self.assertFalse(preview["repo"]["remote_checked"])
 
     def test_core_reports_git_fail_closed_divergence_and_missing_remote_branch(self):
         self.init_from_remote()

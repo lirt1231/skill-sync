@@ -15,6 +15,11 @@ class AgentTarget:
     display_name: str
     skills_dir: Path
     detected: bool
+    extra_skill_dirs: tuple[Path, ...] = ()
+
+    @property
+    def skill_dirs(self) -> tuple[Path, ...]:
+        return (self.skills_dir, *self.extra_skill_dirs)
 
 
 def detect_agents(
@@ -46,6 +51,24 @@ def detect_agents(
         / "Application Support"
         / "kimi-desktop"
     )
+    kimi_code_detected = (
+        "KIMI_CODE_SKILLS_DIR" in environ
+        or (root / ".kimi-code").exists()
+        or kimi_code_skills.exists()
+        or shutil.which("kimi") is not None
+    )
+    kimi_desktop_detected = (
+        "KIMI_DESKTOP_SKILLS_DIR" in environ
+        or kimi_desktop_home.exists()
+        or kimi_desktop_skills.exists()
+    )
+    kimi_skill_dirs = []
+    if kimi_code_detected:
+        kimi_skill_dirs.append(kimi_code_skills)
+    if kimi_desktop_detected:
+        kimi_skill_dirs.append(kimi_desktop_skills)
+    if not kimi_skill_dirs:
+        kimi_skill_dirs.append(kimi_code_skills)
     claude_home = Path(environ.get("CLAUDE_HOME", root / ".claude"))
     return [
         AgentTarget(
@@ -61,18 +84,11 @@ def detect_agents(
             workbuddy_home.exists() or (root / ".workbuddy-ai").exists(),
         ),
         AgentTarget(
-            "kimi-code",
-            "Kimi Code",
-            kimi_code_skills,
-            (root / ".kimi-code").exists()
-            or kimi_code_skills.exists()
-            or shutil.which("kimi") is not None,
-        ),
-        AgentTarget(
-            "kimi-desktop",
-            "Kimi Desktop",
-            kimi_desktop_skills,
-            kimi_desktop_home.exists() or kimi_desktop_skills.exists(),
+            "kimi",
+            "Kimi",
+            kimi_skill_dirs[0],
+            kimi_code_detected or kimi_desktop_detected,
+            tuple(kimi_skill_dirs[1:]),
         ),
         AgentTarget(
             "claude",

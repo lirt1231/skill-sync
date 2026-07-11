@@ -18,8 +18,7 @@ The first release detects:
 
 - Codex: `$CODEX_HOME/skills` or `~/.codex/skills`
 - WorkBuddy: `$WORKBUDDY_HOME/skills` or `~/.workbuddy/skills`
-- Kimi Code: `$KIMI_CODE_SKILLS_DIR` or `~/.config/agents/skills`
-- Kimi Desktop: `$KIMI_DESKTOP_SKILLS_DIR` or its effective Daimon managed root under `~/Library/Application Support/kimi-desktop/daimon-share/daimon/skills`
+- Kimi: one sync target that detects Kimi Code at `$KIMI_CODE_SKILLS_DIR` or `~/.config/agents/skills`, and Kimi Desktop at `$KIMI_DESKTOP_SKILLS_DIR` or its effective Daimon managed root under `~/Library/Application Support/kimi-desktop/daimon-share/daimon/skills`
 - Claude Code: `$CLAUDE_HOME/skills` or `~/.claude/skills`
 
 Detection is conservative. An adapter is installed when its home directory, Skill directory, or executable/application marker exists. Tests may inject environment and home paths.

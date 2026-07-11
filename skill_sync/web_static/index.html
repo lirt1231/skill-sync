@@ -1,13 +1,21 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Skill Sync</title><link rel="stylesheet" href="/style.css"></head>
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Skill Sync</title><link rel="stylesheet" href="/style.css">
+</head>
 <body>
-  <main>
-    <header><div><p class="eyebrow">GLOBAL AGENT SKILLS</p><h1>Skill Sync</h1><p class="subtitle">一个目录，连接每一个 Agent。</p></div><div><button id="link-all">一键链接全部 Agents</button> <button id="sync" class="primary">立即同步</button></div></header>
-    <section id="cards" class="cards"></section>
-    <section class="panel"><div class="panel-head"><div><h2>从 Agent 导入</h2><p>将 Codex 或 Claude Code 中的本地 Skill 迁移到全局目录，并把原目录替换成软链接。</p></div></div><div id="imports"></div></section>
-    <section class="panel"><div class="panel-head"><div><h2>Skill 安装矩阵</h2><p>真实内容保存在 ~/.agents/skills，Agent 目录仅建立链接。</p></div><div><button id="delete-selected">删除所选</button> <button id="refresh">刷新</button></div></div><div class="table-wrap"><table><thead id="head"></thead><tbody id="body"></tbody></table></div></section>
-    <section class="panel"><div class="panel-head"><div><h2>诊断</h2><p>冲突和断链不会被自动覆盖。</p></div></div><div id="issues"></div></section>
-    <div id="toast" role="status"></div>
+  <main class="shell">
+    <header class="topbar"><a class="brand" href="#overview"><span>✦</span> Skill Sync</a><nav aria-label="主导航"><a href="#skills">Skills</a><a href="#agents">Agents</a><a href="#issues">问题</a></nav><button id="refresh" class="quiet">刷新</button></header>
+    <section id="setup" class="setup hidden" aria-labelledby="setup-title"><p class="eyebrow">WELCOME</p><h1 id="setup-title">让你的 Skills 跟着你走。</h1><p>连接一个私有 Git 仓库，Skill Sync 会把内容保存在本机全局目录，并安全链接到你的 Agent。</p><form id="setup-form"><label>Git 仓库地址<input name="repo" required placeholder="git@github.com:you/agent-skills.git"></label><label>分支<input name="branch" value="main"></label><details><summary>高级设置</summary><label>全局 Skill 目录<input name="skills_root" placeholder="~/.agents/skills"></label><label>本地仓库目录<input name="sync_dir" placeholder="默认本地数据目录"></label></details><button class="primary" type="submit">连接并开始使用</button></form><p class="fine-print">不会保存 Git 密码或令牌；认证由你的系统 Git 凭据处理。</p></section>
+    <div id="app" class="hidden">
+      <section id="overview" class="hero"><div><p class="eyebrow">PERSONAL SKILL LIBRARY</p><h1>你的 Agent Skills，<br>始终保持一致。</h1><p id="sync-summary" class="subtitle"></p></div><div class="sync-card"><span id="sync-label" class="status-pill"></span><button id="sync" class="primary large">立即同步</button><p id="sync-note" class="fine-print"></p></div></section>
+      <section id="cards" class="cards" aria-label="概览"></section>
+      <section id="issues" class="panel"><div class="panel-head"><div><p class="eyebrow">ATTENTION</p><h2>需要处理</h2></div></div><div id="issue-list"></div></section>
+      <section id="skills" class="panel"><div class="panel-head wrap"><div><p class="eyebrow">LIBRARY</p><h2>Skills</h2><p>内容仅保存在全局目录；高级路径和哈希信息按需展开。</p></div><div class="actions"><input id="search" type="search" placeholder="搜索 Skill" aria-label="搜索 Skill"><button id="select-all">全选可见项</button><button id="select-selected">同步所选</button><button id="deselect-selected">取消同步</button><button id="link-selected">修复链接</button><select id="copy-agent" aria-label="复制目标 Agent"><option value="codex">复制到 Codex</option><option value="claude">复制到 Claude Code</option><option value="workbuddy">复制到 WorkBuddy</option></select><button id="copy-selected">复制副本</button><button id="delete-selected" class="danger">删除</button></div></div><div id="skill-list" class="skill-list"></div></section>
+      <section id="agents" class="panel"><div class="panel-head"><div><p class="eyebrow">CONNECTIONS</p><h2>Agents</h2><p>启用的 Agent 会使用指向全局 Skill 的安全目录链接。</p></div></div><div id="agent-list" class="agent-list"></div></section>
+      <section class="panel"><div class="panel-head"><div><p class="eyebrow">IMPORT</p><h2>从现有 Agent 导入</h2><p>按来源选择多个 Skill。导入将验证并复制内容到全局目录，然后将原位置替换为链接。</p></div></div><div id="imports"></div></section>
+    </div>
+    <div id="toast" role="status" aria-live="polite"></div>
   </main><script src="/app.js"></script>
 </body></html>

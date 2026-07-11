@@ -43,6 +43,9 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
             if path == "/api/state":
                 self._json(_state(config_path))
                 return
+            if path == "/api/preview":
+                self._json(core.sync_preview(config_path=config_path, fetch_remote=False))
+                return
             if path == "/api/token":
                 self._json({"token": token})
                 return
@@ -67,13 +70,17 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                 body = json.loads(self.rfile.read(length) or b"{}")
                 path = urlparse(self.path).path
                 kwargs = {"skill_names": body.get("skills"), "config_path": config_path}
-                if path == "/api/sync":
-                    try:
-                        result = core.sync(**kwargs)
-                    except SkillSyncError as exc:
-                        if "sync repository is dirty" not in str(exc):
-                            raise
-                        result = core.push(**kwargs)
+                if path == "/api/init":
+                    result = core.init_sync(
+                        body.get("repo", ""),
+                        sync_dir=body.get("sync_dir") or None,
+                        branch=body.get("branch") or "main",
+                        platform=None,
+                        skills_root=body.get("skills_root") or None,
+                        config_path=config_path,
+                    )
+                elif path == "/api/sync":
+                    result = core.sync(**kwargs)
                 elif path == "/api/link":
                     result = core.link_skills(agent_names=body.get("agents"), **kwargs)
                 elif path == "/api/unlink":
@@ -86,10 +93,21 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                     result = core.import_agent_skills(
                         body.get("skills", []), body.get("agent", ""), config_path=config_path
                     )
+                elif path == "/api/copy":
+                    result = core.copy_global_skills_to_agents(
+                        body.get("skills", []), body.get("agents", []), config_path=config_path
+                    )
                 elif path == "/api/delete":
                     result = core.delete_global_skills(
                         body.get("skills", []), config_path=config_path
                     )
+                elif path == "/api/agent":
+                    if body.get("enabled"):
+                        result = core.enable_agent_sync(body.get("agent", ""), config_path=config_path)
+                    else:
+                        result = core.disable_agent_sync(body.get("agent", ""), config_path=config_path)
+                elif path == "/api/backup":
+                    result = core.backup_global_skill(body.get("skill", ""), config_path=config_path)
                 else:
                     self._json({"error": "unknown action"}, HTTPStatus.NOT_FOUND)
                     return
@@ -112,6 +130,21 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
 
 
 def _state(config_path: str | None) -> dict[str, Any]:
+    preview = core.sync_preview(config_path=config_path, fetch_remote=False)
+    if not preview["initialized"]:
+        agents = [
+            {"name": agent.name, "display_name": agent.display_name, "detected": agent.detected,
+             "enabled": True, "skills_dir": str(agent.skills_dir), "skills_dirs": [str(path) for path in agent.skill_dirs]}
+            for agent in core.detect_agents()
+        ]
+        return {
+            "schema_version": 1,
+            "initialized": False,
+            "preview": preview,
+            "status": {"skills": []},
+            "doctor": {"agents": agents, "matrix": [], "issues": []},
+            "import_candidates": [],
+        }
     diagnosis = core.doctor(config_path=config_path)
     try:
         sync_status = core.status(config_path=config_path, fetch_remote=False)
@@ -140,4 +173,11 @@ def _state(config_path: str | None) -> dict[str, Any]:
         import_candidates = core.scan_import_candidates(config_path=config_path)
     except SkillSyncError:
         import_candidates = []
-    return {"status": sync_status, "doctor": diagnosis, "import_candidates": import_candidates}
+    return {
+        "schema_version": 1,
+        "initialized": True,
+        "preview": preview,
+        "status": sync_status,
+        "doctor": diagnosis,
+        "import_candidates": import_candidates,
+    }

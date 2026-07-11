@@ -140,15 +140,23 @@ class CliTest(unittest.TestCase):
         import_skills.assert_called_once_with(["alpha"], "codex", config_path="/tmp/config.json")
         self.assertIn("Imported: alpha", stdout)
 
-    def test_agent_disable_dispatches_to_core(self):
-        with mock.patch.object(
-            cli.core, "disable_agent_sync", return_value={"disabled": "kimi-desktop", "unlinked": []}
-        ) as disable:
-            code, stdout, stderr = run_cli(["agent", "disable", "kimi-desktop"])
+    def test_copy_dispatches_selected_skills_and_agent(self):
+        with mock.patch.object(cli.core, "copy_global_skills_to_agents", return_value={"copied": [{}]}) as copy:
+            code, stdout, stderr = run_cli(["copy", "--skill", "alpha", "--agent", "workbuddy"])
         self.assertEqual(code, 0)
         self.assertEqual(stderr, "")
-        disable.assert_called_once_with("kimi-desktop", config_path=None)
-        self.assertIn("Disabled Agent sync: kimi-desktop", stdout)
+        copy.assert_called_once_with(["alpha"], ["workbuddy"], config_path=None)
+        self.assertIn("Copied: 1", stdout)
+
+    def test_agent_disable_dispatches_to_core(self):
+        with mock.patch.object(
+            cli.core, "disable_agent_sync", return_value={"disabled": "kimi", "unlinked": []}
+        ) as disable:
+            code, stdout, stderr = run_cli(["agent", "disable", "kimi"])
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        disable.assert_called_once_with("kimi", config_path=None)
+        self.assertIn("Disabled Agent sync: kimi", stdout)
 
     def test_repeated_skill_filters_dispatch_to_status_pull_push(self):
         status_result = {
@@ -182,6 +190,16 @@ class CliTest(unittest.TestCase):
         )
         self.assertIn("Pushed: alpha, beta", stdout)
         self.assertIn("committed", stdout)
+
+    def test_preview_dispatches_without_network_refresh(self):
+        with mock.patch.object(cli.core, "sync_preview", return_value={
+            "action": "push", "summary": "Local changes are ready.", "initialized": True
+        }) as preview:
+            code, stdout, stderr = run_cli(["--config", "/tmp/config.json", "preview", "--skill", "alpha"])
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        preview.assert_called_once_with(skill_names=["alpha"], config_path="/tmp/config.json", fetch_remote=False)
+        self.assertIn("push", stdout)
 
     def test_status_text_output_includes_repo_and_skill_basics(self):
         result = {

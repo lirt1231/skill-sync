@@ -9,6 +9,7 @@ from skill_sync.core import (
     disable_agent_sync,
     enable_agent_sync,
     import_agent_skills,
+    copy_global_skills_to_agents,
     delete_global_skills,
     link_skills,
     scan_import_candidates,
@@ -33,6 +34,7 @@ class ImportAgentSkillsTest(unittest.TestCase):
         save_config(self.config_path, config)
         save_registry(self.repo / "registry.yaml", empty_registry())
         self.agent = AgentTarget("codex", "Codex", self.agent_root, True)
+        self.workbuddy = AgentTarget("workbuddy", "WorkBuddy", self.root / "workbuddy" / "skills", True)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -55,7 +57,7 @@ class ImportAgentSkillsTest(unittest.TestCase):
         registry_entry = load_registry(self.repo / "registry.yaml")["skills"]["alpha"]
         self.assertEqual(
             registry_entry["targets"],
-            "codex,workbuddy,kimi-code,kimi-desktop,claude",
+            "codex,workbuddy,kimi,claude",
         )
 
     def test_import_refuses_different_global_content_without_touching_source(self):
@@ -76,6 +78,36 @@ class ImportAgentSkillsTest(unittest.TestCase):
         with mock.patch("skill_sync.core.detect_agents", return_value=[self.agent]):
             result = scan_import_candidates(["codex"], config_path=self.config_path)
         self.assertEqual([(item["name"], item["state"]) for item in result], [("alpha", "importable"), ("beta", "conflict")])
+
+    def test_scan_import_candidates_includes_workbuddy_by_default(self):
+        self.write_skill(self.workbuddy.skills_dir, "wb-skill")
+        with mock.patch("skill_sync.core.detect_agents", return_value=[self.agent, self.workbuddy]):
+            result = scan_import_candidates(config_path=self.config_path)
+        self.assertEqual(result, [{
+            "name": "wb-skill", "agent": "workbuddy", "path": str(self.workbuddy.skills_dir / "wb-skill"), "state": "importable"
+        }])
+
+    def test_copy_global_skill_replaces_managed_link_with_real_agent_copy(self):
+        global_skill = self.write_skill(self.global_root, "alpha", "# alpha\n")
+        self.agent_root.mkdir(parents=True)
+        linked = self.agent_root / "alpha"
+        linked.symlink_to(global_skill, target_is_directory=True)
+        save_registry(self.repo / "registry.yaml", {
+            "version": 2, "skills": {"alpha": {"selected": True, "display_name": "alpha", "targets": "codex"}}
+        })
+        with mock.patch("skill_sync.core.detect_agents", return_value=[self.agent]):
+            result = copy_global_skills_to_agents(["alpha"], ["codex"], config_path=self.config_path)
+        self.assertEqual(result["copied"][0]["state"], "copied")
+        self.assertFalse(linked.is_symlink())
+        self.assertEqual((linked / "SKILL.md").read_text(), "# alpha\n")
+
+    def test_copy_global_skill_refuses_existing_real_agent_directory(self):
+        self.write_skill(self.global_root, "alpha", "# global\n")
+        existing = self.write_skill(self.agent_root, "alpha", "# local\n")
+        with mock.patch("skill_sync.core.detect_agents", return_value=[self.agent]):
+            with self.assertRaisesRegex(SkillSyncError, "refusing to overwrite"):
+                copy_global_skills_to_agents(["alpha"], ["codex"], config_path=self.config_path)
+        self.assertEqual((existing / "SKILL.md").read_text(), "# local\n")
 
     def test_delete_global_skill_removes_managed_link_and_registry_entry(self):
         destination = self.write_skill(self.global_root, "alpha", "# alpha\n")
@@ -118,3 +150,26 @@ class ImportAgentSkillsTest(unittest.TestCase):
             with self.assertRaisesRegex(SkillSyncError, "disabled"):
                 link_skills(agent_names=["codex"], config_path=self.config_path)
             self.assertEqual(enable_agent_sync("codex", config_path=self.config_path)["enabled"], "codex")
+
+    def test_kimi_link_uses_all_detected_skill_directories_and_accepts_split_targets(self):
+        destination = self.write_skill(self.global_root, "alpha")
+        code_root = self.root / "kimi-code" / "skills"
+        desktop_root = self.root / "kimi-desktop" / "skills"
+        save_registry(self.repo / "registry.yaml", {
+            "version": 2,
+            "skills": {
+                "alpha": {
+                    "selected": True,
+                    "display_name": "alpha",
+                    "targets": "kimi-code,kimi-desktop",
+                }
+            },
+        })
+        kimi = AgentTarget("kimi", "Kimi", code_root, True, (desktop_root,))
+
+        with mock.patch("skill_sync.core.detect_agents", return_value=[kimi]):
+            result = link_skills(agent_names=["kimi"], config_path=self.config_path)
+
+        self.assertEqual(len(result["links"]), 2)
+        self.assertEqual((code_root / "alpha").resolve(), destination.resolve())
+        self.assertEqual((desktop_root / "alpha").resolve(), destination.resolve())
