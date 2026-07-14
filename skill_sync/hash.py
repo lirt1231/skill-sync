@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 import struct
 from pathlib import Path
 
@@ -23,6 +25,20 @@ def is_ignored_path(relative_path: str, *, is_dir: bool = False) -> bool:
     return name in IGNORED_FILE_NAMES
 
 
+def is_link_or_reparse(path: str | Path) -> bool:
+    """Return whether a path is a symlink or Windows reparse point."""
+
+    candidate = Path(path)
+    if candidate.is_symlink():
+        return True
+    try:
+        attributes = getattr(os.lstat(candidate), "st_file_attributes", 0)
+    except OSError:
+        return False
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & flag)
+
+
 def hash_skill_dir(path: str | Path) -> str:
     """Return the deterministic SHA-256 content hash for a Skill directory.
 
@@ -31,8 +47,8 @@ def hash_skill_dir(path: str | Path) -> str:
     byte lengths so binary content cannot create ambiguous boundaries.
     """
     root = Path(path)
-    if root.is_symlink():
-        raise ValueError(f"Cannot hash skill directory symlink: {root}")
+    if is_link_or_reparse(root):
+        raise ValueError(f"Cannot hash skill directory symlink or reparse point: {root}")
     if not root.is_dir():
         raise ValueError(f"Skill path is not a directory: {root}")
 
@@ -64,8 +80,10 @@ def _collect_hashable_files(
     for child in sorted(directory.iterdir(), key=lambda entry: entry.name):
         relative_path = child.relative_to(root).as_posix()
 
-        if child.is_symlink():
-            raise ValueError(f"Cannot hash symlink in skill directory: {relative_path}")
+        if is_link_or_reparse(child):
+            raise ValueError(
+                f"Cannot hash symlink or reparse point in skill directory: {relative_path}"
+            )
         if child.is_dir():
             if is_ignored_path(relative_path, is_dir=True):
                 continue

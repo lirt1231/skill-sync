@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,29 @@ def default_config_path(
         home_path = Path.home() if home is None else home
         base_path = home_path / ".config"
     return base_path / "skill-sync" / "config.json"
+
+
+def default_data_root(
+    env: Mapping[str, str] | None = None,
+    home: Path | None = None,
+    *,
+    os_name: str | None = None,
+    platform: str | None = None,
+) -> Path:
+    """Return the machine-local root for rendered deployments and receipts."""
+
+    environ = os.environ if env is None else env
+    home_path = Path.home() if home is None else home
+    current_os = os.name if os_name is None else os_name
+    current_platform = sys.platform if platform is None else platform
+
+    if current_os == "nt":
+        base = Path(environ.get("LOCALAPPDATA", home_path / "AppData" / "Local"))
+    elif current_platform == "darwin":
+        base = home_path / "Library" / "Application Support"
+    else:
+        base = Path(environ.get("XDG_DATA_HOME", home_path / ".local" / "share"))
+    return base / "skill-sync"
 
 
 def empty_config() -> dict[str, Any]:
@@ -91,6 +115,11 @@ def _validate_config_shape(config: Any) -> None:
     skills = config.get("skills")
     if not isinstance(skills, dict):
         raise ValueError("Config skills must be a mapping")
+    data_root = config.get("data_root")
+    if data_root is not None and (not isinstance(data_root, str) or not data_root):
+        raise ValueError("Config data_root must be a non-empty string")
+    if data_root is not None and not Path(data_root).expanduser().is_absolute():
+        raise ValueError("Config data_root must be an absolute path")
     disabled_agents = config.get("disabled_agents", [])
     if not isinstance(disabled_agents, list) or not all(
         isinstance(name, str) for name in disabled_agents

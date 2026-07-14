@@ -68,8 +68,9 @@ skill-sync preview --json
 
 ### Machine-readable CLI output
 
-`version`, `scan`, `status`, `preview`, `doctor`, and `managed check` support
-`--json`. During the pre-1.0 releases, their machine-readable contract uses
+`version`, `scan`, `status`, `preview`, `doctor`, `managed check`,
+`deploy status`, and `deploy gc` support `--json`. During the pre-1.0 releases,
+their machine-readable contract uses
 schema version 1 and always returns the same top-level envelope:
 
 ```json
@@ -98,6 +99,23 @@ to stderr and the command returns its structured exit code:
 - `4`: operation blocked by a safety check
 
 Text mode remains intended for interactive use and keeps its concise output.
+
+Before migrating existing Agent links away from editable canonical sources,
+preview every affected Skill/client pair, perform the migration, and inspect
+the rendered deployment state:
+
+```bash
+skill-sync deploy preview
+skill-sync deploy migrate
+skill-sync deploy status
+skill-sync deploy status --json
+skill-sync deploy gc --dry-run
+```
+
+`deploy preview` is read-only. `deploy migrate` renders immutable snapshots and
+switches managed Agent links only after the deployment is verified. Deployment
+garbage collection removes only verified snapshots that no detected client
+currently references; run it with `--dry-run` first.
 
 Before modifying a Skill from an Agent client, inspect the exact path first:
 

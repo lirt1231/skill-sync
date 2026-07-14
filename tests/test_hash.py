@@ -4,6 +4,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from skill_sync.hash import hash_skill_dir
 
@@ -145,6 +146,16 @@ class HashSkillDirTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "symlink.*linked.md"):
                 hash_skill_dir(root)
+
+    def test_hash_rejects_reparse_point_at_skill_root(self):
+        with tempfile.TemporaryDirectory() as skill_dir:
+            root = Path(skill_dir)
+            write_file(root, "SKILL.md", b"# Example\n")
+            with mock.patch(
+                "skill_sync.hash.is_link_or_reparse", return_value=True
+            ):
+                with self.assertRaisesRegex(ValueError, "reparse point"):
+                    hash_skill_dir(root)
 
 
 if __name__ == "__main__":

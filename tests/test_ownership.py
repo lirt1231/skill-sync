@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest import mock
 
 from skill_sync.agents import AgentClient, AgentTarget
+from skill_sync.deployment import render_base_deployment
 from skill_sync.ownership import OwnershipResult, inspect_ownership
 
 
@@ -57,7 +58,7 @@ class OwnershipInspectionTest(unittest.TestCase):
                 self.assertEqual(result.state, "managed-source")
                 self.assertEqual(result.role, "source")
                 self.assertEqual(result.skill, "alpha")
-                self.assertEqual(result.source_path, str(self.alpha))
+                self.assertEqual(result.source_path, str(self.alpha.resolve()))
                 self.assertIsNone(result.client)
                 self.assertTrue(result.migration_required)
 
@@ -77,11 +78,84 @@ class OwnershipInspectionTest(unittest.TestCase):
                 "role": "direct-source-link",
                 "skill": "alpha",
                 "input_path": str(destination / "SKILL.md"),
-                "source_path": str(self.alpha),
+                "source_path": str(self.alpha.resolve()),
                 "client": "codex",
                 "migration_required": True,
+                "deployment_path": None,
+                "resolution_hash": None,
+                "source_hash": None,
+                "rendered_hash": None,
+                "referenced": None,
             },
         )
+
+    def test_rendered_agent_link_and_deployment_descendant_are_managed(self):
+        rendered_root = self.root / "data" / "rendered"
+        deployed = render_base_deployment(
+            self.alpha, rendered_root, "alpha", "codex"
+        )
+        destination = self.codex_root / "alpha"
+        destination.parent.mkdir(parents=True)
+        destination.symlink_to(deployed.path, target_is_directory=True)
+
+        linked = self.inspect(
+            destination / "SKILL.md", rendered_root=rendered_root
+        )
+        cached = self.inspect(
+            deployed.path / "scripts" / "run.py", rendered_root=rendered_root
+        )
+
+        self.assertTrue(linked.managed)
+        self.assertTrue(linked.healthy)
+        self.assertEqual(linked.state, "managed-deployment")
+        self.assertEqual(linked.role, "rendered-deployment-link")
+        self.assertFalse(linked.migration_required)
+        self.assertEqual(linked.deployment_path, str(deployed.path))
+        self.assertTrue(linked.referenced)
+        self.assertTrue(cached.managed)
+        self.assertEqual(cached.role, "deployment")
+        self.assertEqual(cached.state, "managed-deployment")
+        self.assertTrue(cached.referenced)
+
+    def test_tampered_and_stale_deployments_fail_closed(self):
+        rendered_root = self.root / "data" / "rendered"
+        deployed = render_base_deployment(
+            self.alpha, rendered_root, "alpha", "codex"
+        )
+        destination = self.codex_root / "alpha"
+        destination.parent.mkdir(parents=True)
+        destination.symlink_to(deployed.path, target_is_directory=True)
+        (self.alpha / "SKILL.md").write_text("# changed source\n", encoding="utf-8")
+
+        stale = self.inspect(destination, rendered_root=rendered_root)
+        self.assertTrue(stale.managed)
+        self.assertFalse(stale.healthy)
+        self.assertEqual(stale.state, "stale-render")
+
+        deployed_skill = deployed.path / "SKILL.md"
+        deployed_skill.chmod(0o644)
+        deployed_skill.write_text("tampered\n", encoding="utf-8")
+        tampered = self.inspect(destination, rendered_root=rendered_root)
+        self.assertTrue(tampered.managed)
+        self.assertFalse(tampered.healthy)
+        self.assertEqual(tampered.state, "tampered-render")
+
+    def test_endpoint_rejects_valid_deployment_for_stale_source_resolution(self):
+        rendered_root = self.root / "data" / "rendered"
+        other_source = make_skill(self.root / "other-global", "alpha")
+        (other_source / "SKILL.md").write_text("# other alpha\n", encoding="utf-8")
+        deployed = render_base_deployment(
+            other_source, rendered_root, "alpha", "codex"
+        )
+        destination = self.codex_root / "alpha"
+        destination.parent.mkdir(parents=True)
+        destination.symlink_to(deployed.path, target_is_directory=True)
+
+        result = self.inspect(destination, rendered_root=rendered_root)
+
+        self.assertTrue(result.managed)
+        self.assertFalse(result.healthy)
+        self.assertEqual(result.state, "stale-render")
 
     def test_wrong_link_remains_managed_but_is_unhealthy(self):
         other = make_skill(self.skills_root, "other")
@@ -95,7 +169,7 @@ class OwnershipInspectionTest(unittest.TestCase):
         self.assertFalse(result.healthy)
         self.assertEqual(result.state, "wrong-link")
         self.assertEqual(result.role, "direct-source-link")
-        self.assertEqual(result.source_path, str(self.alpha))
+        self.assertEqual(result.source_path, str(self.alpha.resolve()))
         self.assertEqual(result.client, "codex")
 
     def test_broken_link_remains_managed_but_is_unhealthy(self):
@@ -227,7 +301,7 @@ class OwnershipInspectionTest(unittest.TestCase):
 
         self.assertTrue(result.managed)
         self.assertEqual(result.input_path, "alpha")
-        self.assertEqual(result.source_path, str(self.alpha))
+        self.assertEqual(result.source_path, str(self.alpha.resolve()))
 
     def test_missing_and_unknown_name_inputs_are_ambiguous(self):
         for input_path in (self.root / "does-not-exist", "unknown"):

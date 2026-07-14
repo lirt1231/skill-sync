@@ -13,6 +13,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from skill_sync.deployment import expected_provenance, verify_deployment
+from skill_sync.hash import hash_skill_dir
+
 
 @dataclass(frozen=True)
 class OwnershipResult:
@@ -27,6 +30,11 @@ class OwnershipResult:
     source_path: str | None
     client: str | None
     migration_required: bool
+    deployment_path: str | None = None
+    resolution_hash: str | None = None
+    source_hash: str | None = None
+    rendered_hash: str | None = None
+    referenced: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-ready representation without filesystem objects."""
@@ -56,6 +64,7 @@ def inspect_ownership(
     clients: Iterable[Any] = (),
     targets: Iterable[Any] = (),
     client: str | None = None,
+    rendered_root: str | Path | None = None,
 ) -> OwnershipResult:
     """Inspect whether one path is owned by the current Skill Sync model.
 
@@ -73,6 +82,9 @@ def inspect_ownership(
     canonical_root = _absolute_path(skills_root)
     intent = _ownership_intent(selected_skills, registry)
     endpoints = _endpoints(clients, targets)
+    deployment_root = (
+        None if rendered_root is None else _absolute_path(rendered_root)
+    )
 
     if _is_name(raw_input):
         name = raw_input
@@ -119,9 +131,23 @@ def inspect_ownership(
             role="source",
             skill=source_match,
             input_path=display_input,
-            source_path=str(source),
+            source_path=_resolved_text(source),
             client=None,
             migration_required=True,
+        )
+
+    deployment = (
+        None
+        if deployment_root is None
+        else _deployment_for_path(path, deployment_root)
+    )
+    if deployment is not None:
+        return _inspect_deployment_path(
+            display_input,
+            deployment,
+            canonical_root,
+            intent,
+            endpoints,
         )
 
     if len(endpoint_matches) > 1:
@@ -152,10 +178,23 @@ def inspect_ownership(
                 role="direct-source-link",
                 skill=skill_name,
                 input_path=display_input,
-                source_path=str(source),
+                source_path=_resolved_text(source),
                 client=endpoint.client_id,
                 migration_required=True,
             )
+        if deployment_root is not None:
+            deployment_target = _directory_link_target(destination)
+            if (
+                deployment_target is not None
+                and _is_beneath(deployment_target, deployment_root)
+            ):
+                return _inspect_endpoint_deployment(
+                    display_input,
+                    skill_name,
+                    source,
+                    endpoint,
+                    deployment_target,
+                )
         if link_health in {"wrong-link", "broken-link"}:
             return OwnershipResult(
                 managed=True,
@@ -164,7 +203,7 @@ def inspect_ownership(
                 role="direct-source-link",
                 skill=skill_name,
                 input_path=display_input,
-                source_path=str(source),
+                source_path=_resolved_text(source),
                 client=endpoint.client_id,
                 migration_required=True,
             )
@@ -317,6 +356,198 @@ def _direct_link_health(source: Path, destination: Path) -> str:
     return "missing"
 
 
+def _inspect_endpoint_deployment(
+    input_path: str,
+    skill_name: str,
+    source: Path,
+    endpoint: _Endpoint,
+    deployment: Path,
+) -> OwnershipResult:
+    try:
+        current_source_hash = hash_skill_dir(source)
+    except (OSError, ValueError):
+        current_source_hash = None
+    expected = (
+        None
+        if current_source_hash is None
+        else expected_provenance(skill_name, current_source_hash, endpoint.client_id)
+    )
+    verification = verify_deployment(deployment, expected_provenance=expected)
+    provenance = verification.provenance or {}
+    common = {
+        "managed": True,
+        "role": "rendered-deployment-link",
+        "skill": skill_name,
+        "input_path": input_path,
+        "source_path": _resolved_text(source),
+        "client": endpoint.client_id,
+        "deployment_path": str(deployment),
+        "resolution_hash": provenance.get("resolution_hash"),
+        "source_hash": provenance.get("source_hash"),
+        "rendered_hash": provenance.get("rendered_hash"),
+        "referenced": True,
+    }
+    if verification.state == "missing":
+        return OwnershipResult(
+            healthy=False,
+            state="missing-render",
+            migration_required=True,
+            **common,
+        )
+    if provenance.get("logical_skill") != skill_name or provenance.get(
+        "target_client"
+    ) != endpoint.client_id:
+        return OwnershipResult(
+            healthy=False,
+            state="wrong-link",
+            migration_required=True,
+            **common,
+        )
+    if verification.state == "stale":
+        return OwnershipResult(
+            healthy=False,
+            state="stale-render",
+            migration_required=True,
+            **common,
+        )
+    if not verification.ok:
+        return OwnershipResult(
+            healthy=False,
+            state="tampered-render",
+            migration_required=True,
+            **common,
+        )
+    if current_source_hash != provenance.get("source_hash"):
+        return OwnershipResult(
+            healthy=False,
+            state="stale-render",
+            migration_required=True,
+            **common,
+        )
+    return OwnershipResult(
+        healthy=True,
+        state="managed-deployment",
+        migration_required=False,
+        **common,
+    )
+
+
+def _inspect_deployment_path(
+    input_path: str,
+    deployment: Path,
+    canonical_root: Path,
+    intent: _Intent,
+    endpoints: tuple[_Endpoint, ...],
+) -> OwnershipResult:
+    verification = verify_deployment(deployment)
+    provenance = verification.provenance or {}
+    skill_name = provenance.get("logical_skill")
+    client_id = provenance.get("target_client")
+    if not isinstance(skill_name, str) or not isinstance(client_id, str):
+        return _ambiguous(input_path)
+    source = canonical_root / skill_name
+    if skill_name not in intent.selected:
+        return _unmanaged(input_path, skill=skill_name, source_path=source)
+    referenced = any(
+        endpoint.client_id == client_id
+        and _same_file(deployment, endpoint.skills_root / skill_name)
+        for endpoint in endpoints
+    )
+    try:
+        current_source_hash = hash_skill_dir(source)
+    except (OSError, ValueError):
+        current_source_hash = None
+    expected = (
+        None
+        if current_source_hash is None
+        else expected_provenance(skill_name, current_source_hash, client_id)
+    )
+    if expected is not None:
+        verification = verify_deployment(
+            deployment, expected_provenance=expected
+        )
+        provenance = verification.provenance or provenance
+    common = {
+        "managed": True,
+        "role": "deployment",
+        "skill": skill_name,
+        "input_path": input_path,
+        "source_path": _resolved_text(source),
+        "client": client_id,
+        "deployment_path": str(deployment),
+        "resolution_hash": provenance.get("resolution_hash"),
+        "source_hash": provenance.get("source_hash"),
+        "rendered_hash": provenance.get("rendered_hash"),
+        "referenced": referenced,
+    }
+    if not verification.ok:
+        if verification.state == "stale":
+            return OwnershipResult(
+                healthy=False,
+                state="stale-render",
+                migration_required=True,
+                **common,
+            )
+        return OwnershipResult(
+            healthy=False,
+            state="tampered-render",
+            migration_required=True,
+            **common,
+        )
+    if current_source_hash != provenance.get("source_hash"):
+        return OwnershipResult(
+            healthy=False,
+            state="stale-render",
+            migration_required=True,
+            **common,
+        )
+    return OwnershipResult(
+        healthy=True,
+        state="managed-deployment" if referenced else "unreferenced-render",
+        migration_required=False,
+        **common,
+    )
+
+
+def _deployment_for_path(path: Path, rendered_root: Path) -> Path | None:
+    try:
+        relative = path.relative_to(rendered_root)
+    except ValueError:
+        return None
+    if len(relative.parts) < 2:
+        return None
+    digest_dir, skill_name = relative.parts[:2]
+    if (
+        not digest_dir.startswith("sha256-")
+        or len(digest_dir) != 71
+        or skill_name in {".", ".."}
+    ):
+        return None
+    return rendered_root / digest_dir / skill_name
+
+
+def _directory_link_target(destination: Path) -> Path | None:
+    try:
+        if destination.is_symlink():
+            raw = Path(os.readlink(destination))
+            if not raw.is_absolute():
+                raw = destination.parent / raw
+            return _absolute_path(raw)
+        if os.name == "nt" and destination.exists():
+            return destination.resolve(strict=True)
+    except OSError:
+        return None
+    return None
+
+
+def _is_beneath(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def _same_file(source: Path, destination: Path) -> bool:
     try:
         return os.path.samefile(source, destination)
@@ -326,6 +557,11 @@ def _same_file(source: Path, destination: Path) -> bool:
 
 def _absolute_path(path: str | Path) -> Path:
     return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _resolved_text(path: Path) -> str:
+    """Return a stable canonical-source identity without resolving input links."""
+    return str(path.resolve(strict=False))
 
 
 def _is_name(value: str) -> bool:
@@ -346,7 +582,7 @@ def _unmanaged(
         role="unmanaged",
         skill=skill,
         input_path=input_path,
-        source_path=None if source_path is None else str(source_path),
+        source_path=None if source_path is None else _resolved_text(source_path),
         client=client,
         migration_required=False,
     )
@@ -366,7 +602,7 @@ def _ambiguous(
         role="unknown",
         skill=skill,
         input_path=input_path,
-        source_path=None if source_path is None else str(source_path),
+        source_path=None if source_path is None else _resolved_text(source_path),
         client=client,
         migration_required=False,
     )

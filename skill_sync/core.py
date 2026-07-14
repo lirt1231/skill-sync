@@ -6,22 +6,38 @@ reuse the same behavior and handle :class:`SkillSyncError` consistently.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
 from skill_sync import git
 from skill_sync.agents import aggregate_agent_targets, detect_agents, detect_clients
-from skill_sync.config import default_config_path, load_config, save_config
-from skill_sync.copying import copy_skill_dir
+from skill_sync.config import default_config_path, default_data_root, load_config, save_config
+from skill_sync.copying import copy_skill_dir, rename_no_replace
+from skill_sync.deployment import (
+    deployment_path,
+    expected_provenance,
+    remove_verified_deployment,
+    render_base_deployment,
+    resolution_hash,
+    verify_deployment,
+)
 from skill_sync.errors import SkillSyncError
-from skill_sync.hash import hash_skill_dir
-from skill_sync.linking import create_directory_link, link_state, remove_directory_link
+from skill_sync.hash import hash_skill_dir, is_link_or_reparse
+from skill_sync.linking import (
+    create_directory_link,
+    link_state,
+    remove_directory_link,
+    replace_directory_link,
+)
+from skill_sync.local_lock import local_file_lock
 from skill_sync.ownership import inspect_ownership
 from skill_sync.platforms import get_adapter
-from skill_sync.protocol import EXIT_SAFETY
+from skill_sync.protocol import EXIT_CONFLICT, EXIT_SAFETY
 from skill_sync.registry import empty_registry, load_registry, save_registry
 from skill_sync.skill_metadata import read_skill_description
 
@@ -191,12 +207,27 @@ def scan_skills(
         registry = _load_local_registry(config)
         selected_names = _selected_names(registry)
         if platform is None:
+            scan_root = Path(
+                skill_dir
+                if skill_dir is not None
+                else config.get("skills_root") or Path.home() / ".agents" / "skills"
+            ).expanduser().absolute()
+            _reject_reparse_scan_root(scan_root)
             root = _global_skill_root(config, skill_dir)
             adapter = get_adapter("codex")
             skill_dir = root
         else:
             adapter = get_adapter(platform)
+            root = adapter.default_skill_dir() if skill_dir is None else Path(skill_dir).expanduser().absolute()
+            _reject_reparse_scan_root(root)
         candidates = adapter.discover(skill_dir=skill_dir, selected_names=selected_names)
+        candidates = [
+            candidate
+            for candidate in candidates
+            if not is_link_or_reparse(candidate.path)
+        ]
+        for candidate in candidates:
+            _validate_skill_path(candidate.path)
         return [
             {
                 "name": candidate.name,
@@ -233,6 +264,7 @@ def managed_check(
             registry=registry,
             clients=detect_clients(),
             client=client,
+            rendered_root=_rendered_root(config),
         ).to_dict()
     except SkillSyncError as exc:
         raise SkillSyncError(
@@ -507,6 +539,22 @@ def _default_sync_dir() -> Path:
     return base / "skill-sync" / "repo"
 
 
+def _data_root(config: dict[str, Any]) -> Path:
+    configured = config.get("data_root")
+    if configured is not None and (not isinstance(configured, str) or not configured):
+        raise SkillSyncError("configured data_root must be a non-empty string")
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_absolute():
+            raise SkillSyncError("configured data_root must be an absolute path")
+        return path
+    return default_data_root()
+
+
+def _rendered_root(config: dict[str, Any]) -> Path:
+    return _data_root(config) / "rendered"
+
+
 def _looks_like_local_path(value: str) -> bool:
     return (
         value.startswith(("/", "./", "../", "~"))
@@ -582,24 +630,28 @@ def _target_names(registry: dict[str, Any], skill_names: Iterable[str] | None) -
 
 def _skill_root(platform: str, skill_dir: str | Path | None) -> Path:
     if skill_dir is not None:
-        return Path(skill_dir).resolve()
-    return get_adapter(platform).default_skill_dir().resolve()
+        return Path(skill_dir).expanduser().absolute()
+    return get_adapter(platform).default_skill_dir().expanduser().absolute()
 
 
 def _global_skill_root(config: dict[str, Any], skill_dir: str | Path | None = None) -> Path:
     if skill_dir is not None:
-        return Path(skill_dir).expanduser().resolve()
-    return Path(config.get("skills_root") or Path.home() / ".agents" / "skills").expanduser().resolve()
+        return Path(skill_dir).expanduser().absolute()
+    return Path(
+        config.get("skills_root") or Path.home() / ".agents" / "skills"
+    ).expanduser().absolute()
 
 
 def _resolve_skill_item(item: str | Path, root: Path) -> Path:
     raw = Path(item).expanduser()
     if raw.is_absolute() or len(raw.parts) > 1:
-        return raw.resolve()
-    return (root / raw).resolve()
+        return raw.absolute()
+    return (root / raw).absolute()
 
 
 def _validate_skill_path(path: Path) -> None:
+    if is_link_or_reparse(path):
+        raise SkillSyncError(f"Skill path is a symlink or reparse point: {path}")
     if not path.exists():
         raise SkillSyncError(f"Skill path does not exist: {path}")
     if not path.is_dir():
@@ -608,8 +660,17 @@ def _validate_skill_path(path: Path) -> None:
         raise SkillSyncError(f"Skill path does not contain SKILL.md: {path}")
 
 
+def _reject_reparse_scan_root(root: Path) -> None:
+    if is_link_or_reparse(root):
+        raise SkillSyncError(f"Skill scan root is a symlink or reparse point: {root}")
+
+
 def _is_inside(path: Path, root: Path) -> bool:
-    return path == root or path.is_relative_to(root)
+    resolved_path = path.resolve(strict=False)
+    resolved_root = root.resolve(strict=False)
+    return resolved_path == resolved_root or resolved_path.is_relative_to(
+        resolved_root
+    )
 
 
 def _local_skill_path(config: dict[str, Any], name: str) -> Path:
@@ -746,15 +807,774 @@ def _unexpected_dirty_paths(repo: Path) -> list[str]:
     return unexpected
 
 
+def deploy_preview(
+    config_path: str | Path | None = None,
+    *,
+    skill_names: Iterable[str] | None = None,
+    agent_names: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Describe base deployment builds and link swaps without mutating state."""
+
+    try:
+        config = _load_local_config(config_path)
+        registry = _load_local_registry(config)
+        plan = _deployment_plan(config, registry, skill_names, agent_names)
+        return {
+            "rendered_root": str(_rendered_root(config)),
+            "skills": plan,
+            "blocked": any(
+                client["action"] == "blocked"
+                for skill in plan
+                for client in skill["clients"]
+            ),
+        }
+    except SkillSyncError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise SkillSyncError(str(exc)) from exc
+
+
+def deploy_status(config_path: str | Path | None = None) -> dict[str, Any]:
+    """Return current deployment and Agent link health for selected Skills."""
+
+    preview = deploy_preview(config_path=config_path)
+    skills: list[dict[str, Any]] = []
+    for skill in preview["skills"]:
+        clients = []
+        for client in skill["clients"]:
+            clients.append(
+                {
+                    "client": client["client"],
+                    "agent": client["agent"],
+                    "destination": client["destination"],
+                    "deployment_path": client["deployment_path"],
+                    "deployment_state": client["deployment_state"],
+                    "link_state": client["current_state"],
+                    "migration_required": client["action"] != "noop",
+                }
+            )
+        skills.append(
+            {
+                "name": skill["name"],
+                "source_path": skill["source_path"],
+                "source_hash": skill["source_hash"],
+                "clients": clients,
+            }
+        )
+    operations = _deployment_receipt_health(_data_root(_load_local_config(config_path)))
+    return {
+        "rendered_root": preview["rendered_root"],
+        "skills": skills,
+        "operations": operations,
+        "recovery_required": bool(operations),
+    }
+
+
+def deploy_migrate(
+    config_path: str | Path | None = None,
+    *,
+    skill_names: Iterable[str] | None = None,
+    agent_names: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    config = _load_local_config(config_path)
+    try:
+        with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
+            return _deploy_migrate_unlocked(
+                config_path=config_path,
+                skill_names=skill_names,
+                agent_names=agent_names,
+                _config=config,
+            )
+    except TimeoutError as exc:
+        raise SkillSyncError(
+            str(exc),
+            code="deployment_lock_timeout",
+            exit_code=EXIT_SAFETY,
+        ) from exc
+
+
+def _deploy_migrate_unlocked(
+    config_path: str | Path | None = None,
+    *,
+    skill_names: Iterable[str] | None = None,
+    agent_names: Iterable[str] | None = None,
+    _config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build deployments, then transactionally swap owned Agent links."""
+
+    config = _load_local_config(config_path) if _config is None else _config
+    _assert_no_incomplete_deployment_receipts(_data_root(config))
+    registry = _load_local_registry(config)
+    initial = _deployment_plan(config, registry, skill_names, agent_names)
+    blockers = [
+        {"skill": skill["name"], **client}
+        for skill in initial
+        for client in skill["clients"]
+        if client["action"] == "blocked"
+    ]
+    if blockers:
+        raise SkillSyncError(
+            "deployment migration is blocked by unsafe Agent paths",
+            code="deployment_migration_blocked",
+            exit_code=EXIT_SAFETY,
+            details={"blockers": blockers},
+        )
+
+    rendered_root = _rendered_root(config)
+    deployments: list[dict[str, Any]] = []
+    for skill in initial:
+        source = Path(skill["source_path"])
+        for client in skill["clients"]:
+            if client["deployment_state"] == "valid":
+                continue
+            deployed = render_base_deployment(
+                source,
+                rendered_root,
+                skill["name"],
+                client["client"],
+            )
+            deployments.append(
+                {
+                    "skill": skill["name"],
+                    "client": client["client"],
+                    "path": str(deployed.path),
+                    "created": deployed.created,
+                }
+            )
+
+    prepared = _deployment_plan(config, registry, skill_names, agent_names)
+    initial_hashes = {skill["name"]: skill["source_hash"] for skill in initial}
+    changed_sources = [
+        skill["name"]
+        for skill in prepared
+        if skill["source_hash"] != initial_hashes.get(skill["name"])
+    ]
+    if changed_sources:
+        raise SkillSyncError(
+            "canonical Skill changed while preparing deployments",
+            code="deployment_source_changed",
+            exit_code=EXIT_CONFLICT,
+            details={"skills": changed_sources},
+        )
+    unprepared = [
+        {"skill": skill["name"], **client}
+        for skill in prepared
+        for client in skill["clients"]
+        if client["action"] != "noop"
+        and (
+            client["deployment_state"] != "valid"
+            or client["action"] not in {"create", "swap"}
+        )
+    ]
+    if unprepared:
+        raise SkillSyncError(
+            "deployment state changed while preparing migration",
+            code="deployment_state_changed",
+            exit_code=EXIT_SAFETY,
+            details={"clients": unprepared},
+        )
+    operation_id = uuid.uuid4().hex
+    receipt_path = _data_root(config) / "operations" / f"deploy-migrate-{operation_id}.json"
+    receipt = {
+        "schema_version": 1,
+        "operation_id": operation_id,
+        "operation": "deploy-migrate",
+        "status": "prepared",
+        "created_at": time.time(),
+        "completed": [],
+        "links": [
+            {
+                "skill": skill["name"],
+                "client": client["client"],
+                "destination": client["destination"],
+                "old_target": client.get("current_target"),
+                "new_target": client["deployment_path"],
+                "action": client["action"],
+            }
+            for skill in prepared
+            for client in skill["clients"]
+            if client["action"] != "noop"
+        ],
+    }
+    _write_json_atomic(receipt_path, receipt)
+    migrated: list[dict[str, Any]] = []
+    swapped: list[tuple[Path, Path | None, Path]] = []
+    try:
+        for skill in prepared:
+            for client in skill["clients"]:
+                if client["action"] == "noop":
+                    continue
+                if client["action"] == "blocked":
+                    raise SkillSyncError(
+                        "deployment state changed while preparing migration",
+                        code="deployment_state_changed",
+                        exit_code=EXIT_SAFETY,
+                        details={"skill": skill["name"], "client": client},
+                    )
+                destination = Path(client["destination"])
+                new_target = Path(client["deployment_path"])
+                old_target_text = client.get("current_target")
+                old_target = Path(old_target_text) if old_target_text else None
+                if hash_skill_dir(Path(skill["source_path"])) != skill["source_hash"]:
+                    raise SkillSyncError(
+                        f"canonical Skill changed before link swap: {skill['name']}",
+                        code="deployment_source_changed",
+                        exit_code=EXIT_CONFLICT,
+                        details={"skill": skill["name"]},
+                    )
+                receipt["status"] = "applying"
+                receipt["in_flight"] = str(destination)
+                _write_json_atomic(receipt_path, receipt)
+                replace_directory_link(
+                    new_target,
+                    destination,
+                    allowed_current_sources=() if old_target is None else (old_target,),
+                )
+                # A failed replacement did not install ``new_target`` and
+                # must not be rolled back as though it had. Record it only
+                # after the swap succeeds, but before post-swap verification.
+                swapped.append((destination, old_target, new_target))
+                if link_state(new_target, destination) != "linked":
+                    raise SkillSyncError(
+                        f"deployment link verification failed: {destination}",
+                        code="deployment_link_verification_failed",
+                        exit_code=EXIT_SAFETY,
+                    )
+                migrated.append(
+                    {
+                        "skill": skill["name"],
+                        "client": client["client"],
+                        "from": client["current_state"],
+                        "to": str(new_target),
+                        "state": "linked-render",
+                    }
+                )
+                receipt["completed"].append(str(destination))
+                receipt.pop("in_flight", None)
+                _write_json_atomic(receipt_path, receipt)
+        changed_after_swaps = [
+            skill["name"]
+            for skill in prepared
+            if hash_skill_dir(Path(skill["source_path"])) != skill["source_hash"]
+        ]
+        if changed_after_swaps:
+            raise SkillSyncError(
+                "canonical Skill changed during link migration",
+                code="deployment_source_changed",
+                exit_code=EXIT_CONFLICT,
+                details={"skills": changed_after_swaps},
+            )
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for destination, old_target, new_target in reversed(swapped):
+            try:
+                if old_target is None:
+                    if link_state(new_target, destination) == "linked":
+                        if not remove_directory_link(new_target, destination):
+                            raise OSError(f"could not remove new link {destination}")
+                    elif destination.exists() or destination.is_symlink():
+                        raise OSError(
+                            f"destination changed during rollback: {destination}"
+                        )
+                else:
+                    if link_state(old_target, destination) != "linked":
+                        replace_directory_link(
+                            old_target,
+                            destination,
+                            allowed_current_sources=(new_target,),
+                        )
+            except Exception as rollback_exc:  # pragma: no cover - defensive safety path
+                rollback_errors.append(str(rollback_exc))
+        if rollback_errors:
+            receipt["status"] = "needs-recovery"
+            receipt["error"] = str(exc)
+            receipt["rollback_errors"] = rollback_errors
+            _write_json_atomic(receipt_path, receipt)
+            raise SkillSyncError(
+                "deployment migration failed and rollback needs recovery",
+                code="deployment_rollback_failed",
+                exit_code=EXIT_SAFETY,
+                details={"cause": str(exc), "rollback_errors": rollback_errors},
+            ) from exc
+        receipt["status"] = "rolled-back"
+        receipt["error"] = str(exc)
+        receipt["completed"] = []
+        receipt.pop("in_flight", None)
+        _write_json_atomic(receipt_path, receipt)
+        if isinstance(exc, SkillSyncError):
+            raise
+        raise SkillSyncError(
+            f"deployment migration failed; previous links were restored: {exc}",
+            code="deployment_migration_failed",
+            exit_code=EXIT_SAFETY,
+        ) from exc
+
+    receipt["status"] = "completed"
+    receipt["completed_at"] = time.time()
+    _write_json_atomic(receipt_path, receipt)
+    return {
+        "operation_id": operation_id,
+        "receipt_path": str(receipt_path),
+        "rendered_root": str(rendered_root),
+        "migrated": migrated,
+        "deployments": deployments,
+        "noop": not migrated and not deployments,
+    }
+
+
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("w", encoding="utf-8") as output:
+            json.dump(value, output, ensure_ascii=False, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def deploy_gc(
+    config_path: str | Path | None = None,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    config = _load_local_config(config_path)
+    try:
+        with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
+            return _deploy_gc_unlocked(
+                config_path=config_path, dry_run=dry_run, _config=config
+            )
+    except TimeoutError as exc:
+        raise SkillSyncError(
+            str(exc),
+            code="deployment_lock_timeout",
+            exit_code=EXIT_SAFETY,
+        ) from exc
+
+
+def _deploy_gc_unlocked(
+    config_path: str | Path | None = None,
+    *,
+    dry_run: bool = False,
+    _config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Remove only verified rendered deployments not referenced by a client."""
+
+    config = _load_local_config(config_path) if _config is None else _config
+    _assert_no_incomplete_deployment_receipts(_data_root(config))
+    rendered_root = _rendered_root(config)
+    references = _rendered_link_references(rendered_root, detect_clients())
+    references.update(_operation_receipt_references(_data_root(config), rendered_root))
+    removed: list[str] = []
+    candidates: list[str] = []
+    skipped: list[dict[str, str]] = []
+    if not rendered_root.exists():
+        return {
+            "rendered_root": str(rendered_root),
+            "dry_run": dry_run,
+            "candidates": [],
+            "removed": [],
+            "skipped": [],
+        }
+
+    for digest_dir in sorted(rendered_root.iterdir(), key=lambda path: path.name):
+        if not _valid_rendered_digest_dir(digest_dir):
+            skipped.append({"path": str(digest_dir), "reason": "unknown-layout"})
+            continue
+        for deployment in sorted(digest_dir.iterdir(), key=lambda path: path.name):
+            verification = verify_deployment(deployment)
+            if not verification.ok:
+                skipped.append(
+                    {"path": str(deployment), "reason": verification.state}
+                )
+                continue
+            if deployment.resolve(strict=False) in references:
+                continue
+            candidates.append(str(deployment))
+            if dry_run:
+                continue
+            # Re-scan immediately before deletion so a link created after the
+            # initial inventory cannot turn this into a referenced cache.
+            current_references = _rendered_link_references(
+                rendered_root, detect_clients()
+            )
+            current_references.update(
+                _operation_receipt_references(_data_root(config), rendered_root)
+            )
+            if deployment.resolve(strict=False) in current_references:
+                skipped.append({"path": str(deployment), "reason": "became-referenced"})
+                continue
+            remove_verified_deployment(
+                deployment,
+                rendered_root,
+                _data_root(config) / "trash",
+            )
+            removed.append(str(deployment))
+    return {
+        "rendered_root": str(rendered_root),
+        "dry_run": dry_run,
+        "candidates": candidates,
+        "removed": removed,
+        "skipped": skipped,
+    }
+
+
+def _rendered_link_references(rendered_root: Path, clients: Iterable[Any]) -> set[Path]:
+    references: set[Path] = set()
+    for client in clients:
+        # Detection describes whether a client application appears installed;
+        # an existing known Skill root can still contain a live managed link.
+        if not client.skills_dir.is_dir():
+            continue
+        for destination in client.skills_dir.iterdir():
+            target = _directory_link_target(destination)
+            if target is not None and _is_inside(target, rendered_root):
+                deployment = _rendered_deployment_root(target, rendered_root)
+                if deployment is not None:
+                    references.add(deployment)
+    return references
+
+
+def _operation_receipt_references(data_root: Path, rendered_root: Path) -> set[Path]:
+    references: set[Path] = set()
+    _assert_no_malformed_deployment_receipts(data_root)
+    operations = data_root / "operations"
+    if not operations.is_dir():
+        return references
+    for receipt_path in operations.glob("deploy-migrate-*.json"):
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:  # pragma: no cover
+            raise SkillSyncError(
+                f"cannot safely read deployment receipt: {receipt_path}",
+                code="deployment_recovery_required",
+                exit_code=EXIT_SAFETY,
+                details={"receipt": str(receipt_path), "cause": str(exc)},
+            ) from exc
+        if receipt.get("status") not in {"prepared", "applying", "needs-recovery"}:
+            continue
+        for item in receipt.get("links", []):
+            if not isinstance(item, dict):
+                continue
+            for key in ("old_target", "new_target"):
+                value = item.get(key)
+                if not isinstance(value, str):
+                    continue
+                target = Path(value).resolve(strict=False)
+                if _is_inside(target, rendered_root):
+                    deployment = _rendered_deployment_root(target, rendered_root)
+                    if deployment is not None:
+                        references.add(deployment)
+    return references
+
+
+def _rendered_deployment_root(target: Path, rendered_root: Path) -> Path | None:
+    """Normalize a rendered target (including descendants) to its deployment."""
+
+    resolved_root = rendered_root.resolve(strict=False)
+    resolved_target = target.resolve(strict=False)
+    try:
+        relative = resolved_target.relative_to(resolved_root)
+    except ValueError:
+        return None
+    if len(relative.parts) < 2:
+        return None
+    digest_dir = resolved_root / relative.parts[0]
+    if not _valid_rendered_digest_dir(digest_dir):
+        return None
+    return (digest_dir / relative.parts[1]).resolve(strict=False)
+
+
+_ACTIVE_DEPLOYMENT_RECEIPT_STATES = {"prepared", "applying", "needs-recovery"}
+_TERMINAL_DEPLOYMENT_RECEIPT_STATES = {"completed", "rolled-back"}
+
+
+def _deployment_receipt_health(data_root: Path) -> list[dict[str, Any]]:
+    """Return receipts that cannot be proven safely completed or rolled back."""
+
+    operations = data_root / "operations"
+    if not operations.is_dir():
+        return []
+    recovery: list[dict[str, Any]] = []
+    for receipt_path in sorted(operations.glob("deploy-migrate-*.json")):
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            recovery.append(
+                {
+                    "path": str(receipt_path),
+                    "status": "malformed",
+                    "error": str(exc),
+                    "recovery": "Inspect this receipt and affected Agent links before moving or removing it.",
+                }
+            )
+            continue
+        if not isinstance(receipt, dict):
+            recovery.append(
+                {
+                    "path": str(receipt_path),
+                    "status": "malformed",
+                    "error": "receipt root must be an object",
+                    "recovery": "Inspect this receipt and affected Agent links before moving or removing it.",
+                }
+            )
+            continue
+        status = receipt.get("status")
+        if status in _TERMINAL_DEPLOYMENT_RECEIPT_STATES:
+            continue
+        if status not in _ACTIVE_DEPLOYMENT_RECEIPT_STATES:
+            recovery.append(
+                {
+                    "path": str(receipt_path),
+                    "status": "malformed",
+                    "error": f"unknown or missing receipt status: {status!r}",
+                    "recovery": "Inspect this receipt and affected Agent links before moving or removing it.",
+                }
+            )
+            continue
+        item: dict[str, Any] = {
+            "path": str(receipt_path),
+            "operation_id": receipt.get("operation_id"),
+            "status": status,
+            "recovery": "Verify every recorded Agent link, then complete or roll back this operation.",
+        }
+        if isinstance(receipt.get("in_flight"), str):
+            item["in_flight"] = receipt["in_flight"]
+        if isinstance(receipt.get("error"), str):
+            item["error"] = receipt["error"]
+        if isinstance(receipt.get("rollback_errors"), list):
+            item["rollback_errors"] = receipt["rollback_errors"]
+        recovery.append(item)
+    return recovery
+
+
+def _assert_no_malformed_deployment_receipts(data_root: Path) -> None:
+    malformed = [
+        receipt
+        for receipt in _deployment_receipt_health(data_root)
+        if receipt["status"] == "malformed"
+    ]
+    if malformed:
+        raise SkillSyncError(
+            "deployment receipts are malformed; refusing unsafe cache cleanup",
+            code="deployment_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={"operations": malformed},
+        )
+
+
+def _assert_no_incomplete_deployment_receipts(data_root: Path) -> None:
+    recovery = _deployment_receipt_health(data_root)
+    if recovery:
+        raise SkillSyncError(
+            "an incomplete deployment operation requires recovery",
+            code="deployment_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={"operations": recovery},
+        )
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Persist an atomic rename in its parent directory where supported."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError:
+        if os.name == "nt":  # Windows does not consistently open directories.
+            return
+        raise
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _valid_rendered_digest_dir(path: Path) -> bool:
+    name = path.name
+    digest = name.removeprefix("sha256-")
+    return (
+        path.is_dir()
+        and not path.is_symlink()
+        and name.startswith("sha256-")
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+    )
+
+
+def _deployment_plan(
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    skill_names: Iterable[str] | None,
+    agent_names: Iterable[str] | None,
+) -> list[dict[str, Any]]:
+    targets = _target_names(registry, skill_names)
+    requested = set(agent_names or ())
+    clients = detect_clients()
+    known = {client.id for client in clients} | {client.family_id for client in clients}
+    unknown = requested - known
+    if unknown:
+        raise SkillSyncError("unknown Agent or client: " + ", ".join(sorted(unknown)))
+    disabled = _disabled_agents(config)
+    available = [
+        client
+        for client in clients
+        if client.detected
+        and client.family_id not in disabled
+        and (not requested or client.id in requested or client.family_id in requested)
+    ]
+    rendered_root = _rendered_root(config)
+    result: list[dict[str, Any]] = []
+    for name in targets:
+        source = _local_skill_path_or_default(config, registry, name)
+        _validate_skill_path(source)
+        source_hash = hash_skill_dir(source)
+        entry = registry.get("skills", {}).get(name, {})
+        configured = _configured_client_targets(entry)
+        rows: list[dict[str, Any]] = []
+        for client in available:
+            if configured and not {client.id, client.family_id}.intersection(configured):
+                continue
+            resolved_hash = resolution_hash(name, source_hash, client.id)
+            desired = deployment_path(rendered_root, name, resolved_hash)
+            expected = expected_provenance(name, source_hash, client.id)
+            verification = verify_deployment(desired, expected_provenance=expected)
+            destination = client.skills_dir / name
+            if "platform" in config and _same_path_location(source, destination):
+                # Legacy platform-mode installs may use the Agent directory as
+                # their authored source.  They must be imported into the
+                # global root before a read-only deployment can replace them.
+                continue
+            current_state, current_target = _deployment_link_state(
+                source,
+                destination,
+                desired,
+                rendered_root,
+                name,
+                client.id,
+            )
+            action = _deployment_action(current_state, verification.state)
+            rows.append(
+                {
+                    "client": client.id,
+                    "agent": client.family_id,
+                    "destination": str(destination),
+                    "deployment_path": str(desired),
+                    "deployment_state": verification.state,
+                    "current_state": current_state,
+                    "current_target": None if current_target is None else str(current_target),
+                    "action": action,
+                    "reason": verification.reason,
+                }
+            )
+        result.append(
+            {
+                "name": name,
+                "source_path": str(source),
+                "source_hash": source_hash,
+                "clients": rows,
+            }
+        )
+    return result
+
+
+def _deployment_link_state(
+    source: Path,
+    destination: Path,
+    desired: Path,
+    rendered_root: Path,
+    skill_name: str,
+    client_id: str,
+) -> tuple[str, Path | None]:
+    if link_state(source, destination) == "linked":
+        # Preserve the immediate symlink target. Some installations chain one
+        # Agent through another (Claude -> Codex -> canonical); resolving the
+        # chain would make ownership change when Codex migrates first.
+        return "direct-source-link", _directory_link_target_lexical(destination) or source
+    if link_state(desired, destination) == "linked":
+        verification = verify_deployment(desired)
+        return (
+            "linked-render" if verification.ok else f"{verification.state}-render",
+            desired,
+        )
+    if not destination.exists() and not destination.is_symlink():
+        return "missing", None
+
+    target = _directory_link_target(destination)
+    if target is not None and _is_inside(target, rendered_root):
+        verification = verify_deployment(target)
+        provenance = verification.provenance or {}
+        if verification.state == "missing":
+            return "missing-render", target
+        if not verification.ok:
+            return "tampered-render", target
+        if (
+            provenance.get("logical_skill") == skill_name
+            and provenance.get("target_client") == client_id
+        ):
+            return "stale-render", target
+        return "wrong-link", target
+    physical = link_state(source, destination)
+    return physical, target
+
+
+def _deployment_action(current_state: str, deployment_state: str) -> str:
+    if current_state == "linked-render" and deployment_state == "valid":
+        return "noop"
+    if current_state in {"tampered-render", "missing-render", "wrong-link", "broken-link", "conflict"}:
+        return "blocked"
+    if deployment_state == "tampered":
+        return "blocked"
+    if current_state == "missing":
+        return "create" if deployment_state == "valid" else "build-and-create"
+    if current_state in {"direct-source-link", "stale-render"}:
+        return "swap" if deployment_state == "valid" else "build-and-swap"
+    return "blocked"
+
+
+def _directory_link_target(destination: Path) -> Path | None:
+    try:
+        if destination.is_symlink():
+            raw = Path(os.readlink(destination))
+            return (destination.parent / raw).resolve(strict=False) if not raw.is_absolute() else raw.resolve(strict=False)
+        if os.name == "nt" and destination.exists():
+            return destination.resolve(strict=True)
+    except OSError:
+        return None
+    return None
+
+
+def _directory_link_target_lexical(destination: Path) -> Path | None:
+    """Return a symlink's immediate absolute target without resolving chains."""
+    try:
+        if destination.is_symlink():
+            raw = Path(os.readlink(destination))
+            return raw if raw.is_absolute() else (destination.parent / raw).absolute()
+    except OSError:
+        return None
+    return None
+
+
+def _same_path_location(left: Path, right: Path) -> bool:
+    left_location = left.parent.resolve(strict=False) / left.name
+    right_location = right.parent.resolve(strict=False) / right.name
+    return os.path.normcase(str(left_location)) == os.path.normcase(
+        str(right_location)
+    )
+
+
 def link_skills(
     skill_names: Iterable[str] | None = None,
     agent_names: Iterable[str] | None = None,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Link selected canonical Skills into detected Agent directories."""
+    """Render selected Skills and link detected Agent clients to deployments."""
     config = _load_local_config(config_path)
-    registry = _load_local_registry(config)
-    targets = _target_names(registry, skill_names)
     requested_agents = set(agent_names or ())
     disabled_agents = _disabled_agents(config)
     if requested_agents & disabled_agents:
@@ -762,32 +1582,26 @@ def link_skills(
             "Agent synchronization is disabled: "
             + ", ".join(sorted(requested_agents & disabled_agents))
         )
-    agents = [
-        a
-        for a in detect_agents()
-        if a.detected and a.name not in disabled_agents and (not requested_agents or a.name in requested_agents)
-    ]
-    unknown = requested_agents - {a.name for a in detect_agents()}
-    if unknown:
-        raise SkillSyncError("unknown Agent: " + ", ".join(sorted(unknown)))
+    deploy_migrate(
+        config_path=config_path,
+        skill_names=skill_names,
+        agent_names=agent_names,
+    )
+    registry = _load_local_registry(config)
+    plan = _deployment_plan(config, registry, skill_names, agent_names)
     results: list[dict[str, str]] = []
-    for name in targets:
-        source = _local_skill_path_or_default(config, registry, name)
-        _validate_skill_path(source)
-        entry = registry.get("skills", {}).get(name, {})
-        configured = _configured_agent_targets(entry)
-        for agent in agents:
-            if configured and agent.name not in configured:
-                continue
-            for skills_dir in agent.skill_dirs:
-                destination = skills_dir / name
-                try:
-                    method = create_directory_link(source, destination)
-                    state = "linked"
-                except FileExistsError:
-                    method = "none"
-                    state = link_state(source, destination)
-                results.append({"skill": name, "agent": agent.name, "state": state, "method": method, "path": str(destination)})
+    for skill in plan:
+        for client in skill["clients"]:
+            results.append(
+                {
+                    "skill": skill["name"],
+                    "agent": client["agent"],
+                    "client": client["client"],
+                    "state": client["current_state"],
+                    "method": "rendered",
+                    "path": client["destination"],
+                }
+            )
     return {"links": results}
 
 
@@ -797,20 +1611,180 @@ def unlink_skills(
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     config = _load_local_config(config_path)
+    try:
+        with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
+            return _unlink_skills_unlocked(
+                skill_names, agent_names, config_path, _config=config
+            )
+    except TimeoutError as exc:
+        raise SkillSyncError(
+            str(exc), code="deployment_lock_timeout", exit_code=EXIT_SAFETY
+        ) from exc
+
+
+def _unlink_skills_unlocked(
+    skill_names: Iterable[str] | None = None,
+    agent_names: Iterable[str] | None = None,
+    config_path: str | Path | None = None,
+    *,
+    _config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    config = _load_local_config(config_path) if _config is None else _config
+    _assert_no_incomplete_deployment_receipts(_data_root(config))
     registry = _load_local_registry(config)
     targets = _target_names(registry, skill_names)
     requested = set(agent_names or ())
+    clients = detect_clients()
+    known = {client.id for client in clients} | {client.family_id for client in clients}
+    unknown = requested - known
+    if unknown:
+        raise SkillSyncError("unknown Agent or client: " + ", ".join(sorted(unknown)))
     removed: list[dict[str, str]] = []
-    for agent in detect_agents():
-        if requested and agent.name not in requested:
+    for client in clients:
+        if not client.skills_dir.is_dir():
+            continue
+        if requested and client.id not in requested and client.family_id not in requested:
             continue
         for name in targets:
             source = _local_skill_path_or_default(config, registry, name)
-            for skills_dir in agent.skill_dirs:
-                destination = skills_dir / name
-                if remove_directory_link(source, destination):
-                    removed.append({"skill": name, "agent": agent.name, "path": str(destination)})
+            entry = registry.get("skills", {}).get(name, {})
+            configured = _configured_client_targets(entry)
+            if configured and not {client.id, client.family_id}.intersection(configured):
+                continue
+            destination = client.skills_dir / name
+            owned_target = _owned_link_target(
+                source,
+                destination,
+                _rendered_root(config),
+                name,
+                client.id,
+            )
+            if owned_target is None:
+                continue
+            if remove_directory_link(owned_target, destination):
+                removed.append(
+                    {
+                        "skill": name,
+                        "agent": client.family_id,
+                        "client": client.id,
+                        "path": str(destination),
+                    }
+                )
     return {"unlinked": removed}
+
+
+def _owned_link_target(
+    source: Path,
+    destination: Path,
+    rendered_root: Path,
+    skill_name: str,
+    client_id: str,
+) -> Path | None:
+    if link_state(source, destination) == "linked":
+        return source
+    target = _directory_link_target(destination)
+    if target is None or not _is_inside(target, rendered_root):
+        return None
+    verification = verify_deployment(target)
+    provenance = verification.provenance or {}
+    if provenance.get("logical_skill") != skill_name or provenance.get(
+        "target_client"
+    ) != client_id:
+        return None
+    return target
+
+
+def _imported_deployment_target(
+    destination: Path,
+    rendered_root: Path,
+    skill_name: str,
+    expected_client_ids: set[str],
+) -> Path | None:
+    """Return a verified rendered target installed during an import.
+
+    Import accepts an Agent family while provenance records a concrete client
+    (for example ``kimi`` versus ``kimi-code``), so rollback verifies the
+    rendered deployment and logical Skill instead of guessing a client id.
+    Real directories and links outside the deployment store never qualify.
+    """
+
+    target = _directory_link_target(destination)
+    if target is None or not _is_inside(target, rendered_root):
+        return None
+    verification = verify_deployment(target)
+    provenance = verification.provenance or {}
+    if (
+        verification.state != "valid"
+        or provenance.get("logical_skill") != skill_name
+        or provenance.get("target_client") not in expected_client_ids
+    ):
+        return None
+    return target
+
+
+def _import_client_ids(agent_name: str, skills_dir: Path) -> set[str]:
+    client_ids = {
+        client.id
+        for client in detect_clients()
+        if client.family_id == agent_name
+        and _same_path_location(client.skills_dir, skills_dir)
+    }
+    if client_ids:
+        return client_ids
+    fallback = {
+        "claude": "claude-code",
+        "codex": "codex",
+        "workbuddy": "workbuddy",
+    }.get(agent_name)
+    return {fallback} if fallback else set()
+
+
+def _path_identity(path: Path) -> tuple[int, int, int]:
+    metadata = os.lstat(path)
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode)
+
+
+def _quarantine_and_remove_owned_directory(
+    path: Path,
+    expected_identity: tuple[int, int, int],
+    trash_root: Path,
+) -> bool:
+    """Remove an owned directory only after isolating its verified inode.
+
+    The live canonical path is never passed to ``rmtree``.  A concurrent path
+    winner therefore remains at the live location, while deletion happens
+    under a private machine-local trash directory.
+    """
+
+    try:
+        if is_link_or_reparse(path) or _path_identity(path) != expected_identity:
+            return False
+    except OSError:
+        return False
+    private_trash = trash_root / "owned-removals"
+    if is_link_or_reparse(trash_root) or is_link_or_reparse(private_trash):
+        return False
+    private_trash.mkdir(parents=True, exist_ok=True, mode=0o700)
+    private_trash.chmod(0o700)
+    quarantine = private_trash / f"{path.name}-{uuid.uuid4().hex}"
+    try:
+        rename_no_replace(path, quarantine)
+    except (FileExistsError, FileNotFoundError, OSError):
+        return False
+    try:
+        if is_link_or_reparse(quarantine) or _path_identity(
+            quarantine
+        ) != expected_identity:
+            if not path.exists() and not is_link_or_reparse(path):
+                try:
+                    rename_no_replace(quarantine, path)
+                except (FileExistsError, OSError):
+                    pass
+            return False
+        shutil.rmtree(quarantine)
+        return True
+    except OSError:
+        return False
 
 
 def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
@@ -820,8 +1794,31 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
     agents = aggregate_agent_targets(clients)
     disabled_agents = _disabled_agents(config)
     issues: list[dict[str, str]] = []
+    deployment_operations = _deployment_receipt_health(_data_root(config))
+    for operation in deployment_operations:
+        issue = {
+            "type": "deployment-recovery-required",
+            "path": str(operation["path"]),
+            "status": str(operation["status"]),
+            "detail": str(operation["recovery"]),
+        }
+        if "in_flight" in operation:
+            issue["in_flight"] = str(operation["in_flight"])
+        issues.append(issue)
     matrix: list[dict[str, str]] = []
     client_matrix: list[dict[str, str]] = []
+    deployment_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for selected_name in sorted(_selected_names(registry)):
+        selected_source = _local_skill_path_or_default(
+            config, registry, selected_name
+        )
+        if not (selected_source / "SKILL.md").is_file():
+            continue
+        for planned_skill in _deployment_plan(
+            config, registry, [selected_name], None
+        ):
+            for row in planned_skill["clients"]:
+                deployment_rows[(selected_name, row["client"])] = row
     for name in sorted(_selected_names(registry)):
         source = _local_skill_path_or_default(config, registry, name)
         if not (source / "SKILL.md").is_file():
@@ -831,11 +1828,13 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
         for client in clients:
             if not client.detected:
                 continue
-            state = (
-                "disabled"
-                if client.family_id in disabled_agents
-                else _agent_skill_state(source, client.skills_dir / name)
-            )
+            row = deployment_rows.get((name, client.id))
+            if client.family_id in disabled_agents:
+                state = "disabled"
+            elif row is None:
+                continue
+            else:
+                state = row["current_state"]
             client_states[client.id] = state
             client_matrix.append(
                 {
@@ -860,7 +1859,7 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
             ]
             state = _combined_link_state(states)
             matrix.append({"skill": name, "agent": agent.name, "state": state})
-            if state not in {"linked", "missing", "copied"}:
+            if state not in {"linked", "missing", "copied", "disabled"}:
                 issues.append({"type": state, "skill": name, "agent": agent.name})
     return {
         "skills_root": str(_global_skill_root(config)),
@@ -885,6 +1884,8 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
         ],
         "matrix": matrix,
         "client_matrix": client_matrix,
+        "deployment_operations": deployment_operations,
+        "recovery_required": bool(deployment_operations),
         "issues": issues,
     }
 
@@ -896,15 +1897,47 @@ def disable_agent_sync(
     """Persistently disable an Agent target and remove its managed links."""
     config_file = _config_path(config_path)
     config = load_config(config_file)
-    known_agents = {agent.name for agent in detect_agents()}
-    if agent_name not in known_agents:
-        raise SkillSyncError(f"unknown Agent: {agent_name}")
-    disabled_agents = _disabled_agents(config)
-    disabled_agents.add(agent_name)
-    config["disabled_agents"] = sorted(disabled_agents)
-    save_config(config_file, config)
-    removed = unlink_skills(agent_names=[agent_name], config_path=config_file)
-    return {"disabled": agent_name, **removed}
+    try:
+        with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
+            _assert_no_incomplete_deployment_receipts(_data_root(config))
+            known_agents = {agent.name for agent in detect_agents()}
+            if agent_name not in known_agents:
+                raise SkillSyncError(f"unknown Agent: {agent_name}")
+            previous_disabled = list(config.get("disabled_agents", []))
+            disabled_agents = _disabled_agents(config)
+            disabled_agents.add(agent_name)
+            config["disabled_agents"] = sorted(disabled_agents)
+            save_config(config_file, config)
+            try:
+                removed = _unlink_skills_unlocked(
+                    agent_names=[agent_name],
+                    config_path=config_file,
+                    _config=config,
+                )
+            except Exception as exc:
+                config["disabled_agents"] = previous_disabled
+                save_config(config_file, config)
+                try:
+                    deploy_migrate(
+                        config_path=config_file,
+                        agent_names=[agent_name],
+                    )
+                except Exception as rollback_exc:
+                    raise SkillSyncError(
+                        "Agent disable failed and requires link recovery",
+                        code="disable_rollback_needs_recovery",
+                        exit_code=EXIT_SAFETY,
+                        details={
+                            "cause": str(exc),
+                            "rollback_error": str(rollback_exc),
+                        },
+                    ) from exc
+                raise
+            return {"disabled": agent_name, **removed}
+    except TimeoutError as exc:
+        raise SkillSyncError(
+            str(exc), code="deployment_lock_timeout", exit_code=EXIT_SAFETY
+        ) from exc
 
 
 def enable_agent_sync(
@@ -929,11 +1962,11 @@ def _disabled_agents(config: dict[str, Any]) -> set[str]:
     return {_normalize_agent_name(name) for name in value}
 
 
-def _configured_agent_targets(entry: Any) -> set[str]:
+def _configured_client_targets(entry: Any) -> set[str]:
     if not isinstance(entry, dict):
         return set()
     raw_targets = str(entry.get("targets", DEFAULT_AGENT_TARGETS)).split(",")
-    return {_normalize_agent_name(name.strip()) for name in raw_targets if name.strip()}
+    return {name.strip() for name in raw_targets if name.strip()}
 
 
 def _normalize_agent_name(name: str) -> str:
@@ -947,22 +1980,23 @@ def _combined_link_state(states: list[str]) -> str:
         return "missing"
     unique = set(states)
     if len(unique) == 1:
-        return states[0]
-    if unique <= {"linked", "missing"}:
+        return "linked" if states[0] == "linked-render" else states[0]
+    if unique <= {"direct-source-link", "missing"}:
         return "partial"
-    if unique <= {"linked", "copied"}:
+    if unique <= {"linked", "linked-render", "missing"}:
+        return "partial"
+    if unique <= {"linked", "linked-render", "copied"}:
         return "copied"
-    return next(state for state in states if state not in {"linked", "missing"})
-
-
-def _agent_skill_state(source: Path, destination: Path) -> str:
-    state = link_state(source, destination)
-    if state != "conflict" or not destination.is_dir() or destination.is_symlink():
-        return state
-    try:
-        return "copied" if hash_skill_dir(source) == hash_skill_dir(destination) else state
-    except (OSError, ValueError):
-        return state
+    priority = (
+        "tampered-render",
+        "missing-render",
+        "stale-render",
+        "wrong-link",
+        "broken-link",
+        "conflict",
+        "direct-source-link",
+    )
+    return next((state for state in priority if state in unique), states[0])
 
 
 def scan_import_candidates(
@@ -983,11 +2017,15 @@ def scan_import_candidates(
         if not agent.detected or not agent.skills_dir.exists():
             continue
         for source in sorted(agent.skills_dir.iterdir(), key=lambda path: path.name):
-            if source.is_symlink() or not source.is_dir() or not (source / "SKILL.md").is_file():
+            if is_link_or_reparse(source):
                 continue
+            if not source.is_dir() or not (source / "SKILL.md").is_file():
+                continue
+            _validate_skill_path(source)
             destination = global_root / source.name
             state = "importable"
-            if destination.exists():
+            if destination.exists() or is_link_or_reparse(destination):
+                _validate_skill_path(destination)
                 state = "same" if hash_skill_dir(source) == hash_skill_dir(destination) else "conflict"
             candidates.append(
                 {"name": source.name, "agent": agent_name, "path": str(source), "state": state}
@@ -1000,11 +2038,31 @@ def import_agent_skills(
     agent_name: str,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Move Agent-local Skills into the global root and replace them with links."""
+    config = _load_local_config(config_path)
+    try:
+        with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
+            return _import_agent_skills_unlocked(
+                names, agent_name, config_path, _config=config
+            )
+    except TimeoutError as exc:
+        raise SkillSyncError(
+            str(exc), code="deployment_lock_timeout", exit_code=EXIT_SAFETY
+        ) from exc
+
+
+def _import_agent_skills_unlocked(
+    names: Iterable[str],
+    agent_name: str,
+    config_path: str | Path | None = None,
+    *,
+    _config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Move Agent-local Skills into the global root and link a deployment."""
     name_list = list(names)
     if not name_list:
         raise SkillSyncError("import requires at least one Skill name")
-    config = _load_local_config(config_path)
+    config = _load_local_config(config_path) if _config is None else _config
+    _assert_no_incomplete_deployment_receipts(_data_root(config))
     agents = {agent.name: agent for agent in detect_agents()}
     agent = agents.get(agent_name)
     if agent is None:
@@ -1012,42 +2070,114 @@ def import_agent_skills(
     if not agent.detected:
         raise SkillSyncError(f"Agent is not detected: {agent_name}")
     global_root = _global_skill_root(config)
+    expected_client_ids = _import_client_ids(agent_name, agent.skills_dir)
+    registry = _load_local_registry(config)
+    initially_selected = _selected_names(registry)
     imported: list[dict[str, str]] = []
     for name in name_list:
         if Path(name).name != name or name in {".", ".."}:
             raise SkillSyncError(f"invalid Skill name: {name}")
         source = agent.skills_dir / name
         destination = global_root / name
-        if source.is_symlink():
-            if link_state(destination, source) != "linked":
-                raise SkillSyncError(f"{name} is linked to a different location")
+        installed_target = _imported_deployment_target(
+            source,
+            _rendered_root(config),
+            name,
+            expected_client_ids,
+        )
+        if installed_target is not None:
             imported.append({"name": name, "agent": agent_name, "state": "already-linked"})
             continue
+        if is_link_or_reparse(source):
+            raise SkillSyncError(
+                f"{name} link is not a verified deployment for {agent_name}"
+            )
         _validate_skill_path(source)
-        destination_existed = destination.exists()
+        destination_existed = destination.exists() or is_link_or_reparse(destination)
+        created_identity: tuple[int, int, int] | None = None
+        created_hash: str | None = None
         if destination_existed:
             _validate_skill_path(destination)
             if hash_skill_dir(source) != hash_skill_dir(destination):
                 raise SkillSyncError(f"global Skill has different content: {name}")
         else:
-            copy_skill_dir(source, destination)
+            created_hash = copy_skill_dir(source, destination)
+            created_identity = _path_identity(destination)
         backup = source.parent / f".{name}.skill-sync-import-{time.time_ns()}"
         try:
-            os.replace(source, backup)
-            create_directory_link(destination, source)
-            if link_state(destination, source) != "linked":
-                raise SkillSyncError(f"failed to verify imported Skill link: {name}")
-        except Exception:
-            if source.is_symlink():
-                source.unlink()
-            if backup.exists():
-                os.replace(backup, source)
-            if not destination_existed and destination.exists():
-                shutil.rmtree(destination)
+            rename_no_replace(source, backup)
+            select_skills([name], platform=None, config_path=config_path)
+            deploy_migrate(
+                config_path=config_path,
+                skill_names=[name],
+                agent_names=[agent_name],
+            )
+            if _imported_deployment_target(
+                source, _rendered_root(config), name, expected_client_ids
+            ) is None:
+                raise SkillSyncError(f"failed to verify imported deployment link: {name}")
+        except Exception as exc:
+            recovery_errors: list[str] = []
+            owned_target = _imported_deployment_target(
+                source, _rendered_root(config), name, expected_client_ids
+            )
+            if owned_target is not None:
+                if not remove_directory_link(owned_target, source):
+                    recovery_errors.append(f"could not remove imported link: {source}")
+            if backup.exists() or is_link_or_reparse(backup):
+                try:
+                    rename_no_replace(backup, source)
+                except (FileExistsError, OSError):
+                    recovery_errors.append(
+                        f"Agent path changed; original preserved at {backup}"
+                    )
+            if name not in initially_selected:
+                try:
+                    deselect_skills([name], config_path=config_path)
+                except Exception as rollback_exc:
+                    recovery_errors.append(
+                        f"could not restore selection state: {rollback_exc}"
+                    )
+            if not destination_existed:
+                try:
+                    unchanged = (
+                        created_identity is not None
+                        and created_hash is not None
+                        and not is_link_or_reparse(destination)
+                        and destination.is_dir()
+                        and _path_identity(destination) == created_identity
+                        and hash_skill_dir(destination) == created_hash
+                    )
+                except (OSError, ValueError) as rollback_exc:
+                    unchanged = False
+                    recovery_errors.append(
+                        f"could not verify newly created global Skill: {rollback_exc}"
+                    )
+                if unchanged:
+                    if not _quarantine_and_remove_owned_directory(
+                        destination, created_identity, _data_root(config) / "trash"
+                    ):
+                        recovery_errors.append(
+                            f"newly created global Skill changed during cleanup and was preserved: {destination}"
+                        )
+                else:
+                    recovery_errors.append(
+                        f"global Skill changed during rollback and was preserved: {destination}"
+                    )
+            if recovery_errors:
+                raise SkillSyncError(
+                    "Skill import failed and requires recovery",
+                    code="import_rollback_needs_recovery",
+                    exit_code=EXIT_SAFETY,
+                    details={
+                        "cause": str(exc),
+                        "recovery_errors": recovery_errors,
+                        "backup": str(backup) if backup.exists() else None,
+                    },
+                ) from exc
             raise
         shutil.rmtree(backup)
         imported.append({"name": name, "agent": agent_name, "state": "imported"})
-    select_skills(name_list, platform=None, config_path=config_path)
     return {"imported": imported}
 
 
@@ -1055,6 +2185,25 @@ def copy_global_skills_to_agents(
     names: Iterable[str],
     agent_names: Iterable[str],
     config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    config = _load_local_config(config_path)
+    try:
+        with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
+            return _copy_global_skills_to_agents_unlocked(
+                names, agent_names, config_path, _config=config
+            )
+    except TimeoutError as exc:
+        raise SkillSyncError(
+            str(exc), code="deployment_lock_timeout", exit_code=EXIT_SAFETY
+        ) from exc
+
+
+def _copy_global_skills_to_agents_unlocked(
+    names: Iterable[str],
+    agent_names: Iterable[str],
+    config_path: str | Path | None = None,
+    *,
+    _config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Copy canonical Skills into Agent directories without creating links.
 
@@ -1069,13 +2218,28 @@ def copy_global_skills_to_agents(
         raise SkillSyncError("copy requires at least one Skill name")
     if not requested_agents:
         raise SkillSyncError("copy requires at least one Agent")
-    config = _load_local_config(config_path)
+    config = _load_local_config(config_path) if _config is None else _config
+    _assert_no_incomplete_deployment_receipts(_data_root(config))
     registry = _load_local_registry(config)
-    agents = {agent.name: agent for agent in detect_agents()}
-    unknown = requested_agents - set(agents)
+    clients = detect_clients()
+    known = {client.id for client in clients} | {client.family_id for client in clients}
+    unknown = requested_agents - known
     if unknown:
         raise SkillSyncError("unknown Agent: " + ", ".join(sorted(unknown)))
-    unavailable = [name for name in requested_agents if not agents[name].detected]
+    selected_clients = [
+        client
+        for client in clients
+        if client.id in requested_agents or client.family_id in requested_agents
+    ]
+    unavailable = [
+        name
+        for name in requested_agents
+        if not any(
+            client.detected
+            and (client.id == name or client.family_id == name)
+            for client in selected_clients
+        )
+    ]
     if unavailable:
         raise SkillSyncError("Agent is not detected: " + ", ".join(sorted(unavailable)))
     copied: list[dict[str, str]] = []
@@ -1084,24 +2248,39 @@ def copy_global_skills_to_agents(
             raise SkillSyncError(f"invalid Skill name: {name}")
         source = _local_skill_path_or_default(config, registry, name)
         _validate_skill_path(source)
-        for agent_name in sorted(requested_agents):
-            agent = agents[agent_name]
-            for skills_dir in agent.skill_dirs:
-                destination = skills_dir / name
-                state = link_state(source, destination)
-                if state == "linked":
-                    remove_directory_link(source, destination)
-                elif state != "missing":
-                    raise SkillSyncError(
-                        f"refusing to overwrite existing {state} directory: {destination}"
-                    )
-                try:
-                    copy_skill_dir(source, destination)
-                except Exception:
-                    if not destination.exists() and state == "linked":
-                        create_directory_link(source, destination)
-                    raise
-                copied.append({"skill": name, "agent": agent_name, "path": str(destination), "state": "copied"})
+        for client in selected_clients:
+            if not client.detected:
+                continue
+            destination = client.skills_dir / name
+            owned_target = _owned_link_target(
+                source,
+                destination,
+                _rendered_root(config),
+                name,
+                client.id,
+            )
+            state = "linked" if owned_target is not None else link_state(source, destination)
+            if owned_target is not None:
+                remove_directory_link(owned_target, destination)
+            elif state != "missing":
+                raise SkillSyncError(
+                    f"refusing to overwrite existing {state} directory: {destination}"
+                )
+            try:
+                copy_skill_dir(source, destination)
+            except Exception:
+                if not destination.exists() and owned_target is not None:
+                    create_directory_link(owned_target, destination)
+                raise
+            copied.append(
+                {
+                    "skill": name,
+                    "agent": client.family_id,
+                    "client": client.id,
+                    "path": str(destination),
+                    "state": "copied",
+                }
+            )
     return {"copied": copied}
 
 
@@ -1109,17 +2288,36 @@ def delete_global_skills(
     names: Iterable[str],
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    config = _load_local_config(config_path)
+    try:
+        with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
+            return _delete_global_skills_unlocked(
+                names, config_path, _config=config
+            )
+    except TimeoutError as exc:
+        raise SkillSyncError(
+            str(exc), code="deployment_lock_timeout", exit_code=EXIT_SAFETY
+        ) from exc
+
+
+def _delete_global_skills_unlocked(
+    names: Iterable[str],
+    config_path: str | Path | None = None,
+    *,
+    _config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Permanently delete canonical Skills and their managed Agent links."""
     name_list = list(dict.fromkeys(names))
     if not name_list:
         raise SkillSyncError("delete requires at least one Skill name")
     config_file = _config_path(config_path)
-    config = load_config(config_file)
+    config = load_config(config_file) if _config is None else _config
+    _assert_no_incomplete_deployment_receipts(_data_root(config))
     repo = _repo_path(config)
     registry_path = repo / REGISTRY_FILE
     registry = _read_or_empty_registry(registry_path)
     global_root = _global_skill_root(config)
-    agents = detect_agents()
+    clients = detect_clients()
     moved: list[tuple[str, Path, Path]] = []
     removed_links: list[tuple[Path, Path]] = []
     try:
@@ -1127,17 +2325,25 @@ def delete_global_skills(
             if Path(name).name != name or name in {".", ".."}:
                 raise SkillSyncError(f"invalid Skill name: {name}")
             source = global_root / name
-            if source.is_symlink():
-                raise SkillSyncError(f"refusing to delete global Skill symlink: {name}")
             _validate_skill_path(source)
+            for client in clients:
+                if not client.skills_dir.is_dir():
+                    continue
+                destination = client.skills_dir / name
+                owned_target = _owned_link_target(
+                    source,
+                    destination,
+                    _rendered_root(config),
+                    name,
+                    client.id,
+                )
+                if owned_target is not None and remove_directory_link(
+                    owned_target, destination
+                ):
+                    removed_links.append((owned_target, destination))
             backup = global_root / f".{name}.skill-sync-delete-{time.time_ns()}"
-            os.replace(source, backup)
+            rename_no_replace(source, backup)
             moved.append((name, source, backup))
-            for agent in agents:
-                for skills_dir in agent.skill_dirs:
-                    destination = skills_dir / name
-                    if remove_directory_link(source, destination):
-                        removed_links.append((source, destination))
         skills = registry.setdefault("skills", {})
         local_skills = config.setdefault("skills", {})
         for name in name_list:
@@ -1145,13 +2351,31 @@ def delete_global_skills(
             local_skills.pop(name, None)
         save_registry(registry_path, registry)
         save_config(config_file, config)
-    except Exception:
+    except Exception as exc:
+        recovery_errors: list[str] = []
         for _, source, backup in reversed(moved):
-            if backup.exists() and not source.exists():
-                os.replace(backup, source)
-        for source, destination in removed_links:
-            if source.exists() and not destination.exists():
-                create_directory_link(source, destination)
+            if backup.exists() or is_link_or_reparse(backup):
+                try:
+                    rename_no_replace(backup, source)
+                except (FileExistsError, OSError):
+                    recovery_errors.append(
+                        f"canonical path changed; backup preserved at {backup}"
+                    )
+        for link_target, destination in removed_links:
+            if link_target.exists() and not destination.exists():
+                try:
+                    create_directory_link(link_target, destination)
+                except (FileExistsError, OSError) as rollback_exc:
+                    recovery_errors.append(
+                        f"could not restore {destination}: {rollback_exc}"
+                    )
+        if recovery_errors:
+            raise SkillSyncError(
+                "Skill deletion failed and requires recovery",
+                code="delete_rollback_needs_recovery",
+                exit_code=EXIT_SAFETY,
+                details={"cause": str(exc), "recovery_errors": recovery_errors},
+            ) from exc
         raise
     for _, _, backup in moved:
         shutil.rmtree(backup)
@@ -1167,8 +2391,6 @@ def backup_global_skill(
         raise SkillSyncError(f"invalid Skill name: {name}")
     config = _load_local_config(config_path)
     source = _global_skill_root(config) / name
-    if source.is_symlink():
-        raise SkillSyncError(f"refusing to back up global Skill symlink: {name}")
     _validate_skill_path(source)
     destination = _global_skill_root(config) / ".skill-sync-backups" / f"{name}-{time.strftime('%Y%m%d-%H%M%S')}"
     copy_skill_dir(source, destination)

@@ -138,6 +138,44 @@ def _build_parser() -> argparse.ArgumentParser:
         protocol_command="managed check",
     )
 
+    deploy_parser = subparsers.add_parser(
+        "deploy", help="inspect and migrate rendered Skill deployments"
+    )
+    deploy_subparsers = deploy_parser.add_subparsers(dest="deploy_action", required=True)
+    deploy_preview_parser = deploy_subparsers.add_parser(
+        "preview", help="preview migration to rendered deployments"
+    )
+    deploy_preview_parser.set_defaults(
+        handler=_handle_deploy_preview,
+        protocol_command="deploy preview",
+    )
+    deploy_status_parser = deploy_subparsers.add_parser(
+        "status", help="show rendered deployment status"
+    )
+    deploy_status_parser.add_argument("--json", action="store_true", help="print JSON output")
+    deploy_status_parser.set_defaults(
+        handler=_handle_deploy_status,
+        protocol_command="deploy status",
+    )
+    deploy_migrate_parser = deploy_subparsers.add_parser(
+        "migrate", help="migrate managed links to rendered deployments"
+    )
+    deploy_migrate_parser.set_defaults(
+        handler=_handle_deploy_migrate,
+        protocol_command="deploy migrate",
+    )
+    deploy_gc_parser = deploy_subparsers.add_parser(
+        "gc", help="remove verified unreferenced rendered deployments"
+    )
+    deploy_gc_parser.add_argument(
+        "--dry-run", action="store_true", help="list removable deployments only"
+    )
+    deploy_gc_parser.add_argument("--json", action="store_true", help="print JSON output")
+    deploy_gc_parser.set_defaults(
+        handler=_handle_deploy_gc,
+        protocol_command="deploy gc",
+    )
+
     web_parser = subparsers.add_parser("web", help="start the local management Web UI")
     web_parser.add_argument("--host", default="127.0.0.1")
     web_parser.add_argument("--port", type=int, default=8765)
@@ -283,7 +321,13 @@ def _handle_doctor(args: argparse.Namespace) -> Any:
     if args.json:
         return result
     detected = ", ".join(a["display_name"] for a in result["agents"] if a["detected"]) or "none"
-    return f"Detected Agents: {detected}\nIssues: {len(result['issues'])}"
+    lines = [f"Detected Agents: {detected}", f"Issues: {len(result['issues'])}"]
+    for operation in result.get("deployment_operations", []):
+        detail = f"{operation['status']}: {operation['path']}"
+        if operation.get("in_flight"):
+            detail += f" (in flight: {operation['in_flight']})"
+        lines.append(f"Recovery required: {detail}")
+    return "\n".join(lines)
 
 
 def _handle_managed_check(args: argparse.Namespace) -> Any:
@@ -313,6 +357,36 @@ def _handle_managed_check(args: argparse.Namespace) -> Any:
             f"Recommended action: {action}",
         )
     )
+
+
+def _handle_deploy_preview(args: argparse.Namespace) -> str:
+    result = core.deploy_preview(config_path=args.config)
+    return _format_deploy_preview(result)
+
+
+def _handle_deploy_status(args: argparse.Namespace) -> Any:
+    result = core.deploy_status(config_path=args.config)
+    if args.json:
+        return result
+    return _format_deploy_status(result)
+
+
+def _handle_deploy_migrate(args: argparse.Namespace) -> str:
+    result = core.deploy_migrate(config_path=args.config)
+    return _format_deploy_migrate(result)
+
+
+def _handle_deploy_gc(args: argparse.Namespace) -> Any:
+    result = core.deploy_gc(config_path=args.config, dry_run=args.dry_run)
+    if args.json:
+        return result
+    action = "Would remove" if args.dry_run else "Removed"
+    paths = result["candidates"] if args.dry_run else result["removed"]
+    lines = [f"{action}: {len(paths)} deployments"]
+    lines.extend(f"- {path}" for path in paths)
+    if result.get("skipped"):
+        lines.append(f"Skipped: {len(result['skipped'])} unsafe or referenced entries")
+    return "\n".join(lines)
 
 
 def _handle_web(args: argparse.Namespace) -> None:
@@ -349,6 +423,62 @@ def _format_status(result: dict[str, Any]) -> str:
         change_label = "changed" if skill.get("changed_local") else "unchanged"
         lines.append(
             f"- {skill['name']} [{skill['platform']}] {change_label}: {skill['local_path']}"
+        )
+    return "\n".join(lines)
+
+
+def _format_deploy_preview(result: dict[str, Any]) -> str:
+    lines = [f"Rendered root: {result['rendered_root']}"]
+    skills = result.get("skills", [])
+    if not skills:
+        lines.append("No managed Skill deployments to preview.")
+    for skill in skills:
+        lines.append(f"- {skill['name']} (source {skill['source_path']})")
+        for client in skill.get("clients", []):
+            lines.append(
+                f"  - {client['client']} [{client['agent']}]: "
+                f"{client['current_state']} -> {client['action']}; "
+                f"{client['destination']} -> {client['deployment_path']}"
+            )
+    if result.get("blocked"):
+        lines.append("Migration blocked: resolve the reported deployment state first.")
+    return "\n".join(lines)
+
+
+def _format_deploy_status(result: dict[str, Any]) -> str:
+    lines = [f"Rendered root: {result['rendered_root']}"]
+    for operation in result.get("operations", []):
+        detail = f"{operation['status']}: {operation['path']}"
+        if operation.get("in_flight"):
+            detail += f" (in flight: {operation['in_flight']})"
+        lines.append(f"Recovery required: {detail}")
+    skills = result.get("skills", [])
+    if not skills:
+        lines.append("No managed Skill deployments.")
+        return "\n".join(lines)
+    for skill in skills:
+        lines.append(f"- {skill['name']} (source {skill['source_path']})")
+        for client in skill.get("clients", []):
+            migration = "migration required" if client["migration_required"] else "current"
+            lines.append(
+                f"  - {client['client']} [{client['agent']}]: "
+                f"deployment {client['deployment_state']}, link {client['link_state']}, {migration}; "
+                f"{client['destination']} -> {client['deployment_path']}"
+            )
+    return "\n".join(lines)
+
+
+def _format_deploy_migrate(result: dict[str, Any]) -> str:
+    lines = [f"Rendered root: {result['rendered_root']}"]
+    migrated = result.get("migrated", [])
+    if result.get("noop") or not migrated:
+        lines.append("No deployment migrations needed.")
+        return "\n".join(lines)
+    lines.append(f"Migrated: {len(migrated)} Skill/client links")
+    for item in migrated:
+        lines.append(
+            f"- {item['skill']} / {item['client']}: {item['state']}; "
+            f"{item['from']} -> {item['to']}"
         )
     return "\n".join(lines)
 

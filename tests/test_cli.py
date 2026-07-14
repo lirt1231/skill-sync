@@ -286,6 +286,153 @@ class CliTest(unittest.TestCase):
             envelope["errors"][0]["details"]["inspection"], inspection
         )
 
+    def test_deploy_preview_dispatches_and_prints_each_skill_client(self):
+        result = {
+            "rendered_root": "/data/rendered",
+            "skills": [
+                {
+                    "name": "alpha",
+                    "source_path": "/global/alpha",
+                    "source_hash": "sha256:source",
+                    "clients": [
+                        {
+                            "client": "codex",
+                            "agent": "codex",
+                            "destination": "/codex/alpha",
+                            "deployment_path": "/data/rendered/hash/alpha",
+                            "current_state": "direct-source-link",
+                            "action": "migrate",
+                        },
+                        {
+                            "client": "kimi-desktop",
+                            "agent": "kimi",
+                            "destination": "/kimi/alpha",
+                            "deployment_path": "/data/rendered/hash/alpha",
+                            "current_state": "missing",
+                            "action": "link",
+                        },
+                    ],
+                }
+            ],
+            "blocked": False,
+        }
+        with mock.patch.object(cli.core, "deploy_preview", return_value=result, create=True) as preview:
+            code, stdout, stderr = run_cli(
+                ["--config", "/tmp/config.json", "deploy", "preview"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        preview.assert_called_once_with(config_path="/tmp/config.json")
+        self.assertIn("alpha", stdout)
+        self.assertIn("codex [codex]", stdout)
+        self.assertIn("kimi-desktop [kimi]", stdout)
+        self.assertIn("direct-source-link -> migrate", stdout)
+        self.assertIn("/data/rendered/hash/alpha", stdout)
+
+    def test_deploy_status_supports_text_and_json_envelope(self):
+        result = {
+            "rendered_root": "/data/rendered",
+            "skills": [
+                {
+                    "name": "alpha",
+                    "source_path": "/global/alpha",
+                    "source_hash": "sha256:source",
+                    "clients": [
+                        {
+                            "client": "workbuddy",
+                            "agent": "workbuddy",
+                            "destination": "/workbuddy/alpha",
+                            "deployment_path": "/data/rendered/hash/alpha",
+                            "deployment_state": "healthy",
+                            "link_state": "managed-deployment",
+                            "migration_required": False,
+                        }
+                    ],
+                }
+            ],
+        }
+        with mock.patch.object(cli.core, "deploy_status", return_value=result, create=True) as status:
+            code, stdout, stderr = run_cli(["deploy", "status"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        status.assert_called_once_with(config_path=None)
+        self.assertIn("alpha", stdout)
+        self.assertIn("workbuddy [workbuddy]", stdout)
+        self.assertIn("deployment healthy, link managed-deployment, current", stdout)
+
+        with mock.patch.object(cli.core, "deploy_status", return_value=result, create=True):
+            code, stdout, stderr = run_cli(["deploy", "status", "--json"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        envelope = json.loads(stdout)
+        self.assertEqual(envelope["command"], "deploy status")
+        self.assertTrue(envelope["ok"])
+        self.assertEqual(envelope["result"], result)
+
+    def test_deploy_migrate_dispatches_and_summarizes_migrated_links(self):
+        result = {
+            "rendered_root": "/data/rendered",
+            "migrated": [
+                {
+                    "skill": "alpha",
+                    "client": "codex",
+                    "from": "/global/alpha",
+                    "to": "/data/rendered/hash/alpha",
+                    "state": "migrated",
+                }
+            ],
+            "deployments": [],
+            "noop": False,
+        }
+        with mock.patch.object(cli.core, "deploy_migrate", return_value=result, create=True) as migrate:
+            code, stdout, stderr = run_cli(
+                ["--config", "/tmp/config.json", "deploy", "migrate"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        migrate.assert_called_once_with(config_path="/tmp/config.json")
+        self.assertIn("Migrated: 1 Skill/client links", stdout)
+        self.assertIn("alpha / codex: migrated", stdout)
+        self.assertIn("/global/alpha -> /data/rendered/hash/alpha", stdout)
+
+    def test_deploy_migrate_reports_noop(self):
+        result = {
+            "rendered_root": "/data/rendered",
+            "migrated": [],
+            "deployments": [],
+            "noop": True,
+        }
+        with mock.patch.object(cli.core, "deploy_migrate", return_value=result, create=True):
+            code, stdout, stderr = run_cli(["deploy", "migrate"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("No deployment migrations needed.", stdout)
+
+    def test_deploy_gc_supports_dry_run_json_envelope(self):
+        result = {
+            "rendered_root": "/data/rendered",
+            "dry_run": True,
+            "candidates": ["/data/rendered/hash/alpha"],
+            "removed": [],
+            "skipped": [],
+        }
+        with mock.patch.object(cli.core, "deploy_gc", return_value=result) as gc:
+            code, stdout, stderr = run_cli(
+                ["--config", "/tmp/config.json", "deploy", "gc", "--dry-run", "--json"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        gc.assert_called_once_with(config_path="/tmp/config.json", dry_run=True)
+        envelope = json.loads(stdout)
+        self.assertEqual(envelope["command"], "deploy gc")
+        self.assertEqual(envelope["result"], result)
+
     def test_repeated_skill_filters_dispatch_to_status_pull_push(self):
         status_result = {
             "schema_version": 1,

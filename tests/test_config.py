@@ -5,6 +5,7 @@ from pathlib import Path
 
 from skill_sync.config import (
     default_config_path,
+    default_data_root,
     empty_config,
     load_config,
     save_config,
@@ -25,6 +26,32 @@ class ConfigTest(unittest.TestCase):
         path = default_config_path(env={}, home=Path("/home/example"))
 
         self.assertEqual(path, Path("/home/example/.config/skill-sync/config.json"))
+
+    def test_default_data_root_uses_platform_conventions(self):
+        home = Path("/home/example")
+
+        self.assertEqual(
+            default_data_root(
+                env={"LOCALAPPDATA": "C:/Users/example/AppData/Local"},
+                home=home,
+                os_name="nt",
+                platform="win32",
+            ),
+            Path("C:/Users/example/AppData/Local/skill-sync"),
+        )
+        self.assertEqual(
+            default_data_root(env={}, home=home, os_name="posix", platform="darwin"),
+            home / "Library" / "Application Support" / "skill-sync",
+        )
+        self.assertEqual(
+            default_data_root(
+                env={"XDG_DATA_HOME": "/data/example"},
+                home=home,
+                os_name="posix",
+                platform="linux",
+            ),
+            Path("/data/example/skill-sync"),
+        )
 
     def test_load_missing_config_returns_empty_defaults(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -97,6 +124,27 @@ class ConfigTest(unittest.TestCase):
             config_path.write_text(json.dumps({"skills": []}), encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "skills"):
+                load_config(config_path)
+
+    def test_load_rejects_invalid_data_root(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps({"skills": {}, "data_root": ""}), encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ValueError, "data_root"):
+                load_config(config_path)
+
+    def test_load_rejects_relative_data_root(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps({"skills": {}, "data_root": "relative/store"}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "absolute"):
                 load_config(config_path)
 
 

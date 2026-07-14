@@ -95,7 +95,7 @@ class CopySkillDirTest(unittest.TestCase):
 
             import skill_sync.copying as copying
 
-            original_replace = copying.os.replace
+            original_rename = copying._rename_no_replace
 
             def fail_install_temp(src, dst):
                 src_path = Path(src)
@@ -106,9 +106,9 @@ class CopySkillDirTest(unittest.TestCase):
                     and src_path.parent.name.startswith(".destination.tmp-")
                 ):
                     raise OSError("forced replacement failure")
-                return original_replace(src, dst)
+                return original_rename(src, dst)
 
-            with mock.patch.object(copying.os, "replace", side_effect=fail_install_temp):
+            with mock.patch.object(copying, "_rename_no_replace", side_effect=fail_install_temp):
                 with self.assertRaisesRegex(OSError, "forced replacement failure"):
                     copy_skill_dir(source, destination)
 
@@ -188,6 +188,92 @@ class CopySkillDirTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "source.*directory"):
                 copy_skill_dir(work / "missing", work / "destination")
+
+    def test_rejects_source_root_reported_as_reparse_point(self):
+        with tempfile.TemporaryDirectory() as work_dir:
+            work = Path(work_dir)
+            source = work / "source"
+            write_file(source, "SKILL.md", b"# Skill\n")
+            with mock.patch("skill_sync.copying.is_link_or_reparse", return_value=True):
+                with self.assertRaisesRegex(ValueError, "source.*directory"):
+                    copy_skill_dir(source, work / "destination")
+
+    def test_concurrent_real_directory_winner_is_preserved(self):
+        self._assert_concurrent_winner_preserved("directory")
+
+    def test_concurrent_file_winner_is_preserved(self):
+        self._assert_concurrent_winner_preserved("file")
+
+    @unittest.skipUnless(hasattr(Path, "symlink_to"), "symlinks are unsupported")
+    def test_concurrent_link_winner_is_preserved(self):
+        self._assert_concurrent_winner_preserved("link")
+
+    def test_concurrent_winner_after_backup_is_preserved_without_losing_original(self):
+        with tempfile.TemporaryDirectory() as work_dir:
+            work = Path(work_dir)
+            source = work / "source"
+            destination = work / "destination"
+            write_file(source, "SKILL.md", b"# Incoming Skill\n")
+            write_file(destination, "SKILL.md", b"# Original Skill\n")
+            import skill_sync.copying as copying
+
+            original_rename = copying._rename_no_replace
+
+            def install_winner_then_publish(src, dst):
+                if Path(dst) == destination and Path(src).parent.name.startswith(
+                    ".destination.tmp-"
+                ):
+                    write_file(destination, "winner.txt", b"external winner")
+                return original_rename(Path(src), Path(dst))
+
+            with mock.patch.object(
+                copying, "_rename_no_replace", side_effect=install_winner_then_publish
+            ):
+                with self.assertRaises(FileExistsError):
+                    copy_skill_dir(source, destination)
+
+            self.assertEqual((destination / "winner.txt").read_bytes(), b"external winner")
+            backups = list(work.glob(".destination.backup-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((backups[0] / "SKILL.md").read_bytes(), b"# Original Skill\n")
+
+    def _assert_concurrent_winner_preserved(self, winner_kind: str):
+        with tempfile.TemporaryDirectory() as work_dir:
+            work = Path(work_dir)
+            source = work / "source"
+            destination = work / "destination"
+            write_file(source, "SKILL.md", b"# Incoming Skill\n")
+            external_target = work / "external-target"
+            external_target.mkdir()
+            import skill_sync.copying as copying
+
+            original_rename = copying._rename_no_replace
+
+            def install_winner_then_publish(src, dst):
+                if Path(dst) == destination and Path(src).parent.name.startswith(
+                    ".destination.tmp-"
+                ):
+                    if winner_kind == "directory":
+                        write_file(destination, "winner.txt", b"external directory")
+                    elif winner_kind == "file":
+                        destination.write_bytes(b"external file")
+                    else:
+                        destination.symlink_to(external_target, target_is_directory=True)
+                return original_rename(Path(src), Path(dst))
+
+            with mock.patch.object(
+                copying, "_rename_no_replace", side_effect=install_winner_then_publish
+            ):
+                with self.assertRaises(FileExistsError):
+                    copy_skill_dir(source, destination)
+
+            if winner_kind == "directory":
+                self.assertEqual((destination / "winner.txt").read_bytes(), b"external directory")
+            elif winner_kind == "file":
+                self.assertEqual(destination.read_bytes(), b"external file")
+            else:
+                self.assertTrue(destination.is_symlink())
+                self.assertEqual(destination.resolve(), external_target.resolve())
 
 
 if __name__ == "__main__":

@@ -1,4 +1,7 @@
+import json
+import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +11,10 @@ try:
     import skill_sync.core as core_module
     from skill_sync.core import (
         deselect_skills,
+        deploy_migrate,
+        deploy_gc,
+        deploy_preview,
+        deploy_status,
         init_sync,
         pull,
         push,
@@ -27,6 +34,10 @@ except ImportError as exc:  # pragma: no cover - exercised by initial TDD red ru
     scan_skills = None
     select_skills = None
     deselect_skills = None
+    deploy_migrate = None
+    deploy_gc = None
+    deploy_preview = None
+    deploy_status = None
     status = None
     pull = None
     push = None
@@ -163,6 +174,333 @@ class CoreWorkflowTest(unittest.TestCase):
             for client_id, family_id, display_name in endpoints
         ]
 
+    def use_local_data_root(self) -> Path:
+        config = load_config(self.config_path)
+        data_root = self.work / "data"
+        config["data_root"] = str(data_root)
+        save_config(self.config_path, config)
+        return data_root
+
+    def test_deploy_preview_is_read_only_and_reports_direct_link_migration(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        data_root = self.use_local_data_root()
+        clients = self.detected_clients("codex")
+        destination = clients[0].skills_dir / "alpha"
+        core_module.create_directory_link(source, destination)
+
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            preview = deploy_preview(config_path=self.config_path)
+            status_result = deploy_status(config_path=self.config_path)
+
+        row = preview["skills"][0]["clients"][0]
+        self.assertFalse(preview["blocked"])
+        self.assertEqual(row["current_state"], "direct-source-link")
+        self.assertEqual(row["deployment_state"], "missing")
+        self.assertEqual(row["action"], "build-and-swap")
+        self.assertFalse(data_root.exists())
+        self.assertTrue(status_result["skills"][0]["clients"][0]["migration_required"])
+        self.assertEqual(destination.resolve(), source.resolve())
+
+    def test_deploy_migrate_builds_per_client_read_only_snapshots(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        self.use_local_data_root()
+        clients = self.detected_clients("codex", "workbuddy")
+        for client in clients[:2]:
+            core_module.create_directory_link(source, client.skills_dir / "alpha")
+
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            result = deploy_migrate(config_path=self.config_path)
+            second = deploy_migrate(config_path=self.config_path)
+
+        self.assertEqual(len(result["migrated"]), 2)
+        self.assertEqual(len(result["deployments"]), 2)
+        targets = {
+            client.id: (client.skills_dir / "alpha").resolve()
+            for client in clients[:2]
+        }
+        self.assertNotEqual(targets["codex"], targets["workbuddy"])
+        for target in targets.values():
+            self.assertTrue(core_module.verify_deployment(target).ok)
+            self.assertNotEqual(target, source.resolve())
+            self.assertEqual(target.stat().st_mode & 0o222, 0)
+        self.assertTrue(second["noop"])
+        self.assertEqual(second["migrated"], [])
+        self.assertTrue((source / "SKILL.md").is_file())
+        receipt = json.loads(Path(result["receipt_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(len(receipt["completed"]), 2)
+
+    def test_deploy_migrate_refuses_real_agent_directory_without_building(self):
+        self.init_from_remote()
+        self.select_default_skill("alpha")
+        data_root = self.use_local_data_root()
+        clients = self.detected_clients("codex")
+        destination = clients[0].skills_dir / "alpha"
+        make_skill(destination.parent, "alpha", "# local conflict\n")
+
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            with self.assertRaises(SkillSyncError) as raised:
+                deploy_migrate(config_path=self.config_path)
+
+        self.assertEqual(raised.exception.exit_code, 4)
+        self.assertEqual((destination / "SKILL.md").read_text(), "# local conflict\n")
+        self.assertFalse((data_root / "rendered").exists())
+
+    def test_deploy_migrate_stops_if_canonical_changes_after_render(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        self.use_local_data_root()
+        clients = self.detected_clients("codex")
+        destination = clients[0].skills_dir / "alpha"
+        core_module.create_directory_link(source, destination)
+        real_render = core_module.render_base_deployment
+
+        def render_then_change(*args, **kwargs):
+            deployed = real_render(*args, **kwargs)
+            (source / "SKILL.md").write_text("# changed during render\n", encoding="utf-8")
+            return deployed
+
+        with (
+            mock.patch.object(core_module, "detect_clients", return_value=clients),
+            mock.patch.object(
+                core_module,
+                "render_base_deployment",
+                side_effect=render_then_change,
+            ),
+        ):
+            with self.assertRaises(SkillSyncError) as raised:
+                deploy_migrate(config_path=self.config_path)
+
+        self.assertEqual(raised.exception.exit_code, 3)
+        self.assertEqual(destination.resolve(), source.resolve())
+
+    def test_deploy_migrate_rolls_back_prior_link_when_later_swap_fails(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        self.use_local_data_root()
+        clients = self.detected_clients("codex", "workbuddy")
+        destinations = [client.skills_dir / "alpha" for client in clients[:2]]
+        for destination in destinations:
+            core_module.create_directory_link(source, destination)
+        real_replace = core_module.replace_directory_link
+        calls = 0
+
+        def fail_second_swap(new_source, destination, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("forced second swap failure")
+            return real_replace(new_source, destination, **kwargs)
+
+        with (
+            mock.patch.object(core_module, "detect_clients", return_value=clients),
+            mock.patch.object(
+                core_module, "replace_directory_link", side_effect=fail_second_swap
+            ),
+        ):
+            with self.assertRaisesRegex(SkillSyncError, "previous links were restored"):
+                deploy_migrate(config_path=self.config_path)
+
+        for destination in destinations:
+            self.assertEqual(destination.resolve(), source.resolve())
+        receipts = list((self.work / "data" / "operations").glob("deploy-migrate-*.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(
+            json.loads(receipts[0].read_text(encoding="utf-8"))["status"],
+            "rolled-back",
+        )
+
+    def test_deploy_migrate_rolls_back_current_link_after_post_swap_verify_failure(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        data_root = self.use_local_data_root()
+        clients = self.detected_clients("codex")
+        destination = clients[0].skills_dir / "alpha"
+        core_module.create_directory_link(source, destination)
+        real_link_state = core_module.link_state
+        failed = False
+
+        def fail_first_post_swap_verification(candidate, checked_destination):
+            nonlocal failed
+            state = real_link_state(candidate, checked_destination)
+            if (
+                not failed
+                and state == "linked"
+                and Path(candidate).is_relative_to(data_root / "rendered")
+            ):
+                failed = True
+                return "wrong-link"
+            return state
+
+        with (
+            mock.patch.object(core_module, "detect_clients", return_value=clients),
+            mock.patch.object(
+                core_module,
+                "link_state",
+                side_effect=fail_first_post_swap_verification,
+            ),
+        ):
+            with self.assertRaisesRegex(SkillSyncError, "verification failed"):
+                deploy_migrate(config_path=self.config_path)
+
+        self.assertTrue(failed)
+        self.assertEqual(destination.resolve(), source.resolve())
+
+    def test_deploy_migrate_handles_link_chained_through_another_client(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        self.use_local_data_root()
+        codex, claude = [
+            client
+            for client in self.detected_clients("codex", "claude-code")
+            if client.detected
+        ]
+        codex.skills_dir.mkdir(parents=True)
+        claude.skills_dir.mkdir(parents=True)
+        codex_link = codex.skills_dir / "alpha"
+        claude_link = claude.skills_dir / "alpha"
+        codex_link.symlink_to(source, target_is_directory=True)
+        claude_link.symlink_to(codex_link, target_is_directory=True)
+
+        with mock.patch.object(
+            core_module, "detect_clients", return_value=[codex, claude]
+        ):
+            result = deploy_migrate(config_path=self.config_path)
+            preview = deploy_preview(config_path=self.config_path)
+
+        self.assertEqual(len(result["migrated"]), 2)
+        self.assertEqual(
+            {row["current_state"] for row in preview["skills"][0]["clients"]},
+            {"linked-render"},
+        )
+        self.assertNotEqual(codex_link.resolve(), claude_link.resolve())
+
+    def test_deploy_gc_removes_only_verified_unreferenced_snapshots(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        data_root = self.use_local_data_root()
+        clients = self.detected_clients("codex")
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            deploy_migrate(config_path=self.config_path)
+            unreferenced = core_module.render_base_deployment(
+                source,
+                data_root / "rendered",
+                "alpha",
+                "claude-code",
+            )
+            dry_run = deploy_gc(config_path=self.config_path, dry_run=True)
+            remained_after_dry_run = unreferenced.path.exists()
+            result = deploy_gc(config_path=self.config_path)
+
+        referenced = (clients[0].skills_dir / "alpha").resolve()
+        self.assertTrue(referenced.exists())
+        self.assertTrue(core_module.verify_deployment(referenced).ok)
+        self.assertIn(str(unreferenced.path), dry_run["candidates"])
+        self.assertTrue(remained_after_dry_run)
+        self.assertIn(str(unreferenced.path), result["removed"])
+        self.assertFalse(unreferenced.path.exists())
+
+    def test_deploy_gc_fails_closed_on_malformed_receipt(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        data_root = self.use_local_data_root()
+        deployment = core_module.render_base_deployment(
+            source, data_root / "rendered", "alpha", "codex"
+        )
+        operations = data_root / "operations"
+        operations.mkdir(parents=True)
+        (operations / "deploy-migrate-truncated.json").write_text(
+            '{"status":"applying"', encoding="utf-8"
+        )
+
+        with mock.patch.object(
+            core_module, "detect_clients", return_value=self.detected_clients()
+        ):
+            with self.assertRaises(SkillSyncError) as raised:
+                deploy_gc(config_path=self.config_path)
+
+        self.assertEqual(raised.exception.exit_code, 4)
+        self.assertEqual(raised.exception.code, "deployment_recovery_required")
+        self.assertTrue(deployment.path.exists())
+
+    def test_deploy_status_and_doctor_surface_incomplete_receipt(self):
+        self.init_from_remote()
+        self.select_default_skill("alpha")
+        data_root = self.use_local_data_root()
+        operations = data_root / "operations"
+        operations.mkdir(parents=True)
+        receipt_path = operations / "deploy-migrate-pending.json"
+        receipt_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "operation_id": "pending",
+                    "operation": "deploy-migrate",
+                    "status": "applying",
+                    "in_flight": "/clients/codex/skills/alpha",
+                    "links": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        clients = self.detected_clients("codex")
+
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            status_result = deploy_status(config_path=self.config_path)
+            doctor_result = core_module.doctor(config_path=self.config_path)
+            with self.assertRaises(SkillSyncError) as raised:
+                deploy_migrate(config_path=self.config_path)
+
+        self.assertTrue(status_result["recovery_required"])
+        self.assertEqual(status_result["operations"][0]["status"], "applying")
+        self.assertEqual(
+            status_result["operations"][0]["in_flight"],
+            "/clients/codex/skills/alpha",
+        )
+        self.assertTrue(
+            any(issue["type"] == "deployment-recovery-required" for issue in doctor_result["issues"])
+        )
+        self.assertEqual(raised.exception.exit_code, 4)
+
+    def test_deploy_gc_scans_existing_undetected_client_root(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        (source / "nested").mkdir()
+        (source / "nested" / "asset.txt").write_text("asset\n", encoding="utf-8")
+        data_root = self.use_local_data_root()
+        clients = self.detected_clients()
+        client = clients[0]
+        deployment = core_module.render_base_deployment(
+            source, data_root / "rendered", "alpha", client.id
+        )
+        client.skills_dir.mkdir(parents=True)
+        core_module.create_directory_link(
+            deployment.path / "nested", client.skills_dir / "alpha"
+        )
+
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            result = deploy_gc(config_path=self.config_path)
+
+        self.assertNotIn(str(deployment.path), result["removed"])
+        self.assertTrue(deployment.path.exists())
+
+    def test_atomic_receipt_write_fsyncs_parent_directory(self):
+        receipt = self.work / "operations" / "receipt.json"
+        real_fsync = os.fsync
+        fsynced_modes: list[int] = []
+
+        def record_fsync(fd):
+            fsynced_modes.append(os.fstat(fd).st_mode)
+            return real_fsync(fd)
+
+        with mock.patch.object(core_module.os, "fsync", side_effect=record_fsync):
+            core_module._write_json_atomic(receipt, {"status": "prepared"})
+
+        self.assertGreaterEqual(len(fsynced_modes), 2)
+        self.assertTrue(any(stat.S_ISDIR(mode) for mode in fsynced_modes))
+
     def test_doctor_reports_kimi_code_as_concrete_client_and_legacy_family(self):
         self.init_from_remote()
         self.select_default_skill("alpha")
@@ -240,7 +578,7 @@ class CoreWorkflowTest(unittest.TestCase):
                 row["client"]: row["state"]
                 for row in result["client_matrix"]
             },
-            {"kimi-code": "linked", "kimi-desktop": "missing"},
+            {"kimi-code": "direct-source-link", "kimi-desktop": "missing"},
         )
 
     def test_managed_check_inspects_agent_path_without_fetching_or_mutating(self):
