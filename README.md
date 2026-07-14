@@ -16,7 +16,7 @@ isolated environment and makes it available from any directory:
 
 ```bash
 pipx install "git+https://github.com/YOUR_NAME/skill-sync.git"
-skill-sync --help
+skill-sync version
 ```
 
 For a private repository over SSH:
@@ -66,11 +66,59 @@ skill-sync preview
 skill-sync preview --json
 ```
 
+### Machine-readable CLI output
+
+`version`, `scan`, `status`, `preview`, `doctor`, and `managed check` support
+`--json`. During the pre-1.0 releases, their machine-readable contract uses
+schema version 1 and always returns the same top-level envelope:
+
+```json
+{
+  "schema_version": 1,
+  "command": "version",
+  "ok": true,
+  "result": {"version": "0.1.0"},
+  "warnings": [],
+  "errors": []
+}
+```
+
+Command-specific data is contained in `result`. New compatible fields may be
+added without changing `schema_version`; removing or changing existing fields
+requires a schema version increase.
+
+In JSON mode, a `SkillSyncError` is emitted as the same envelope with
+`ok: false` and structured entries in `errors`. The error envelope is written
+to stderr and the command returns its structured exit code:
+
+- `0`: success
+- `1`: operation failed
+- `2`: invalid CLI usage (reported by `argparse`)
+- `3`: conflict requiring a user decision
+- `4`: operation blocked by a safety check
+
+Text mode remains intended for interactive use and keeps its concise output.
+
+Before modifying a Skill from an Agent client, inspect the exact path first:
+
+```bash
+skill-sync managed check ~/.codex/skills/my-skill/SKILL.md --client codex
+skill-sync managed check ~/.codex/skills/my-skill/SKILL.md --client codex --json
+```
+
+A completed check exits with `0` for both managed and unmanaged paths. Read the
+`managed` field in JSON mode. Wrong or broken managed links remain
+`managed: true` with `healthy: false`; ambiguous ownership exits nonzero so an
+Agent cannot mistake an inconclusive check for permission to edit. The check is
+fully local: it loads the configured registry and detected client paths but
+does not fetch, write files, or change links.
+
 When local and remote content both changed, Skill Sync stops. The UI shows the
 affected state and can create a timestamped local backup, but never chooses a
 version, overwrites a real directory, or merges content for you.
 
-Import an existing real Skill directory from Codex or Claude Code into the canonical root:
+Import an existing real Skill directory from Codex, Claude Code, or WorkBuddy
+into the canonical root:
 
 ```bash
 skill-sync import --agent codex my-skill

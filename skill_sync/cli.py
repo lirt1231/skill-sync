@@ -10,6 +10,8 @@ from typing import Any
 
 from skill_sync import core
 from skill_sync.errors import SkillSyncError
+from skill_sync.protocol import error_envelope, success_envelope
+from skill_sync.version import __version__
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -17,15 +19,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = _build_parser()
     args = parser.parse_args(argv)
+    json_mode = bool(getattr(args, "json", False))
+    command_name = getattr(args, "protocol_command", args.command)
 
     try:
         result = args.handler(args)
     except SkillSyncError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+        if json_mode:
+            print(_json(error_envelope(command_name, exc)), file=sys.stderr)
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return exc.exit_code
 
     if result is not None:
-        print(result)
+        if json_mode:
+            print(_json(success_envelope(command_name, result)))
+        else:
+            print(result)
     return 0
 
 
@@ -44,6 +54,10 @@ def _build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--skills-root", help="canonical Skill directory (default: ~/.agents/skills)")
     init_parser.add_argument("--platform", help=argparse.SUPPRESS)
     init_parser.set_defaults(handler=_handle_init)
+
+    version_parser = subparsers.add_parser("version", help="show the installed skill-sync version")
+    version_parser.add_argument("--json", action="store_true", help="print JSON output")
+    version_parser.set_defaults(handler=_handle_version)
 
     scan_parser = subparsers.add_parser("scan", help="list candidate local Skills")
     scan_parser.add_argument("--platform", help=argparse.SUPPRESS)
@@ -111,6 +125,19 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--json", action="store_true", help="print JSON output")
     doctor_parser.set_defaults(handler=_handle_doctor)
 
+    managed_parser = subparsers.add_parser("managed", help="inspect managed Skill ownership")
+    managed_subparsers = managed_parser.add_subparsers(dest="managed_action", required=True)
+    managed_check_parser = managed_subparsers.add_parser(
+        "check", help="check whether a Skill path is managed"
+    )
+    managed_check_parser.add_argument("path_or_name", help="Skill path or selected Skill name")
+    managed_check_parser.add_argument("--client", help="concrete client or Agent family ID")
+    managed_check_parser.add_argument("--json", action="store_true", help="print JSON output")
+    managed_check_parser.set_defaults(
+        handler=_handle_managed_check,
+        protocol_command="managed check",
+    )
+
     web_parser = subparsers.add_parser("web", help="start the local management Web UI")
     web_parser.add_argument("--host", default="127.0.0.1")
     web_parser.add_argument("--port", type=int, default=8765)
@@ -153,10 +180,16 @@ def _handle_init(args: argparse.Namespace) -> str:
     )
 
 
-def _handle_scan(args: argparse.Namespace) -> str:
+def _handle_version(args: argparse.Namespace) -> str | dict[str, str]:
+    if args.json:
+        return {"version": __version__}
+    return f"skill-sync {__version__}"
+
+
+def _handle_scan(args: argparse.Namespace) -> Any:
     result = core.scan_skills(platform=args.platform, config_path=args.config)
     if args.json:
-        return _json(result)
+        return result
     if not result:
         return "No Skills found."
     lines = []
@@ -186,17 +219,17 @@ def _handle_deselect(args: argparse.Namespace) -> str:
     return f"Deselected: {_names(result.get('deselected'))}"
 
 
-def _handle_status(args: argparse.Namespace) -> str:
+def _handle_status(args: argparse.Namespace) -> Any:
     result = core.status(skill_names=args.skills, config_path=args.config)
     if args.json:
-        return _json(result)
+        return result
     return _format_status(result)
 
 
-def _handle_preview(args: argparse.Namespace) -> str:
+def _handle_preview(args: argparse.Namespace) -> Any:
     result = core.sync_preview(skill_names=args.skills, config_path=args.config, fetch_remote=False)
     if args.json:
-        return _json(result)
+        return result
     return f"Next action: {result['action']}\n{result['summary']}"
 
 
@@ -245,12 +278,41 @@ def _handle_unlink(args: argparse.Namespace) -> str:
     return f"Links removed: {len(result['unlinked'])}"
 
 
-def _handle_doctor(args: argparse.Namespace) -> str:
+def _handle_doctor(args: argparse.Namespace) -> Any:
     result = core.doctor(config_path=args.config)
     if args.json:
-        return _json(result)
+        return result
     detected = ", ".join(a["display_name"] for a in result["agents"] if a["detected"]) or "none"
     return f"Detected Agents: {detected}\nIssues: {len(result['issues'])}"
+
+
+def _handle_managed_check(args: argparse.Namespace) -> Any:
+    result = core.managed_check(
+        args.path_or_name,
+        client=args.client,
+        config_path=args.config,
+    )
+    if args.json:
+        return result
+    ownership = "managed" if result["managed"] else "unmanaged"
+    health = "healthy" if result["healthy"] else "unhealthy"
+    source = result.get("source_path") or "none"
+    client = result.get("client") or "none"
+    if result["managed"] and result["healthy"]:
+        action = "Do not edit this path directly; use the managed edit workflow."
+    elif result["managed"]:
+        action = "Stop and repair the managed Skill state before editing."
+    else:
+        action = "Skill Sync does not manage this path; use the client's normal edit workflow."
+    return "\n".join(
+        (
+            f"Ownership: {ownership} ({result['role']})",
+            f"Health: {health} ({result['state']})",
+            f"Source: {source}",
+            f"Client: {client}",
+            f"Recommended action: {action}",
+        )
+    )
 
 
 def _handle_web(args: argparse.Namespace) -> None:

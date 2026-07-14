@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-skill-sync"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Synchronize selected Agent Skills across devices and Agent clients"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,5 +19,8 @@ skill-sync = "skill_sync.cli:main"
 [tool.setuptools.packages.find]
 include = ["skill_sync*"]
 
+[tool.setuptools.dynamic]
+version = { attr = "skill_sync.version.__version__" }
+
 [tool.setuptools.package-data]
-skill_sync = ["web_static/*.html", "web_static/*.js", "web_static/*.css"]
+skill_sync = ["web_static/*.html", "web_static/*.js", "web_static/*.css", "web_static/*.woff2"]

@@ -13,19 +13,23 @@ class WebUiTest(unittest.TestCase):
         self.assertIn('id="setup-form"', (STATIC_DIR / "index.html").read_text(encoding="utf-8"))
         self.assertIn('id="sync"', (STATIC_DIR / "index.html").read_text(encoding="utf-8"))
         self.assertIn('id="copy-selected"', (STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+        self.assertIn('id="detail-description"', (STATIC_DIR / "index.html").read_text(encoding="utf-8"))
         self.assertIn('action("/api/backup", {skill})', (STATIC_DIR / "app.js").read_text(encoding="utf-8"))
+        self.assertIn('skill.description||"暂无 description"', (STATIC_DIR / "app.js").read_text(encoding="utf-8"))
         self.assertIn('allSelected ? selected.delete', (STATIC_DIR / "app.js").read_text(encoding="utf-8"))
 
     def test_state_combines_status_and_link_matrix(self):
         with mock.patch("skill_sync.web.core.sync_preview", return_value={"initialized": True, "action": "noop", "issues": []}), mock.patch("skill_sync.web.core.doctor", return_value={
             "agents": [{"name": "codex", "detected": True}],
+            "clients": [{"name": "codex", "family": "codex", "detected": True}],
             "matrix": [{"skill": "alpha", "agent": "codex", "state": "linked"}],
+            "client_matrix": [{"skill": "alpha", "client": "codex", "agent": "codex", "state": "linked"}],
             "issues": [],
         }), mock.patch("skill_sync.web.core.status", return_value={
             "repo": {"clean": True}, "skills": [{"name": "alpha"}]
         }) as status, mock.patch("skill_sync.web.core.scan_skills", return_value=[
-            {"name": "alpha", "path": "/skills/alpha", "selected": True, "external": False},
-            {"name": "beta", "path": "/skills/beta", "selected": False, "external": False},
+            {"name": "alpha", "path": "/skills/alpha", "description": "Alpha description", "selected": True, "external": False},
+            {"name": "beta", "path": "/skills/beta", "description": "Beta description", "selected": False, "external": False},
         ]), mock.patch("skill_sync.web.core.scan_import_candidates", return_value=[
             {"name": "legacy", "agent": "codex", "path": "/codex/legacy", "state": "importable"}
         ]):
@@ -33,6 +37,10 @@ class WebUiTest(unittest.TestCase):
         status.assert_called_once_with(config_path=None, fetch_remote=False)
         self.assertEqual(value["status"]["skills"][0]["agents"]["codex"], "linked")
         self.assertEqual([item["name"] for item in value["status"]["skills"]], ["alpha", "beta"])
+        self.assertEqual(value["status"]["skills"][0]["description"], "Alpha description")
+        self.assertEqual(value["status"]["skills"][1]["description"], "Beta description")
+        self.assertEqual(value["doctor"]["clients"][0]["name"], "codex")
+        self.assertEqual(value["doctor"]["client_matrix"][0]["client"], "codex")
         self.assertEqual(value["import_candidates"][0]["name"], "legacy")
 
     def test_state_returns_setup_contract_when_uninitialized(self):

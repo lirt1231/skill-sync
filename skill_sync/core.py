@@ -13,14 +13,17 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from skill_sync import git
-from skill_sync.agents import detect_agents
+from skill_sync.agents import aggregate_agent_targets, detect_agents, detect_clients
 from skill_sync.config import default_config_path, load_config, save_config
 from skill_sync.copying import copy_skill_dir
 from skill_sync.errors import SkillSyncError
 from skill_sync.hash import hash_skill_dir
 from skill_sync.linking import create_directory_link, link_state, remove_directory_link
+from skill_sync.ownership import inspect_ownership
 from skill_sync.platforms import get_adapter
+from skill_sync.protocol import EXIT_SAFETY
 from skill_sync.registry import empty_registry, load_registry, save_registry
+from skill_sync.skill_metadata import read_skill_description
 
 
 REGISTRY_FILE = "registry.yaml"
@@ -198,6 +201,7 @@ def scan_skills(
             {
                 "name": candidate.name,
                 "path": str(candidate.path),
+                "description": read_skill_description(candidate.path),
                 "selected": candidate.selected,
                 "external": candidate.external,
             }
@@ -205,6 +209,53 @@ def scan_skills(
         ]
     except (git.GitError, ValueError, OSError) as exc:
         raise SkillSyncError(str(exc)) from exc
+
+
+def managed_check(
+    input_path: str | Path,
+    *,
+    client: str | None = None,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Inspect local Skill ownership without fetching or changing state.
+
+    A completed inspection is successful for both managed and unmanaged paths.
+    Ambiguous ownership is a safety error because callers must not interpret an
+    inconclusive result as permission to edit.
+    """
+
+    try:
+        config = _load_local_config(config_path)
+        registry = _load_local_registry(config)
+        inspection = inspect_ownership(
+            input_path,
+            skills_root=_global_skill_root(config),
+            registry=registry,
+            clients=detect_clients(),
+            client=client,
+        ).to_dict()
+    except SkillSyncError as exc:
+        raise SkillSyncError(
+            f"could not inspect Skill ownership: {exc}",
+            code="ownership_check_failed",
+            exit_code=exc.exit_code,
+            details={"input_path": str(input_path), "client": client},
+        ) from exc
+    except (ValueError, OSError) as exc:
+        raise SkillSyncError(
+            f"could not inspect Skill ownership: {exc}",
+            code="ownership_check_failed",
+            details={"input_path": str(input_path), "client": client},
+        ) from exc
+
+    if inspection["state"] == "ambiguous":
+        raise SkillSyncError(
+            "Skill ownership is ambiguous; stop before editing and verify the path or client",
+            code="ownership_ambiguous",
+            exit_code=EXIT_SAFETY,
+            details={"inspection": inspection},
+        )
+    return inspection
 
 
 def select_skills(
@@ -608,6 +659,7 @@ def _skill_status(config: dict[str, Any], registry: dict[str, Any], name: str) -
     platform = entry.get("source_platform", config.get("platform", "global")) if isinstance(entry, dict) else config.get("platform", "global")
     return {
         "name": name,
+        "description": read_skill_description(local_path),
         "platform": platform,
         "local_path": str(local_path),
         "local_hash": local_hash,
@@ -764,22 +816,48 @@ def unlink_skills(
 def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
     config = _load_local_config(config_path)
     registry = _load_local_registry(config)
-    agents = detect_agents()
+    clients = detect_clients()
+    agents = aggregate_agent_targets(clients)
     disabled_agents = _disabled_agents(config)
     issues: list[dict[str, str]] = []
     matrix: list[dict[str, str]] = []
+    client_matrix: list[dict[str, str]] = []
     for name in sorted(_selected_names(registry)):
         source = _local_skill_path_or_default(config, registry, name)
         if not (source / "SKILL.md").is_file():
             issues.append({"type": "missing-skill", "skill": name, "path": str(source)})
             continue
+        client_states: dict[str, str] = {}
+        for client in clients:
+            if not client.detected:
+                continue
+            state = (
+                "disabled"
+                if client.family_id in disabled_agents
+                else _agent_skill_state(source, client.skills_dir / name)
+            )
+            client_states[client.id] = state
+            client_matrix.append(
+                {
+                    "skill": name,
+                    "client": client.id,
+                    "agent": client.family_id,
+                    "state": state,
+                }
+            )
         for agent in agents:
             if not agent.detected:
                 continue
             if agent.name in disabled_agents:
                 matrix.append({"skill": name, "agent": agent.name, "state": "disabled"})
                 continue
-            states = [_agent_skill_state(source, skills_dir / name) for skills_dir in agent.skill_dirs]
+            states = [
+                client_states[client.id]
+                for client in clients
+                if client.detected
+                and client.family_id == agent.name
+                and client.id in client_states
+            ]
             state = _combined_link_state(states)
             matrix.append({"skill": name, "agent": agent.name, "state": state})
             if state not in {"linked", "missing", "copied"}:
@@ -787,7 +865,26 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
     return {
         "skills_root": str(_global_skill_root(config)),
         "agents": [{"name": a.name, "display_name": a.display_name, "skills_dir": str(a.skills_dir), "skills_dirs": [str(path) for path in a.skill_dirs], "detected": a.detected, "enabled": a.name not in disabled_agents} for a in agents],
+        "clients": [
+            {
+                "name": client.id,
+                "family": client.family_id,
+                "display_name": client.display_name,
+                "skills_dir": str(client.skills_dir),
+                "detected": client.detected,
+                "enabled": client.family_id not in disabled_agents,
+                "status": (
+                    "disabled"
+                    if client.family_id in disabled_agents
+                    else "detected"
+                    if client.detected
+                    else "not-detected"
+                ),
+            }
+            for client in clients
+        ],
         "matrix": matrix,
+        "client_matrix": client_matrix,
         "issues": issues,
     }
 

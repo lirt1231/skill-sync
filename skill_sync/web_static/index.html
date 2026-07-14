@@ -1,21 +1,93 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Skill Sync</title><link rel="stylesheet" href="/style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Skill Sync</title>
+  <link rel="stylesheet" href="/remixicon.css">
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <main class="shell">
-    <header class="topbar"><a class="brand" href="#overview"><span>✦</span> Skill Sync</a><nav aria-label="主导航"><a href="#skills">Skills</a><a href="#agents">Agents</a><a href="#issues">问题</a></nav><button id="refresh" class="quiet">刷新</button></header>
-    <section id="setup" class="setup hidden" aria-labelledby="setup-title"><p class="eyebrow">WELCOME</p><h1 id="setup-title">让你的 Skills 跟着你走。</h1><p>连接一个私有 Git 仓库，Skill Sync 会把内容保存在本机全局目录，并安全链接到你的 Agent。</p><form id="setup-form"><label>Git 仓库地址<input name="repo" required placeholder="git@github.com:you/agent-skills.git"></label><label>分支<input name="branch" value="main"></label><details><summary>高级设置</summary><label>全局 Skill 目录<input name="skills_root" placeholder="~/.agents/skills"></label><label>本地仓库目录<input name="sync_dir" placeholder="默认本地数据目录"></label></details><button class="primary" type="submit">连接并开始使用</button></form><p class="fine-print">不会保存 Git 密码或令牌；认证由你的系统 Git 凭据处理。</p></section>
-    <div id="app" class="hidden">
-      <section id="overview" class="hero"><div><p class="eyebrow">PERSONAL SKILL LIBRARY</p><h1>你的 Agent Skills，<br>始终保持一致。</h1><p id="sync-summary" class="subtitle"></p></div><div class="sync-card"><span id="sync-label" class="status-pill"></span><button id="sync" class="primary large">立即同步</button><p id="sync-note" class="fine-print"></p></div></section>
-      <section id="cards" class="cards" aria-label="概览"></section>
-      <section id="issues" class="panel"><div class="panel-head"><div><p class="eyebrow">ATTENTION</p><h2>需要处理</h2></div></div><div id="issue-list"></div></section>
-      <section id="skills" class="panel"><div class="panel-head wrap"><div><p class="eyebrow">LIBRARY</p><h2>Skills</h2><p>内容仅保存在全局目录；高级路径和哈希信息按需展开。</p></div><div class="actions"><input id="search" type="search" placeholder="搜索 Skill" aria-label="搜索 Skill"><button id="select-all">全选可见项</button><button id="select-selected">同步所选</button><button id="deselect-selected">取消同步</button><button id="link-selected">修复链接</button><select id="copy-agent" aria-label="复制目标 Agent"><option value="codex">复制到 Codex</option><option value="claude">复制到 Claude Code</option><option value="workbuddy">复制到 WorkBuddy</option></select><button id="copy-selected">复制副本</button><button id="delete-selected" class="danger">删除</button></div></div><div id="skill-list" class="skill-list"></div></section>
-      <section id="agents" class="panel"><div class="panel-head"><div><p class="eyebrow">CONNECTIONS</p><h2>Agents</h2><p>启用的 Agent 会使用指向全局 Skill 的安全目录链接。</p></div></div><div id="agent-list" class="agent-list"></div></section>
-      <section class="panel"><div class="panel-head"><div><p class="eyebrow">IMPORT</p><h2>从现有 Agent 导入</h2><p>按来源选择多个 Skill。导入将验证并复制内容到全局目录，然后将原位置替换为链接。</p></div></div><div id="imports"></div></section>
-    </div>
+  <section id="setup" class="setup hidden" aria-labelledby="setup-title">
+    <div class="setup-brand"><span class="brand-mark"><i class="ri-triangle-line"></i></span><strong>Skill Sync</strong></div>
+    <h1 id="setup-title">让你的 Skills 跟着你走</h1>
+    <p>连接一个私有 Git 仓库，在所有 Agent 之间安全同步。</p>
+    <form id="setup-form">
+      <label>Git 仓库地址<input name="repo" required placeholder="git@github.com:you/agent-skills.git"></label>
+      <label>分支<input name="branch" value="main"></label>
+      <details><summary>高级设置</summary><label>全局 Skill 目录<input name="skills_root" placeholder="~/.agents/skills"></label><label>本地仓库目录<input name="sync_dir" placeholder="默认本地数据目录"></label></details>
+      <button class="primary" type="submit">连接并开始使用</button>
+    </form>
+    <small>不会保存 Git 密码或令牌，认证由系统 Git 凭据处理。</small>
+  </section>
+
+  <div id="app" class="app-shell hidden">
+    <aside class="sidebar">
+      <a class="brand" href="#skills"><span class="brand-mark"><i class="ri-triangle-line"></i></span><strong>Skill Sync</strong></a>
+      <nav aria-label="主导航">
+        <button class="nav-item active" data-view="skills"><i class="ri-file-list-3-line"></i><span>技能库</span></button>
+        <button class="nav-item" data-view="agents"><i class="ri-links-line"></i><span>连接</span></button>
+        <button class="nav-item" data-view="imports"><i class="ri-download-2-line"></i><span>导入</span></button>
+      </nav>
+      <button id="refresh" class="nav-item settings"><i class="ri-refresh-line"></i><span>刷新状态</span></button>
+    </aside>
+
+    <main class="workspace">
+      <section id="view-skills" class="view active">
+        <header class="view-header"><div><h1>技能库</h1><p>管理并同步你的技能到各个 Agent。</p></div></header>
+        <div class="sync-strip">
+          <div class="health-icon"><i class="ri-check-line"></i></div>
+          <div><strong id="sync-label">一切正常</strong><p id="sync-summary"></p></div>
+          <button id="sync" class="primary"><i class="ri-loop-right-line"></i><span>立即同步</span></button>
+        </div>
+        <div id="issue-list" class="issue-list hidden"></div>
+        <section class="library-surface">
+          <div class="table-tools">
+            <label id="search-wrap" class="search-wrap collapsed"><i class="ri-search-line"></i><input id="search" type="search" placeholder="搜索 Skill" aria-label="搜索 Skill"></label>
+            <button id="search-toggle" class="icon-button" aria-label="搜索"><i class="ri-search-line"></i></button>
+          </div>
+          <div class="skill-table-head"><input id="select-all-checkbox" type="checkbox" aria-label="全选可见项"><span>技能名称</span><span>Agent 覆盖</span><span>状态</span><span></span></div>
+          <div id="skill-list" class="skill-list"></div>
+        </section>
+        <div id="selection-bar" class="selection-bar hidden">
+          <strong><span id="selection-count">0</span> 项已选择</strong>
+          <button id="select-selected"><i class="ri-loop-right-line"></i><span>更新同步</span></button>
+          <button id="deselect-selected" class="hidden" tabindex="-1">取消同步</button>
+          <div class="copy-control"><button id="copy-selected"><i class="ri-file-copy-line"></i>复制到</button><select id="copy-agent" aria-label="复制目标 Agent"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="workbuddy">WorkBuddy</option></select></div>
+          <details class="more-menu"><summary><i class="ri-more-line"></i>更多</summary><div><button id="link-selected">修复链接</button><button id="delete-selected" class="danger">删除所选</button></div></details>
+          <button id="clear-selection" class="icon-button" aria-label="取消选择"><i class="ri-close-line"></i></button>
+          <button id="select-all" class="visually-hidden">全选可见项</button>
+        </div>
+      </section>
+
+      <section id="view-agents" class="view">
+        <header class="view-header"><div><h1>连接</h1><p>选择哪些 Agent 使用全局技能库。</p></div></header>
+        <div id="agent-list" class="agent-list"></div>
+      </section>
+
+      <section id="view-imports" class="view">
+        <header class="view-header"><div><h1>从 Agent 导入</h1><p>选择本地 Skill 导入全局技能库，原目录会安全替换为链接。</p></div></header>
+        <div id="import-tabs" class="source-tabs"></div>
+        <section class="import-surface">
+          <div class="import-table-head"><input id="select-all-imports" type="checkbox" aria-label="全选当前来源"><span>技能名称</span><span>来源路径</span><span></span></div>
+          <div id="imports"></div>
+        </section>
+        <div id="import-bar" class="import-bar hidden"><strong>已选择 <span id="import-count">0</span> 项</strong><button id="clear-imports">取消</button><button id="import-selected" class="primary">导入到全局</button></div>
+      </section>
+    </main>
+
+    <aside id="detail-drawer" class="detail-drawer hidden" aria-label="Skill 详情">
+      <button id="close-detail" class="icon-button drawer-close" aria-label="关闭详情"><i class="ri-close-line"></i></button>
+      <div class="detail-icon"><i class="ri-file-text-line"></i></div>
+      <h2 id="detail-name"></h2><p id="detail-status" class="detail-status"></p>
+      <p id="detail-description" class="detail-description"></p>
+      <section><h3>概览</h3><dl><div><dt>来源</dt><dd>全局库</dd></div><div><dt>同步状态</dt><dd id="detail-sync"></dd></div></dl></section>
+      <section><h3>Agent 覆盖</h3><div id="detail-agents"></div></section>
+      <section><h3>位置</h3><code id="detail-path"></code></section>
+      <button id="detail-backup">创建本地备份</button>
+    </aside>
     <div id="toast" role="status" aria-live="polite"></div>
-  </main><script src="/app.js"></script>
-</body></html>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

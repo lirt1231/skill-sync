@@ -11,6 +11,7 @@ try:
         init_sync,
         pull,
         push,
+        managed_check,
         scan_skills,
         select_skills,
         status,
@@ -29,11 +30,13 @@ except ImportError as exc:  # pragma: no cover - exercised by initial TDD red ru
     status = None
     pull = None
     push = None
+    managed_check = None
     sync = None
     sync_preview = None
     SkillSyncError = Exception
 
 from skill_sync.config import load_config, save_config
+from skill_sync.agents import AgentClient
 from skill_sync.git import init_repo, run_git
 from skill_sync.hash import hash_skill_dir
 from skill_sync.registry import load_registry, save_registry
@@ -140,6 +143,182 @@ class CoreWorkflowTest(unittest.TestCase):
         )
         return skill
 
+    def detected_clients(self, *detected_ids: str) -> list[AgentClient]:
+        detected = set(detected_ids)
+        endpoints = (
+            ("codex", "codex", "Codex"),
+            ("workbuddy", "workbuddy", "WorkBuddy"),
+            ("kimi-code", "kimi", "Kimi Code"),
+            ("kimi-desktop", "kimi", "Kimi Desktop"),
+            ("claude-code", "claude", "Claude Code"),
+        )
+        return [
+            AgentClient(
+                client_id,
+                family_id,
+                display_name,
+                self.work / "clients" / client_id / "skills",
+                client_id in detected,
+            )
+            for client_id, family_id, display_name in endpoints
+        ]
+
+    def test_doctor_reports_kimi_code_as_concrete_client_and_legacy_family(self):
+        self.init_from_remote()
+        self.select_default_skill("alpha")
+        clients = self.detected_clients("kimi-code")
+
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            result = core_module.doctor(config_path=self.config_path)
+
+        kimi = next(agent for agent in result["agents"] if agent["name"] == "kimi")
+        self.assertTrue(kimi["detected"])
+        self.assertEqual(kimi["skills_dirs"], [str(clients[2].skills_dir)])
+        self.assertEqual(
+            result["matrix"],
+            [{"skill": "alpha", "agent": "kimi", "state": "missing"}],
+        )
+        self.assertEqual(
+            result["client_matrix"],
+            [
+                {
+                    "skill": "alpha",
+                    "client": "kimi-code",
+                    "agent": "kimi",
+                    "state": "missing",
+                }
+            ],
+        )
+        self.assertEqual(
+            [client["name"] for client in result["clients"]],
+            ["codex", "workbuddy", "kimi-code", "kimi-desktop", "claude-code"],
+        )
+
+    def test_doctor_reports_kimi_desktop_as_concrete_client_and_legacy_family(self):
+        self.init_from_remote()
+        self.select_default_skill("alpha")
+        clients = self.detected_clients("kimi-desktop")
+
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            result = core_module.doctor(config_path=self.config_path)
+
+        kimi = next(agent for agent in result["agents"] if agent["name"] == "kimi")
+        self.assertTrue(kimi["detected"])
+        self.assertEqual(kimi["skills_dirs"], [str(clients[3].skills_dir)])
+        self.assertEqual(
+            result["client_matrix"],
+            [
+                {
+                    "skill": "alpha",
+                    "client": "kimi-desktop",
+                    "agent": "kimi",
+                    "state": "missing",
+                }
+            ],
+        )
+
+    def test_doctor_aggregates_both_kimi_clients_without_changing_family_matrix(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        clients = self.detected_clients("kimi-code", "kimi-desktop")
+        core_module.create_directory_link(source, clients[2].skills_dir / "alpha")
+
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            result = core_module.doctor(config_path=self.config_path)
+
+        kimi = next(agent for agent in result["agents"] if agent["name"] == "kimi")
+        self.assertEqual(
+            kimi["skills_dirs"],
+            [str(clients[2].skills_dir), str(clients[3].skills_dir)],
+        )
+        self.assertEqual(
+            result["matrix"],
+            [{"skill": "alpha", "agent": "kimi", "state": "partial"}],
+        )
+        self.assertEqual(
+            {
+                row["client"]: row["state"]
+                for row in result["client_matrix"]
+            },
+            {"kimi-code": "linked", "kimi-desktop": "missing"},
+        )
+
+    def test_managed_check_inspects_agent_path_without_fetching_or_mutating(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        clients = self.detected_clients("codex")
+        destination = clients[0].skills_dir / "alpha"
+        destination.parent.mkdir(parents=True)
+        destination.symlink_to(source, target_is_directory=True)
+
+        with (
+            mock.patch.object(core_module, "detect_clients", return_value=clients),
+            mock.patch.object(
+                core_module.git,
+                "fetch",
+                side_effect=AssertionError("managed check must not fetch"),
+            ) as fetch,
+        ):
+            result = managed_check(
+                destination / "SKILL.md",
+                client="codex",
+                config_path=self.config_path,
+            )
+
+        fetch.assert_not_called()
+        self.assertTrue(result["managed"])
+        self.assertTrue(result["healthy"])
+        self.assertEqual(result["role"], "direct-source-link")
+        self.assertEqual(result["source_path"], str(source.resolve()))
+        self.assertEqual(result["client"], "codex")
+        self.assertTrue(destination.is_symlink())
+
+    def test_managed_check_preserves_unhealthy_managed_link(self):
+        self.init_from_remote()
+        source = self.select_default_skill("alpha")
+        clients = self.detected_clients("codex")
+        destination = clients[0].skills_dir / "alpha"
+        destination.parent.mkdir(parents=True)
+        destination.symlink_to(self.work / "missing", target_is_directory=True)
+
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            result = managed_check(destination, config_path=self.config_path)
+
+        self.assertTrue(result["managed"])
+        self.assertFalse(result["healthy"])
+        self.assertEqual(result["state"], "broken-link")
+        self.assertEqual(result["source_path"], str(source.resolve()))
+
+    def test_managed_check_returns_clear_unmanaged_result(self):
+        self.init_from_remote()
+        self.select_default_skill("alpha")
+        project_skill = make_skill(
+            self.work / "project" / ".agents" / "skills",
+            "alpha",
+        )
+
+        result = managed_check(
+            project_skill / "SKILL.md",
+            config_path=self.config_path,
+        )
+
+        self.assertFalse(result["managed"])
+        self.assertTrue(result["healthy"])
+        self.assertEqual(result["state"], "unmanaged")
+
+    def test_managed_check_rejects_ambiguous_result_with_inspection_details(self):
+        self.init_from_remote()
+        self.select_default_skill("alpha")
+
+        with self.assertRaises(SkillSyncError) as raised:
+            managed_check("unknown", config_path=self.config_path)
+
+        self.assertEqual(raised.exception.code, "ownership_ambiguous")
+        self.assertEqual(raised.exception.exit_code, 4)
+        inspection = raised.exception.details["inspection"]
+        self.assertFalse(inspection["managed"])
+        self.assertEqual(inspection["state"], "ambiguous")
+
     def test_init_creates_missing_local_repo_as_non_bare_with_registry_and_defaults(self):
         repo = self.work / "new-local-sync-repo"
 
@@ -191,7 +370,11 @@ class CoreWorkflowTest(unittest.TestCase):
 
     def test_scan_lists_selected_and_external_candidates_without_mutating_state(self):
         self.init_from_remote()
-        make_skill(self.skill_root, "selected")
+        make_skill(
+            self.skill_root,
+            "selected",
+            "---\nname: selected\ndescription: Selected description\n---\n# Selected\n",
+        )
         make_skill(self.skill_root, "unselected")
         select_skills(["selected"], config_path=self.config_path, skill_dir=self.skill_root)
         before = read_file(self.work / "sync", "registry.yaml")
@@ -207,6 +390,8 @@ class CoreWorkflowTest(unittest.TestCase):
             [("selected", True, False), ("unselected", False, False)],
         )
         self.assertEqual(external_candidates, [])
+        self.assertEqual(candidates[0]["description"], "Selected description")
+        self.assertEqual(candidates[1]["description"], "")
         self.assertEqual(read_file(self.work / "sync", "registry.yaml"), before)
 
     def test_select_and_deselect_update_registry_and_local_config_without_commit(self):
@@ -256,7 +441,10 @@ class CoreWorkflowTest(unittest.TestCase):
 
     def test_status_reports_hashes_repo_state_and_repeated_skill_filtering(self):
         self.init_from_remote()
-        self.select_default_skill("alpha")
+        self.select_default_skill(
+            "alpha",
+            "---\nname: alpha\ndescription: Alpha description\n---\n# Alpha\n",
+        )
         self.select_default_skill("beta")
         push(config_path=self.config_path, skill_names=["alpha", "beta"])
         write_file(self.skill_root, "alpha/extra.txt", "changed\n")
@@ -266,6 +454,7 @@ class CoreWorkflowTest(unittest.TestCase):
         self.assertEqual(result["schema_version"], 1)
         self.assertEqual([item["name"] for item in result["skills"]], ["alpha"])
         self.assertTrue(result["skills"][0]["changed_local"])
+        self.assertEqual(result["skills"][0]["description"], "Alpha description")
         self.assertIn("local_path", result["skills"][0])
         self.assertNotIn("beta", [item["name"] for item in result["skills"]])
         self.assertTrue(result["repo"]["clean"])

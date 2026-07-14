@@ -90,8 +90,41 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(stderr, "")
-        self.assertEqual(json.loads(stdout), candidates)
+        self.assertEqual(
+            json.loads(stdout),
+            {
+                "schema_version": 1,
+                "command": "scan",
+                "ok": True,
+                "result": candidates,
+                "warnings": [],
+                "errors": [],
+            },
+        )
         self.assertLess(stdout.index('"external"'), stdout.index('"name"'))
+
+    def test_version_supports_text_and_json_output(self):
+        code, stdout, stderr = run_cli(["version"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout, f"skill-sync {cli.__version__}\n")
+
+        code, stdout, stderr = run_cli(["version", "--json"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            json.loads(stdout),
+            {
+                "schema_version": 1,
+                "command": "version",
+                "ok": True,
+                "result": {"version": cli.__version__},
+                "warnings": [],
+                "errors": [],
+            },
+        )
 
     def test_select_and_deselect_dispatch_positional_names(self):
         with mock.patch.object(cli.core, "select_skills", return_value={"selected": ["alpha", "beta"]}) as select:
@@ -157,6 +190,101 @@ class CliTest(unittest.TestCase):
         self.assertEqual(stderr, "")
         disable.assert_called_once_with("kimi", config_path=None)
         self.assertIn("Disabled Agent sync: kimi", stdout)
+
+    def test_managed_check_dispatches_and_prints_human_guidance(self):
+        result = {
+            "managed": True,
+            "healthy": False,
+            "state": "broken-link",
+            "role": "direct-source-link",
+            "skill": "alpha",
+            "input_path": "/clients/codex/skills/alpha/SKILL.md",
+            "source_path": "/global/skills/alpha",
+            "client": "codex",
+            "migration_required": True,
+        }
+        with mock.patch.object(cli.core, "managed_check", return_value=result) as check:
+            code, stdout, stderr = run_cli(
+                [
+                    "--config",
+                    "/tmp/config.json",
+                    "managed",
+                    "check",
+                    result["input_path"],
+                    "--client",
+                    "codex",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        check.assert_called_once_with(
+            result["input_path"],
+            client="codex",
+            config_path="/tmp/config.json",
+        )
+        self.assertIn("Ownership: managed", stdout)
+        self.assertIn("Health: unhealthy (broken-link)", stdout)
+        self.assertIn("Source: /global/skills/alpha", stdout)
+        self.assertIn("Client: codex", stdout)
+        self.assertIn("Recommended action:", stdout)
+
+    def test_managed_check_json_uses_full_command_name_envelope(self):
+        result = {
+            "managed": False,
+            "healthy": True,
+            "state": "unmanaged",
+            "role": "unmanaged",
+            "skill": None,
+            "input_path": "/project/.agents/skills/alpha/SKILL.md",
+            "source_path": None,
+            "client": None,
+            "migration_required": False,
+        }
+        with mock.patch.object(cli.core, "managed_check", return_value=result):
+            code, stdout, stderr = run_cli(
+                ["managed", "check", result["input_path"], "--json"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        envelope = json.loads(stdout)
+        self.assertEqual(envelope["command"], "managed check")
+        self.assertTrue(envelope["ok"])
+        self.assertEqual(envelope["result"], result)
+
+    def test_managed_check_ambiguous_json_is_structured_safety_error(self):
+        inspection = {
+            "managed": False,
+            "healthy": False,
+            "state": "ambiguous",
+            "role": "unknown",
+            "skill": None,
+            "input_path": "unknown",
+            "source_path": None,
+            "client": None,
+            "migration_required": False,
+        }
+        error = SkillSyncError(
+            "Skill ownership is ambiguous",
+            code="ownership_ambiguous",
+            exit_code=4,
+            details={"inspection": inspection},
+        )
+        with mock.patch.object(cli.core, "managed_check", side_effect=error):
+            code, stdout, stderr = run_cli(
+                ["managed", "check", "unknown", "--json"]
+            )
+
+        self.assertEqual(code, 4)
+        self.assertEqual(stdout, "")
+        envelope = json.loads(stderr)
+        self.assertEqual(envelope["command"], "managed check")
+        self.assertFalse(envelope["ok"])
+        self.assertEqual(envelope["errors"][0]["code"], "ownership_ambiguous")
+        self.assertEqual(
+            envelope["errors"][0]["details"]["inspection"], inspection
+        )
 
     def test_repeated_skill_filters_dispatch_to_status_pull_push(self):
         status_result = {
@@ -266,13 +394,21 @@ class CliTest(unittest.TestCase):
         self.assertEqual(stderr, "")
         status.assert_called_once_with(skill_names=["alpha"], config_path=None)
         parsed = json.loads(stdout)
-        self.assertEqual(set(parsed), {"schema_version", "repo", "skills"})
         self.assertEqual(
-            set(parsed["repo"]),
+            set(parsed),
+            {"schema_version", "command", "ok", "result", "warnings", "errors"},
+        )
+        self.assertEqual(parsed["schema_version"], 1)
+        self.assertEqual(parsed["command"], "status")
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["warnings"], [])
+        self.assertEqual(parsed["errors"], [])
+        self.assertEqual(
+            set(parsed["result"]["repo"]),
             {"path", "branch", "clean", "ahead", "behind", "diverged"},
         )
         self.assertEqual(
-            set(parsed["skills"][0]),
+            set(parsed["result"]["skills"][0]),
             {
                 "name",
                 "platform",
@@ -283,11 +419,30 @@ class CliTest(unittest.TestCase):
                 "selected",
             },
         )
-        self.assertEqual(parsed, result)
+        self.assertEqual(parsed["result"], result)
         self.assertEqual(
             stdout,
-            '{"repo": {"ahead": 0, "behind": 0, "branch": "main", "clean": true, "diverged": false, "path": "/repo"}, "schema_version": 1, "skills": [{"changed_local": false, "local_hash": "sha256:aaaaaaaa", "local_path": "/skills/alpha", "name": "alpha", "platform": "codex", "remote_hash": "sha256:bbbbbbbb", "selected": true}]}\n',
+            '{"command": "status", "errors": [], "ok": true, "result": {"repo": {"ahead": 0, "behind": 0, "branch": "main", "clean": true, "diverged": false, "path": "/repo"}, "schema_version": 1, "skills": [{"changed_local": false, "local_hash": "sha256:aaaaaaaa", "local_path": "/skills/alpha", "name": "alpha", "platform": "codex", "remote_hash": "sha256:bbbbbbbb", "selected": true}]}, "schema_version": 1, "warnings": []}\n',
         )
+
+    def test_preview_and_doctor_json_use_success_envelopes(self):
+        preview_result = {"action": "pull", "summary": "Remote changes are ready."}
+        with mock.patch.object(cli.core, "sync_preview", return_value=preview_result):
+            code, stdout, stderr = run_cli(["preview", "--json"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(json.loads(stdout)["command"], "preview")
+        self.assertEqual(json.loads(stdout)["result"], preview_result)
+
+        doctor_result = {"agents": [], "issues": []}
+        with mock.patch.object(cli.core, "doctor", return_value=doctor_result):
+            code, stdout, stderr = run_cli(["doctor", "--json"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(json.loads(stdout)["command"], "doctor")
+        self.assertEqual(json.loads(stdout)["result"], doctor_result)
 
     def test_sync_dispatches_and_reports_noop(self):
         with mock.patch.object(cli.core, "sync", return_value={"synced": [], "noop": True}) as sync:
@@ -305,6 +460,48 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(stdout, "")
         self.assertEqual(stderr, "error: not initialized\n")
+
+    def test_json_mode_errors_use_error_envelope_and_structured_exit_code(self):
+        error = SkillSyncError(
+            "unsafe deployment",
+            code="unsafe_deployment",
+            exit_code=4,
+            details={"skill": "alpha"},
+        )
+        with mock.patch.object(cli.core, "doctor", side_effect=error):
+            code, stdout, stderr = run_cli(["doctor", "--json"])
+
+        self.assertEqual(code, 4)
+        self.assertEqual(stdout, "")
+        self.assertEqual(
+            json.loads(stderr),
+            {
+                "schema_version": 1,
+                "command": "doctor",
+                "ok": False,
+                "result": None,
+                "warnings": [],
+                "errors": [
+                    {
+                        "code": "unsafe_deployment",
+                        "message": "unsafe deployment",
+                        "details": {"skill": "alpha"},
+                    }
+                ],
+            },
+        )
+
+    def test_text_mode_errors_use_structured_exit_code_without_json(self):
+        with mock.patch.object(
+            cli.core,
+            "status",
+            side_effect=SkillSyncError("conflict", exit_code=3),
+        ):
+            code, stdout, stderr = run_cli(["status"])
+
+        self.assertEqual(code, 3)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, "error: conflict\n")
 
     def test_argparse_errors_raise_system_exit_two(self):
         stdout = io.StringIO()

@@ -50,11 +50,14 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                 self._json({"token": token})
                 return
             filename = "index.html" if path == "/" else path.lstrip("/")
-            if filename not in {"index.html", "app.js", "style.css"}:
+            if filename not in {"index.html", "app.js", "style.css", "remixicon.css", "remixicon.woff2"}:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             content = (STATIC_DIR / filename).read_bytes()
-            content_type = {".html": "text/html", ".js": "text/javascript", ".css": "text/css"}[Path(filename).suffix]
+            content_type = {
+                ".html": "text/html", ".js": "text/javascript", ".css": "text/css",
+                ".woff2": "font/woff2",
+            }[Path(filename).suffix]
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", f"{content_type}; charset=utf-8")
             self.send_header("Content-Length", str(len(content)))
@@ -160,11 +163,12 @@ def _state(config_path: str | None) -> dict[str, Any]:
         skills[candidate["name"]] = {
             "name": candidate["name"],
             "local_path": candidate["path"],
+            "description": candidate.get("description", ""),
             "selected": candidate["selected"],
             "changed_local": False,
         }
     for name, item in selected.items():
-        skills[name] = item
+        skills[name] = {**skills.get(name, {}), **item}
     matrix = {(item["skill"], item["agent"]): item["state"] for item in diagnosis["matrix"]}
     for skill in skills.values():
         skill["agents"] = {agent["name"]: matrix.get((skill["name"], agent["name"]), "not-detected") for agent in diagnosis["agents"]}
