@@ -5,19 +5,44 @@
 本文档把平台路线图拆成可以逐项执行和验收的工程步骤。实施时必须按
 顺序推进；前一步未通过验收，不开始下一步。
 
-每一步遵循同一节奏：
+每一个 commit 遵循同一节奏；一个 Step 通常由多个 commit 完成：
 
 1. 确认当前工作区和真实机器状态。
 2. 先补测试，证明当前缺少目标能力。
-3. 实现本步骤的最小闭环。
+3. 实现当前 commit 声明的最小闭环。
 4. 跑单元测试、集成测试和必要的真实机器冒烟测试。
-5. 更新 README、设计文档和命令帮助。
+5. 只更新与当前 commit 行为直接相关的 README、设计文档和命令帮助。
 6. 检查迁移和回退路径。
-7. 等待用户确认是否创建 Git commit。
-8. 未得到用户明确指令，不执行 push。
+7. 对照本文的 commit map，确认没有混入下一个 commit 的内容。
+8. 等待用户确认是否创建 Git commit。
+9. 未得到用户明确指令，不执行 push。
 
 不要在一个步骤中顺便实现后续功能。尤其不要同时修改 Agent 身份模型、
 链接目标、Git 同步协议和 Web UI 数据结构。
+
+### Commit 执行契约
+
+1. 一个 commit 只对应下文 commit map 中的一个编号，例如 `5.2`。
+2. 实现、该实现的测试和直接相关的文档必须放在同一个 commit；不允许先提交
+   无测试实现，再用后续 commit 补测试。
+3. 数据模型、CLI wiring、核心 mutation、Web UI 和真实迁移默认拆开提交。
+4. 纯重构和行为变化默认拆开；如果行为变化必须依赖重构，先提交保持行为不变
+   且全量测试通过的重构。
+5. 每个 commit 必须能够独立 checkout、运行测试并保持已有命令可用；中间
+   commit 不得依赖“下一个 commit 会修好”。
+6. commit message 使用动词开头并描述一个结果，例如：
+   `add edit session metadata store`，不使用 `misc changes`、`wip` 或
+   `continue roadmap`。
+7. 开始下一个 commit 前必须满足：当前 commit 的定向测试通过、全量测试通过、
+   `git diff --check` 通过、工作区干净。
+8. 发现本 commit 之外的问题时先记录到 roadmap/issue，不顺手修复；只有阻断
+   当前验收的安全问题可以纳入，并需在交付说明中明确原因。
+9. commit 和 push 仍是独立动作。用户允许 commit 不等于允许 push；不得自动
+   push。
+
+历史基线：Step 0–3 的 client-aware foundation 已落在 `33e5a6d`，Step 4
+只读 Deployment Store 已落在 `6c670b7`。从 Step 5 开始严格使用下文的
+commit 级拆分，不再以“一个 Step 一个大 commit”为执行单位。
 
 ## 2. 全程不变的安全规则
 
@@ -795,6 +820,177 @@ Batch B 完成后，产品具备“多设备同步 + 多 Agent Client 适配管�
 3. Step 13：Secret/Audit。
 4. Step 14：Inspection/Authoring Assistance。
 
+## 18.1 后续 Commit Map
+
+下面的编号是实施和提交边界，不是可以合并处理的建议清单。每完成一项就停在
+干净工作区，报告测试结果并等待下一步。所有 commit 都必须带本项测试；表中
+“验收”是除全量测试和 `git diff --check` 之外的额外门槛。
+
+### Step 5：Base-only Managed Edit Session
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 5.1 | `add edit session metadata store` | session ID、状态机、metadata schema、本地目录布局、每 Skill 锁；不创建 workspace、不改 CLI | schema round-trip、损坏 metadata fail closed、锁并发测试 |
+| 5.2 | `add edit session inspection commands` | `edit list/status` 只读 CLI 和 JSON envelope；不增加 mutation | 不存在/损坏/active session 输出契约测试 |
+| 5.3 | `add edit session begin and abort` | Base session 的 baseline snapshot、writable workspace、`begin/abort`；不实现 apply | canonical 变化、重复 begin、abort 不动 source |
+| 5.4 | `add edit diff and validation` | 文件级/文本级 diff、`SKILL.md`/frontmatter/path/symlink 校验 | binary、hidden、symlink、非法路径和空变更测试 |
+| 5.5 | `add edit impact preview` | 根据当前 registry/client resolution 计算受影响 deployment；只读 | 多 client、disabled/undetected client、stale baseline 测试 |
+| 5.6 | `add transactional base edit apply` | baseline conflict、backup、receipt、canonical 原子替换；暂不自动重建 deployment | apply 中断、canonical winner、rollback、receipt fsync 测试 |
+| 5.7 | `rebuild deployments after edit apply` | apply 后定向重建、验证并切换 deployment；失败恢复 canonical 和链接 | Codex/WorkBuddy 多端一致性、链式链接和 Windows junction 测试 |
+| 5.8 | `add managed edit recovery` | `edit recover`、tampered diff、capture/discard；不自动采用 tampered 内容 | tampered capture/discard、过期 session、recovery receipt 测试 |
+| 5.9 | `document base managed edit workflow` | README、`--help`、完整 CLI e2e fixture；不新增 core 行为 | wheel 安装后所有 edit 命令可用，示例与 JSON golden 一致 |
+
+### Step 6：管理 Skill 和真实 Agent 流程
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 6.1 | `require managed checks before skill edits` | 更新 `skill-sync-manager`：先 check，再 begin/diff/validate/impact/apply；记录最低 CLI 版本 | 管理 Skill 不引用不存在命令，旧 CLI 给出升级提示 |
+| 6.2 | `verify managed edits from codex` | 只加入 Codex 真实流程 fixture/记录和必要兼容修复 | Codex 不写 deployment/canonical、不隐式 push |
+| 6.3 | `verify managed edits from workbuddy` | 只加入 WorkBuddy 真实流程和必要兼容修复 | 与 Codex 相同的完整闭环 |
+| 6.4 | `verify managed edits from remaining clients` | Claude、Kimi Code/Desktop 的兼容验证；独立 adapter bug 另拆 fix commit | 每个可测 client 有明确结果和限制说明 |
+
+### Step 7：Variant Source 和 Resolver
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 7.1 | `add strict variant manifest parser` | `variant.yaml` schema/parser/path 安全；不解析内容 | unknown field、traversal、absolute path、symlink fail closed |
+| 7.2 | `add deterministic variant overlay engine` | add/replace/delete overlay；不接 registry/CLI | Base+family+client 文件级 golden fixtures |
+| 7.3 | `add layered resolution provenance` | resolver priority、layer hashes、resolution hash/provenance | 单层变化只改变受影响 client hash |
+| 7.4 | `add variant source management commands` | `variant list/create/validate`；不增加 edit session scope | family/client ID、重复 create、空 variant 测试 |
+| 7.5 | `add variant resolve and diff commands` | `resolve --dry-run`、Base/client diff 和 JSON 输出 | Kimi family/client 优先级、binary metadata diff |
+| 7.6 | `document variant resolution model` | README、architecture、迁移限制；不新增行为 | wheel CLI help 与文档命令逐项核对 |
+
+### Step 8：Family/Client Edit Session
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 8.1 | `add scoped edit session metadata` | session 增加 Base/Family/Client scope 和 layer baseline；不改变 begin | 旧 Base session 兼容读取、非法 scope fail closed |
+| 8.2 | `add family and client edit begin` | scoped begin、缺失 variant 的最小 overlay workspace | 不复制完整 Base，Kimi family 展开正确 |
+| 8.3 | `add scoped edit diff and impact` | source-layer diff、resolved diff、scope impact | Base/Family/Client 影响矩阵 golden tests |
+| 8.4 | `add transactional scoped edit apply` | 只替换目标 layer并重建受影响 deployments | Codex-only 不改变 WorkBuddy，family 同时影响两个 Kimi |
+| 8.5 | `teach manager skill to choose edit scope` | 管理 Skill scope 规则和真实 Agent 验证 | 有歧义时询问，不自动扩大影响范围 |
+
+### Step 9：Registry v3 和多设备同步
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 9.1 | `add registry v3 variant schema` | v3 读取/写入、v2 只读兼容、首次 variant 升级 | v2 fixtures 不写回，v3 deterministic serialization |
+| 9.2 | `sync portable variant sources` | Git 仓库打包 Base/Variant/registry；排除本机状态 | 无 absolute path、deployment、session、backup、credential |
+| 9.3 | `add variant aware sync conflicts` | Base/Variant 单元级 preview/status/conflict stop | 不同 variant 可合并，同一单元双改停止 |
+| 9.4 | `add multi device resolution fixtures` | 两机器检测矩阵和可重复 resolution hash 测试 | Codex/WorkBuddy、Kimi Code/Desktop、同 client 三组矩阵通过 |
+| 9.5 | `document registry v3 migration` | 升级、回退、多设备操作文档；不新增行为 | 新旧机器流程可按文档复现 |
+
+### Step 10：Web UI
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 10.1 | `add deployment and session web read models` | 复用 core 的只读 API；不改页面 | Web/CLI 同输入输出一致，普通请求不 fetch |
+| 10.2 | `show managed skill inventory` | inventory、source hash、deployment/session/variant badges | 搜索、选择和空状态测试 |
+| 10.3 | `show family client deployment matrix` | client matrix、Kimi 分组、stale/tampered/conflict 状态 | 具体 client 问题不被 family 汇总掩盖 |
+| 10.4 | `add managed edit session interface` | begin/diff/validate/impact/apply/abort UI | mutation 都显示 plan/result，不能写 deployment |
+| 10.5 | `add tamper recovery interface` | capture/discard recovery UI | 高风险动作确认、错误时保留恢复信息 |
+| 10.6 | `cache web inventory hashes` | affected-only refresh 和 hash cache；不改变业务状态 | 100 Skill 缓存刷新目标小于 300 ms |
+
+### Step 11：Adapter 扩展
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 11.1 | `add local custom adapter schema` | 本机 adapter 配置和 capability model；不加新客户端 | absolute local path 不进入 portable registry |
+| 11.2 | `add custom adapter commands` | `agent add/remove/list` 和 JSON 契约 | home-relative/env path、重复 ID、非法 capability 测试 |
+| 11.3 | `enforce adapter link capabilities` | symlink/junction/copy-only/global/project/variant 前置检查 | 不支持能力在 mutation 前失败 |
+| 11.4 | `add opencode adapter` | 只增加 OpenCode adapter、证据和 fixtures | macOS/Windows 路径与检测测试 |
+| 11.5 | `add gemini cli adapter` | 只增加 Gemini CLI adapter | 同上 |
+| 11.6 | `add cursor adapter` | 只增加 Cursor adapter | 同上 |
+| 11.7 | `add github copilot adapter` | 只增加 GitHub Copilot adapter | 同上 |
+| 11.8 | `add windsurf adapter` | 只增加 Windsurf adapter | 同上 |
+
+### Step 12：Conflict、History 和 Rollback
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 12.1 | `add backup and history inspection` | history/backup list 只读模型和 CLI | Base/Variant、缺失和损坏 backup 测试 |
+| 12.2 | `add forward only backup restore` | backup restore/revision restore，生成 forward change；不 push | 禁止 reset/force push，恢复前强制 backup |
+| 12.3 | `add conflict decision engine` | keep local/use remote/keep both/abort core plan；不加 UI | 每项选择可预览、可恢复、不自动 push |
+| 12.4 | `add conflict resolution commands` | Conflict Center CLI 和 JSON receipt | binary 只显示 metadata/hash，文本 diff golden |
+| 12.5 | `add conflict center interface` | UI 展示和调用同一 core plan | 一个冲突不阻止读取其他健康 Skill |
+
+### Step 13：Secret Scan 和审计
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 13.1 | `add redacted secret scanner` | key/token/entropy/filename/pattern 检测与脱敏输出 | fixture 中完整 secret 不出现在日志/JSON |
+| 13.2 | `block pushes with secret findings` | push 前 gate 和逐项 acknowledge；不自动删除 | 高危阻止 push、ack 可审计且无永久全局关闭 |
+| 13.3 | `add privacy safe activity log` | actor/command/scope/hash/backup/result 日志 | 不记录正文、secret、credential |
+| 13.4 | `add redacted diagnostic export` | 默认排除 source/credential 的诊断包 | 包内容 allowlist 测试 |
+
+### Step 14：Inspection 和适配辅助
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 14.1 | `add skill inspection read model` | 文件树、source/variant/resolved provenance 只读 core/CLI | binary、large file、tampered source 安全输出 |
+| 14.2 | `add skill detail interface` | Markdown preview、文件树和 provenance UI | 不执行 Markdown 脚本，不允许编辑 deployment |
+| 14.3 | `add client compatibility checks` | 工具名、路径、命令假设检查 | 每条 finding 有证据和 client scope |
+| 14.4 | `add base variant scope recommendations` | Base/Family/Client 建议；不自动重写 | 建议可解释，有歧义明确提示用户决策 |
+
+## 18.2 并行开发与合并顺序
+
+并行只表示可以在独立 branch/worktree 中同时开发，不表示可以跳过依赖或任意
+顺序合并。`main` 始终按照 commit map 的依赖顺序接收 commit；后合并的分支必须
+基于最新 `main` rebase，并重新执行定向测试、全量测试和 `git diff --check`。
+
+### 并行执行规则
+
+1. 一个 branch/worktree 只负责一个 commit ID，不在同一分支预做后续 commit。
+2. 每个并行 commit 仍必须包含自己的实现、测试和直接相关文档，并能独立验收。
+3. 共享 schema、公共 CLI parser、registry migration、transaction apply 和 recovery
+   属于串行热点；依赖它们的分支不得自行复制或提前发明接口。
+4. 并行分支可以提前开发，但只有全部前置 commit 已进入 `main` 后才能合并。
+5. 合并顺序默认使用 commit ID 顺序；表中注明的 rebase 顺序优先于开发完成时间。
+6. 发生语义冲突时停止合并并回到 roadmap 重新划分范围，不为了消除 Git 冲突而
+   把两个 commit 压成一个 commit。
+7. 常规并发控制在 2–3 个 worktree；只有互不共享实现文件的独立 adapter 才提高
+   到 4 个并发。
+8. commit、合并和 push 分别授权；并行开发不授权自动 commit、自动合并或自动
+   push。
+
+### 推荐并行批次
+
+| 前置条件 | 可并行开发 | 合并要求 | 并行度 |
+| --- | --- | --- | --- |
+| `5.1` 完成 | `5.2`、`5.3` | 先合并 `5.2`，`5.3` rebase 后验收 | 中：可能同时修改 edit CLI |
+| `5.3` 完成 | `5.4`、`5.5` | 按 ID 合并；`5.6` 等两者完成 | 高：diff/validation 与 impact 相对独立 |
+| `6.1` 完成 | `6.2`、`6.3`、`6.4` | 各 client 兼容修复不得混入其他分支 | 高：真实 Agent 流程相互独立 |
+| `7.1` 完成 | `7.2`、`7.4` | `7.2` 先进入 resolver 主链；`7.4` rebase 后合并 | 中：core overlay 与 source CLI 分离 |
+| `10.1` 完成 | `10.2`、`10.3` | 拆分页面组件，按 ID 合并并重跑前端测试 | 中：业务独立但可能共享页面文件 |
+| `11.3` 完成 | `11.4`–`11.8` | 每个 adapter 单独 commit，按 ID 合并 | 最高：Agent adapter 相互独立 |
+| `12.1` 完成 | `12.2`、`12.3` | 按 ID 合并；`12.3` 不依赖 restore CLI | 中：restore 与 decision engine 分离 |
+| `13.1` 完成 | `13.2`、`13.3` | 按 ID 合并并统一复核 redaction | 高：push gate 与 activity log 分离 |
+| `14.1` 完成 | `14.2`、`14.3` | 按 ID 合并；`14.4` 等待 `14.3` | 高：详情 UI 与 compatibility core 分离 |
+
+### 必须保持串行的关键链
+
+```text
+5.1
+├── 5.2
+└── 5.3
+    ├── 5.4
+    └── 5.5
+        ↓
+5.6 → 5.7 → 5.8 → 5.9 → 6.1
+
+7.2 → 7.3 → 7.5 → 7.6
+8.1 → 8.2 → 8.3 → 8.4 → 8.5
+9.1 → 9.2 → 9.3 → 9.4 → 9.5
+10.4 → 10.5
+11.1 → 11.2 → 11.3
+12.3 → 12.4 → 12.5
+13.1 → 13.2
+14.3 → 14.4
+```
+
+transaction apply、deployment rebuild、recovery、registry migration 和 scoped
+edit apply 直接影响用户源数据或托管部署，不能通过并行开发扩大接口不确定性。
+
 ## 19. 每一步结束时的统一检查清单
 
 ```text
@@ -811,22 +1007,33 @@ Batch B 完成后，产品具备“多设备同步 + 多 Agent Client 适配管�
 [ ] 有迁移预览和失败回退
 [ ] 真实机器 smoke test 与风险匹配
 [ ] 工作区未混入无关用户修改
+[ ] 只完成当前 commit map 编号声明的范围
+[ ] 实现、测试和直接相关文档在同一个 commit
+[ ] 当前 commit 可独立 checkout 和通过验收
+[ ] 并行分支只负责一个 commit ID
+[ ] 所有前置 commit 已进入 main，当前分支已 rebase
+[ ] rebase 后重新执行定向测试、全量测试和 diff check
+[ ] 开始下一 commit 前工作区干净
 [ ] 是否 commit 由用户确认
 [ ] 是否 push 必须由用户明确指令
 ```
 
 ## 20. 现在应该从哪里开始
 
-下一次实施不要直接写 Variant Resolver。应从 Step 0 开始：先审计当前未提交
-改动，完成 V2 基线验收；随后实现 Step 1 和 Step 2。第一个对用户产生明显
-新价值的里程碑是 Step 3 的 `managed check`，第一个真正消除当前软链接修改
-风险的里程碑是 Step 4 + Step 5。
+Step 0–4 已完成并验收，当前所有托管客户端都使用只读 rendered
+deployment。下一次实施从 commit `5.1 add edit session metadata store` 开始，
+不要提前加入 workspace、CLI mutation、apply 或 Variant Resolver。
 
-建议每次只完成一个 Step，并在交付时报告：
+`5.1` 必须单独完成。它验收并进入 `main` 后，可以按照第 18.2 节并行启动
+`5.2` 和 `5.3`；`5.3` 进入 `main` 后，再并行启动 `5.4` 和 `5.5`。关键安全
+链仍保持串行，不能为了提高并发跳过验收门槛。
 
+建议每次只完成 commit map 中的一个编号，并在交付时报告：
+
+- 当前 commit 编号和 message；
 - 改了什么；
 - 验证了什么；
 - 是否影响真实链接；
 - 是否发生 schema migration；
-- 下一步是什么；
+- 下一 commit 编号是什么；
 - 当前未 commit、未 push 的状态。
