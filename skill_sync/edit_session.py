@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import stat
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -14,6 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator
 
+from skill_sync.copying import copy_skill_dir, rename_no_replace
 from skill_sync.hash import is_link_or_reparse
 from skill_sync.local_lock import local_file_lock
 
@@ -29,6 +32,21 @@ class EditSessionMetadataError(ValueError):
 
 class InvalidEditSessionTransition(EditSessionMetadataError):
     """Raised when an edit session attempts an invalid state transition."""
+
+
+class ActiveEditSessionError(EditSessionMetadataError):
+    """Raised when a logical Skill already has an unfinished edit session."""
+
+    def __init__(self, logical_skill: str, session_id: str) -> None:
+        super().__init__(
+            f"Skill already has an active edit session: {logical_skill} ({session_id})"
+        )
+        self.logical_skill = logical_skill
+        self.session_id = session_id
+
+
+class CanonicalSkillChangedError(EditSessionMetadataError):
+    """Raised when canonical content changes while its snapshot is created."""
 
 
 class EditSessionStatus(str, Enum):
@@ -272,6 +290,104 @@ class EditSessionStore:
                 raise
         return paths
 
+    def begin(
+        self,
+        *,
+        logical_skill: str,
+        source: str | Path,
+        baseline_hash: str,
+        actor: str | None = None,
+    ) -> tuple[EditSessionMetadata, EditSessionPaths]:
+        """Atomically create a Base snapshot and writable workspace.
+
+        The caller hashes the canonical source before entering this method.  A
+        different copied hash means the source moved during preparation, so no
+        session is published.  The per-Skill lock makes the unfinished-session
+        check and final directory publication one operation.
+        """
+
+        source_path = Path(source)
+        metadata = EditSessionMetadata.new(
+            logical_skill=logical_skill,
+            baseline_hash=baseline_hash,
+            actor=actor,
+        )
+        paths = self.paths(metadata.session_id)
+
+        with self.skill_lock(logical_skill):
+            active = self._unfinished_session(logical_skill)
+            if active is not None:
+                raise ActiveEditSessionError(logical_skill, active.session_id)
+
+            staging = Path(
+                tempfile.mkdtemp(prefix=".begin-", dir=self.root)
+            )
+            try:
+                os.chmod(staging, 0o700)
+                staged_baseline = staging / "baseline"
+                staged_workspace = staging / "workspace"
+                copied_hash = copy_skill_dir(source_path, staged_baseline)
+                if copied_hash != baseline_hash:
+                    raise CanonicalSkillChangedError(
+                        "canonical Skill changed while creating the edit baseline"
+                    )
+                workspace_hash = copy_skill_dir(staged_baseline, staged_workspace)
+                if workspace_hash != baseline_hash:
+                    raise EditSessionMetadataError(
+                        "edit workspace does not match its baseline snapshot"
+                    )
+                _set_snapshot_permissions(staged_baseline, writable=False)
+                _set_snapshot_permissions(staged_workspace, writable=True)
+                _write_json_atomic(
+                    staging / EDIT_SESSION_METADATA_FILE,
+                    metadata.to_dict(),
+                )
+                rename_no_replace(staging, paths.root)
+                _fsync_directory(self.root)
+            except Exception:
+                if staging.exists() and not is_link_or_reparse(staging):
+                    _remove_real_tree(staging)
+                raise
+
+        return metadata, paths
+
+    def abort(self, session_id: str) -> EditSessionMetadata:
+        """End an active session and remove only its machine-local work trees."""
+
+        initial = self.load(session_id)
+        with self.skill_lock(initial.logical_skill):
+            current = self.load(session_id)
+            if current.status is not EditSessionStatus.ACTIVE:
+                raise InvalidEditSessionTransition(
+                    f"edit session cannot transition from {current.status.value} "
+                    "to aborted"
+                )
+            paths = self.paths(session_id)
+            _assert_real_directory(paths.baseline, "edit baseline")
+            _assert_real_directory(paths.workspace, "edit workspace")
+            displaced: list[tuple[Path, Path]] = []
+            try:
+                for original in (paths.baseline, paths.workspace):
+                    temporary = paths.root / f".{original.name}.aborting"
+                    if temporary.exists() or is_link_or_reparse(temporary):
+                        raise EditSessionMetadataError(
+                            f"unexpected abort cleanup path: {temporary}"
+                        )
+                    original.rename(temporary)
+                    displaced.append((original, temporary))
+                aborted = current.transitioned(EditSessionStatus.ABORTED)
+                _write_json_atomic(paths.metadata, aborted.to_dict())
+            except Exception:
+                for original, temporary in reversed(displaced):
+                    if temporary.exists() and not original.exists():
+                        temporary.rename(original)
+                raise
+
+            for _, temporary in displaced:
+                _remove_real_tree(temporary)
+            _fsync_directory(paths.root)
+            return aborted
+
     def load(self, session_id: str) -> EditSessionMetadata:
         """Load one session, failing closed on malformed or displaced metadata."""
 
@@ -345,6 +461,55 @@ class EditSessionStore:
             updated = current.transitioned(status, now=now)
             _write_json_atomic(self.paths(session_id).metadata, updated.to_dict())
         return updated
+
+    def _unfinished_session(
+        self, logical_skill: str
+    ) -> EditSessionMetadata | None:
+        """Return an unfinished published session for one logical Skill.
+
+        Unlike the public strict inspection API, this mutation-internal scan
+        ignores verified begin staging directories.  Different logical Skills
+        use different locks and may legitimately have overlapping staging
+        copies; no staging directory is ever interpreted as a healthy session.
+        """
+
+        self._assert_safe_root_for_read()
+        if not self.root.exists():
+            return None
+        try:
+            entries = sorted(self.root.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise EditSessionMetadataError(
+                f"cannot safely enumerate edit sessions: {self.root}: {exc}"
+            ) from exc
+        published: list[EditSessionMetadata] = []
+        for entry in entries:
+            if entry.name == ".locks" or entry.name.startswith(".begin-"):
+                if is_link_or_reparse(entry) or not entry.is_dir():
+                    raise EditSessionMetadataError(
+                        f"edit session internal path must be a real directory: {entry}"
+                    )
+                continue
+            try:
+                _validate_session_id(entry.name)
+            except EditSessionMetadataError as exc:
+                raise EditSessionMetadataError(
+                    f"unexpected entry in edit session root: {entry}"
+                ) from exc
+            published.append(self.load(entry.name))
+
+        for metadata in published:
+            if (
+                metadata.logical_skill.casefold() == logical_skill.casefold()
+                and metadata.status
+                in {
+                    EditSessionStatus.ACTIVE,
+                    EditSessionStatus.APPLYING,
+                    EditSessionStatus.NEEDS_RECOVERY,
+                }
+            ):
+                return metadata
+        return None
 
     def _prepare_root(self) -> None:
         if self.data_root.exists() and is_link_or_reparse(self.data_root):
@@ -502,3 +667,40 @@ def _fsync_directory(directory: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _assert_real_directory(path: Path, label: str) -> None:
+    if is_link_or_reparse(path) or not path.is_dir():
+        raise EditSessionMetadataError(f"{label} must be a real directory: {path}")
+    for child in path.rglob("*"):
+        if is_link_or_reparse(child):
+            raise EditSessionMetadataError(
+                f"{label} must not contain a link or reparse point: {child}"
+            )
+
+
+def _set_snapshot_permissions(root: Path, *, writable: bool) -> None:
+    """Keep session copies private; only the workspace is owner-writable."""
+
+    _assert_real_directory(root, "edit session snapshot")
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_dir():
+            os.chmod(path, 0o700 if writable else 0o500)
+        elif path.is_file():
+            executable = bool(path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+            os.chmod(path, (0o700 if executable else 0o600) if writable else (0o500 if executable else 0o400))
+        else:
+            raise EditSessionMetadataError(
+                f"edit session snapshot contains a non-regular path: {path}"
+            )
+    os.chmod(root, 0o700 if writable else 0o500)
+
+
+def _remove_real_tree(root: Path) -> None:
+    _assert_real_directory(root, "edit session cleanup tree")
+    for path in (root, *root.rglob("*")):
+        if path.is_dir():
+            os.chmod(path, 0o700)
+        elif path.is_file():
+            os.chmod(path, 0o600)
+    shutil.rmtree(root)

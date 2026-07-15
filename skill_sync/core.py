@@ -26,8 +26,13 @@ from skill_sync.deployment import (
     resolution_hash,
     verify_deployment,
 )
+from skill_sync.edit_session import (
+    ActiveEditSessionError,
+    CanonicalSkillChangedError,
+    EditSessionMetadataError,
+    EditSessionStore,
+)
 from skill_sync.errors import SkillSyncError
-from skill_sync.edit_session import EditSessionMetadataError, EditSessionStore
 from skill_sync.hash import hash_skill_dir, is_link_or_reparse
 from skill_sync.linking import (
     create_directory_link,
@@ -330,6 +335,102 @@ def managed_check(
             details={"inspection": inspection},
         )
     return inspection
+
+
+def edit_begin(
+    skill_name: str,
+    *,
+    actor: str | None = None,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Create a Base-only managed edit session for one selected Skill."""
+
+    config = _load_local_config(config_path)
+    try:
+        registry = _load_local_registry(config)
+        _target_names(registry, [skill_name])
+        source = _local_skill_path_or_default(config, registry, skill_name).absolute()
+        _validate_skill_path(source)
+        baseline_hash = hash_skill_dir(source)
+        metadata, paths = EditSessionStore(_data_root(config)).begin(
+            logical_skill=skill_name,
+            source=source,
+            baseline_hash=baseline_hash,
+            actor=actor,
+        )
+        return {
+            "session_id": metadata.session_id,
+            "skill": metadata.logical_skill,
+            "scope": "base",
+            "status": metadata.status.value,
+            "actor": metadata.actor,
+            "baseline_hash": metadata.baseline_hash,
+            "baseline_path": str(paths.baseline.absolute()),
+            "workspace_path": str(paths.workspace.absolute()),
+        }
+    except ActiveEditSessionError as exc:
+        raise SkillSyncError(
+            str(exc),
+            code="active_edit_session",
+            exit_code=EXIT_CONFLICT,
+            details={
+                "skill": exc.logical_skill,
+                "session_id": exc.session_id,
+            },
+        ) from exc
+    except CanonicalSkillChangedError as exc:
+        raise SkillSyncError(
+            str(exc),
+            code="canonical_changed",
+            exit_code=EXIT_CONFLICT,
+            details={"skill": skill_name},
+        ) from exc
+    except EditSessionMetadataError as exc:
+        raise SkillSyncError(
+            f"could not safely begin edit session: {exc}",
+            code="unsafe_edit_session",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill_name},
+        ) from exc
+    except SkillSyncError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise SkillSyncError(
+            f"could not begin edit session: {exc}",
+            code="edit_begin_failed",
+            details={"skill": skill_name},
+        ) from exc
+
+
+def edit_abort(
+    session_id: str,
+    *,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Abort a Base edit session without reading or writing canonical content."""
+
+    config = _load_local_config(config_path)
+    try:
+        metadata = EditSessionStore(_data_root(config)).abort(session_id)
+        return {
+            "session_id": metadata.session_id,
+            "skill": metadata.logical_skill,
+            "scope": "base",
+            "status": metadata.status.value,
+        }
+    except EditSessionMetadataError as exc:
+        raise SkillSyncError(
+            f"could not safely abort edit session: {exc}",
+            code="unsafe_edit_session",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise SkillSyncError(
+            f"could not abort edit session: {exc}",
+            code="edit_abort_failed",
+            details={"session_id": session_id},
+        ) from exc
 
 
 def select_skills(

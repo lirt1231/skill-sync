@@ -286,6 +286,86 @@ class CliTest(unittest.TestCase):
             envelope["errors"][0]["details"]["inspection"], inspection
         )
 
+    def test_edit_begin_dispatches_base_session_and_uses_shared_json_envelope(self):
+        result = {
+            "session_id": "4f92500f-832f-40f7-a417-c474f0425ce0",
+            "skill": "alpha",
+            "scope": "base",
+            "status": "active",
+            "actor": "codex",
+            "baseline_hash": "sha256:" + "a" * 64,
+            "baseline_path": "/data/edit-sessions/id/baseline",
+            "workspace_path": "/data/edit-sessions/id/workspace",
+        }
+        with mock.patch.object(cli.core, "edit_begin", return_value=result) as begin:
+            code, stdout, stderr = run_cli(
+                [
+                    "--config",
+                    "/tmp/config.json",
+                    "edit",
+                    "begin",
+                    "alpha",
+                    "--base",
+                    "--actor",
+                    "codex",
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        begin.assert_called_once_with(
+            "alpha", actor="codex", config_path="/tmp/config.json"
+        )
+        self.assertEqual(
+            json.loads(stdout),
+            {
+                "schema_version": 1,
+                "command": "edit begin",
+                "ok": True,
+                "result": result,
+                "warnings": [],
+                "errors": [],
+            },
+        )
+
+    def test_edit_abort_dispatches_and_prints_human_summary(self):
+        session_id = "4f92500f-832f-40f7-a417-c474f0425ce0"
+        result = {
+            "session_id": session_id,
+            "skill": "alpha",
+            "scope": "base",
+            "status": "aborted",
+        }
+        with mock.patch.object(cli.core, "edit_abort", return_value=result) as abort:
+            code, stdout, stderr = run_cli(
+                ["--config", "/tmp/config.json", "edit", "abort", session_id]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        abort.assert_called_once_with(session_id, config_path="/tmp/config.json")
+        self.assertIn(f"Aborted edit session: {session_id}", stdout)
+
+    def test_edit_begin_json_conflict_uses_full_command_name_and_exit_three(self):
+        error = SkillSyncError(
+            "already active",
+            code="active_edit_session",
+            exit_code=3,
+            details={"skill": "alpha", "session_id": "existing"},
+        )
+        with mock.patch.object(cli.core, "edit_begin", side_effect=error):
+            code, stdout, stderr = run_cli(
+                ["edit", "begin", "alpha", "--base", "--json"]
+            )
+
+        self.assertEqual(code, 3)
+        self.assertEqual(stdout, "")
+        payload = json.loads(stderr)
+        self.assertEqual(payload["command"], "edit begin")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["errors"][0]["code"], "active_edit_session")
+
     def test_deploy_preview_dispatches_and_prints_each_skill_client(self):
         result = {
             "rendered_root": "/data/rendered",

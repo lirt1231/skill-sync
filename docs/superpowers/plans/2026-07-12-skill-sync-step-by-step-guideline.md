@@ -1020,14 +1020,14 @@ edit apply 直接影响用户源数据或托管部署，不能通过并行开发
 
 ## 20. 现在应该从哪里开始
 
-Step 0–4 和 commit `5.1 add edit session metadata store` 已完成并验收。当前
-所有托管客户端都使用只读 rendered deployment，edit session 已具备严格的
-Base metadata schema、状态机、本机目录布局和每 Skill 锁，但尚未创建 baseline
-snapshot、workspace 或 CLI。
+Step 0–4 和 commit `5.1`–`5.3` 已完成并验收。当前所有托管客户端都使用只读
+rendered deployment；edit session 已具备严格 metadata、只读 `list/status`、
+Base baseline snapshot、writable workspace 和 `begin/abort`。同一 Skill 的 begin
+由每 Skill 锁串行，不同 Skill 可以并行；abort 不修改 canonical source。
 
-下一批按照第 18.2 节并行开发 `5.2 add edit session inspection commands` 和
-`5.3 add edit session begin and abort`。合并时先接收 `5.2`，再将 `5.3` rebase
-到最新 `main` 后验收；`5.3` 进入 `main` 后，再并行启动 `5.4` 和 `5.5`。关键
+下一批按照第 18.2 节并行开发 `5.4 add edit diff and validation` 和
+`5.5 add edit impact preview`。合并时先接收 `5.4`，再将 `5.5` rebase 到最新
+`main` 后验收；`5.6 transactional base edit apply` 必须等待两者全部完成。关键
 安全链仍保持串行，不能为了提高并发跳过验收门槛。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：

@@ -138,6 +138,51 @@ def _build_parser() -> argparse.ArgumentParser:
         protocol_command="managed check",
     )
 
+    edit_parser = subparsers.add_parser("edit", help="manage safe Skill edit sessions")
+    edit_subparsers = edit_parser.add_subparsers(dest="edit_action", required=True)
+    edit_list_parser = edit_subparsers.add_parser(
+        "list", help="list machine-local edit sessions"
+    )
+    edit_list_parser.add_argument("--json", action="store_true", help="print JSON output")
+    edit_list_parser.set_defaults(
+        handler=_handle_edit_list,
+        protocol_command="edit list",
+    )
+    edit_status_parser = edit_subparsers.add_parser(
+        "status", help="show one machine-local edit session"
+    )
+    edit_status_parser.add_argument("session_id", help="edit session UUID")
+    edit_status_parser.add_argument("--json", action="store_true", help="print JSON output")
+    edit_status_parser.set_defaults(
+        handler=_handle_edit_status,
+        protocol_command="edit status",
+    )
+    edit_begin_parser = edit_subparsers.add_parser(
+        "begin", help="create a Base edit workspace"
+    )
+    edit_begin_parser.add_argument("skill", help="selected logical Skill name")
+    edit_begin_parser.add_argument(
+        "--base",
+        action="store_true",
+        required=True,
+        help="edit the canonical Base Skill",
+    )
+    edit_begin_parser.add_argument("--actor", help="client or Agent starting the edit")
+    edit_begin_parser.add_argument("--json", action="store_true", help="print JSON output")
+    edit_begin_parser.set_defaults(
+        handler=_handle_edit_begin,
+        protocol_command="edit begin",
+    )
+    edit_abort_parser = edit_subparsers.add_parser(
+        "abort", help="discard a managed edit workspace"
+    )
+    edit_abort_parser.add_argument("session_id", help="edit session UUID")
+    edit_abort_parser.add_argument("--json", action="store_true", help="print JSON output")
+    edit_abort_parser.set_defaults(
+        handler=_handle_edit_abort,
+        protocol_command="edit abort",
+    )
+
     deploy_parser = subparsers.add_parser(
         "deploy", help="inspect and migrate rendered Skill deployments"
     )
@@ -174,26 +219,6 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy_gc_parser.set_defaults(
         handler=_handle_deploy_gc,
         protocol_command="deploy gc",
-    )
-
-    edit_parser = subparsers.add_parser("edit", help="inspect managed Skill edit sessions")
-    edit_subparsers = edit_parser.add_subparsers(dest="edit_action", required=True)
-    edit_list_parser = edit_subparsers.add_parser(
-        "list", help="list machine-local edit sessions"
-    )
-    edit_list_parser.add_argument("--json", action="store_true", help="print JSON output")
-    edit_list_parser.set_defaults(
-        handler=_handle_edit_list,
-        protocol_command="edit list",
-    )
-    edit_status_parser = edit_subparsers.add_parser(
-        "status", help="show one machine-local edit session"
-    )
-    edit_status_parser.add_argument("session_id", help="edit session UUID")
-    edit_status_parser.add_argument("--json", action="store_true", help="print JSON output")
-    edit_status_parser.set_defaults(
-        handler=_handle_edit_status,
-        protocol_command="edit status",
     )
 
     web_parser = subparsers.add_parser("web", help="start the local management Web UI")
@@ -377,6 +402,30 @@ def _handle_managed_check(args: argparse.Namespace) -> Any:
             f"Recommended action: {action}",
         )
     )
+
+
+def _handle_edit_begin(args: argparse.Namespace) -> Any:
+    result = core.edit_begin(
+        args.skill,
+        actor=args.actor,
+        config_path=args.config,
+    )
+    if args.json:
+        return result
+    return "\n".join(
+        (
+            f"Edit session: {result['session_id']} ({result['skill']}, Base)",
+            f"Baseline: {result['baseline_hash']}",
+            f"Workspace: {result['workspace_path']}",
+        )
+    )
+
+
+def _handle_edit_abort(args: argparse.Namespace) -> Any:
+    result = core.edit_abort(args.session_id, config_path=args.config)
+    if args.json:
+        return result
+    return f"Aborted edit session: {result['session_id']} ({result['skill']})"
 
 
 def _handle_deploy_preview(args: argparse.Namespace) -> str:
