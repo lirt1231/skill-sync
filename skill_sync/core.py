@@ -551,6 +551,254 @@ def _active_edit_trees(
     return metadata, baseline, workspace
 
 
+def edit_impact(
+    session_id: str,
+    *,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Preview Base deployment impact without changing any local state."""
+
+    config = _load_local_config(config_path)
+    store = EditSessionStore(_data_root(config))
+    try:
+        metadata = store.load(session_id)
+    except FileNotFoundError as exc:
+        session_root = store.paths(session_id).root
+        if session_root.exists() or is_link_or_reparse(session_root):
+            raise SkillSyncError(
+                f"edit session metadata is missing or incomplete: {session_id}",
+                code="unsafe_edit_session",
+                exit_code=EXIT_SAFETY,
+                details={"session_id": session_id},
+            ) from exc
+        raise SkillSyncError(
+            f"edit session does not exist: {session_id}",
+            code="edit_session_not_found",
+            details={"session_id": session_id},
+        ) from exc
+    except (EditSessionMetadataError, OSError) as exc:
+        raise SkillSyncError(
+            f"could not safely load edit session: {exc}",
+            code="unsafe_edit_session",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+
+    try:
+        if metadata.status is not EditSessionStatus.ACTIVE:
+            raise SkillSyncError(
+                f"edit session is not active: {session_id} ({metadata.status.value})",
+                code="edit_session_not_active",
+                exit_code=EXIT_SAFETY,
+                details={"session_id": session_id, "status": metadata.status.value},
+            )
+        registry = _load_local_registry(config)
+        _target_names(registry, [metadata.logical_skill])
+        source = _local_skill_path_or_default(
+            config, registry, metadata.logical_skill
+        ).absolute()
+        _validate_skill_path(source)
+        paths = store.paths(session_id)
+        try:
+            baseline_snapshot_hash = hash_skill_dir(paths.baseline)
+        except (OSError, ValueError) as exc:
+            raise SkillSyncError(
+                f"edit session baseline is unsafe or incomplete: {exc}",
+                code="unsafe_edit_baseline",
+                exit_code=EXIT_SAFETY,
+                details={"session_id": session_id},
+            ) from exc
+        if baseline_snapshot_hash != metadata.baseline_hash:
+            raise SkillSyncError(
+                "edit session baseline no longer matches recorded metadata",
+                code="unsafe_edit_baseline",
+                exit_code=EXIT_SAFETY,
+                details={
+                    "session_id": session_id,
+                    "expected_hash": metadata.baseline_hash,
+                    "actual_hash": baseline_snapshot_hash,
+                },
+            )
+        try:
+            workspace_hash = hash_skill_dir(paths.workspace)
+        except (OSError, ValueError) as exc:
+            raise SkillSyncError(
+                f"edit session workspace is unsafe or incomplete: {exc}",
+                code="edit_session_incomplete",
+                exit_code=EXIT_SAFETY,
+                details={"session_id": session_id},
+            ) from exc
+        current_hash = hash_skill_dir(source)
+        stale_baseline = current_hash != metadata.baseline_hash
+        disabled = _disabled_agents(config)
+        clients = detect_clients()
+        entry = registry.get("skills", {}).get(metadata.logical_skill, {})
+        configured = _configured_client_targets(entry)
+        rendered_root = _rendered_root(config)
+        rows: list[dict[str, Any]] = []
+
+        for client in clients:
+            if configured and not {client.id, client.family_id}.intersection(configured):
+                continue
+            enabled = client.family_id not in disabled
+            current_resolution = resolution_hash(
+                metadata.logical_skill, current_hash, client.id
+            )
+            proposed_resolution = resolution_hash(
+                metadata.logical_skill, workspace_hash, client.id
+            )
+            current_deployment = deployment_path(
+                rendered_root, metadata.logical_skill, current_resolution
+            )
+            proposed_deployment = deployment_path(
+                rendered_root, metadata.logical_skill, proposed_resolution
+            )
+            current_verification = verify_deployment(
+                current_deployment,
+                expected_provenance=expected_provenance(
+                    metadata.logical_skill, current_hash, client.id
+                ),
+            )
+            proposed_verification = verify_deployment(
+                proposed_deployment,
+                expected_provenance=expected_provenance(
+                    metadata.logical_skill, workspace_hash, client.id
+                ),
+            )
+            destination = client.skills_dir / metadata.logical_skill
+            current_link_state, current_target = _deployment_link_state(
+                source,
+                destination,
+                current_deployment,
+                rendered_root,
+                metadata.logical_skill,
+                client.id,
+            )
+            proposed_link_state, proposed_target = _deployment_link_state(
+                source,
+                destination,
+                proposed_deployment,
+                rendered_root,
+                metadata.logical_skill,
+                client.id,
+            )
+            planned_action = _deployment_action(
+                proposed_link_state, proposed_verification.state
+            )
+            deployment_would_change = current_resolution != proposed_resolution
+            requires_rebuild = proposed_verification.state != "valid"
+            affected = deployment_would_change or planned_action != "noop"
+            if not enabled:
+                availability = "disabled"
+                action = "disabled"
+            elif not client.detected:
+                availability = "undetected"
+                action = "undetected"
+            elif stale_baseline:
+                availability = "available"
+                action = "blocked"
+            elif planned_action == "blocked":
+                availability = "available"
+                action = "blocked"
+            elif requires_rebuild:
+                availability = "available"
+                action = "rebuild"
+            elif planned_action != "noop":
+                availability = "available"
+                action = "relink"
+            else:
+                availability = "available"
+                action = "noop"
+
+            rows.append(
+                {
+                    "client": client.id,
+                    "agent": client.family_id,
+                    "display_name": client.display_name,
+                    "detected": client.detected,
+                    "enabled": enabled,
+                    "availability": availability,
+                    "destination": str(destination),
+                    "current_resolution_hash": current_resolution,
+                    "current_deployment_path": str(current_deployment),
+                    "current_deployment_state": current_verification.state,
+                    "current_link_state": current_link_state,
+                    "current_target": (
+                        None if current_target is None else str(current_target)
+                    ),
+                    "proposed_resolution_hash": proposed_resolution,
+                    "proposed_deployment_path": str(proposed_deployment),
+                    "proposed_deployment_state": proposed_verification.state,
+                    "proposed_link_state": proposed_link_state,
+                    "proposed_target": (
+                        None if proposed_target is None else str(proposed_target)
+                    ),
+                    "deployment_would_change": deployment_would_change,
+                    "requires_rebuild": requires_rebuild,
+                    "affected": affected,
+                    "hypothetical_action": planned_action,
+                    "action": action,
+                    "blocked_reason": (
+                        "stale-baseline"
+                        if stale_baseline and enabled and client.detected
+                        else None
+                    ),
+                }
+            )
+
+        families: list[dict[str, Any]] = []
+        for agent in aggregate_agent_targets(clients):
+            members = [row for row in rows if row["agent"] == agent.name]
+            if not members:
+                continue
+            families.append(
+                {
+                    "agent": agent.name,
+                    "display_name": agent.display_name,
+                    "detected": agent.detected,
+                    "enabled": agent.name not in disabled,
+                    "clients": [row["client"] for row in members],
+                    "affected_clients": [
+                        row["client"] for row in members if row["affected"]
+                    ],
+                }
+            )
+
+        return {
+            "session_id": metadata.session_id,
+            "skill": metadata.logical_skill,
+            "scope": "base",
+            "status": metadata.status.value,
+            "baseline_hash": metadata.baseline_hash,
+            "current_hash": current_hash,
+            "workspace_hash": workspace_hash,
+            "stale_baseline": stale_baseline,
+            "blocked": stale_baseline,
+            "blocked_reason": (
+                "canonical-changed-since-begin" if stale_baseline else None
+            ),
+            "has_workspace_changes": workspace_hash != metadata.baseline_hash,
+            "registry_targets": sorted(configured),
+            "families": families,
+            "clients": rows,
+            "summary": {
+                "affected": sum(bool(row["affected"]) for row in rows),
+                "requires_rebuild": sum(bool(row["requires_rebuild"]) for row in rows),
+                "disabled": sum(row["availability"] == "disabled" for row in rows),
+                "undetected": sum(row["availability"] == "undetected" for row in rows),
+            },
+        }
+    except SkillSyncError:
+        raise
+    except (EditSessionMetadataError, OSError, ValueError) as exc:
+        raise SkillSyncError(
+            f"could not safely preview edit impact: {exc}",
+            code="unsafe_edit_session",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+
+
 def select_skills(
     items: Iterable[str | Path],
     platform: str | None = "codex",

@@ -1020,15 +1020,17 @@ edit apply 直接影响用户源数据或托管部署，不能通过并行开发
 
 ## 20. 现在应该从哪里开始
 
-Step 0–4 和 commit `5.1`–`5.3` 已完成并验收。当前所有托管客户端都使用只读
-rendered deployment；edit session 已具备严格 metadata、只读 `list/status`、
-Base baseline snapshot、writable workspace 和 `begin/abort`。同一 Skill 的 begin
-由每 Skill 锁串行，不同 Skill 可以并行；abort 不修改 canonical source。
+Step 0–4 和 commit `5.1`–`5.5` 已完成并验收。当前所有托管客户端都使用只读
+rendered deployment；edit session 已具备严格 metadata、只读
+`list/status/diff/validate/impact`、Base baseline snapshot、writable workspace 和
+`begin/abort`。同一 Skill 的 begin 由每 Skill 锁串行，不同 Skill 可以并行；abort
+不修改 canonical source。impact 会列出 family/client deployment 影响，并在
+canonical baseline 过期时 fail closed。
 
-下一批按照第 18.2 节并行开发 `5.4 add edit diff and validation` 和
-`5.5 add edit impact preview`。合并时先接收 `5.4`，再将 `5.5` rebase 到最新
-`main` 后验收；`5.6 transactional base edit apply` 必须等待两者全部完成。关键
-安全链仍保持串行，不能为了提高并发跳过验收门槛。
+下一 commit 是 `5.6 add transactional base edit apply`：实现 baseline conflict、
+backup、receipt 和 canonical 原子替换，但暂不自动重建 deployment。它位于
+transaction apply、deployment rebuild、recovery 的串行关键链上，必须单独开发和
+验收，不与 `5.7` 或后续 commit 并行。完成 `5.6` 前不得修改真实托管 Skill。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

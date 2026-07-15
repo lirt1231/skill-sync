@@ -202,6 +202,15 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_edit_validate,
         protocol_command="edit validate",
     )
+    edit_impact_parser = edit_subparsers.add_parser(
+        "impact", help="preview Base deployment impact"
+    )
+    edit_impact_parser.add_argument("session_id", help="edit session UUID")
+    edit_impact_parser.add_argument("--json", action="store_true", help="print JSON output")
+    edit_impact_parser.set_defaults(
+        handler=_handle_edit_impact,
+        protocol_command="edit impact",
+    )
 
     deploy_parser = subparsers.add_parser(
         "deploy", help="inspect and migrate rendered Skill deployments"
@@ -488,6 +497,31 @@ def _handle_edit_validate(args: argparse.Namespace) -> Any:
         f"- {issue['code']} {issue['path']}: {issue['message']}"
         for issue in result["issues"]
     )
+    return "\n".join(lines)
+
+
+def _handle_edit_impact(args: argparse.Namespace) -> Any:
+    result = core.edit_impact(args.session_id, config_path=args.config)
+    if args.json:
+        return result
+    lines = [
+        f"Impact: {result['session_id']} ({result['skill']}, Base)",
+        f"Stale baseline: {'yes' if result['stale_baseline'] else 'no'}",
+        (
+            f"Blocked: {'yes' if result['blocked'] else 'no'}"
+            + (f" ({result['blocked_reason']})" if result['blocked_reason'] else "")
+        ),
+        (
+            f"Affected clients: {result['summary']['affected']}; "
+            f"rebuilds: {result['summary']['requires_rebuild']}"
+        ),
+    ]
+    for client in result["clients"]:
+        lines.append(
+            f"- {client['client']} [{client['agent']}, {client['availability']}]: "
+            f"{client['action']}; deployment {client['current_deployment_state']} "
+            f"-> {client['proposed_deployment_state']}"
+        )
     return "\n".join(lines)
 
 
