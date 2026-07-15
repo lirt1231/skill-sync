@@ -27,6 +27,7 @@ from skill_sync.deployment import (
     verify_deployment,
 )
 from skill_sync.errors import SkillSyncError
+from skill_sync.edit_session import EditSessionMetadataError, EditSessionStore
 from skill_sync.hash import hash_skill_dir, is_link_or_reparse
 from skill_sync.linking import (
     create_directory_link,
@@ -44,6 +45,47 @@ from skill_sync.skill_metadata import read_skill_description
 
 REGISTRY_FILE = "registry.yaml"
 DEFAULT_AGENT_TARGETS = "codex,workbuddy,kimi,claude"
+
+
+def list_edit_sessions(
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Inspect all machine-local edit sessions without network or mutations."""
+
+    store = EditSessionStore(_data_root(_load_local_config(config_path)))
+    try:
+        sessions = [item.to_dict() for item in store.list_metadata()]
+    except (EditSessionMetadataError, OSError) as exc:
+        raise SkillSyncError(
+            str(exc),
+            code="invalid_edit_session_metadata",
+            exit_code=EXIT_SAFETY,
+        ) from exc
+    return {"sessions": sessions}
+
+
+def edit_session_status(
+    session_id: str,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Inspect one machine-local edit session without network or mutations."""
+
+    store = EditSessionStore(_data_root(_load_local_config(config_path)))
+    try:
+        return store.load(session_id).to_dict()
+    except FileNotFoundError as exc:
+        raise SkillSyncError(
+            f"edit session does not exist: {session_id}",
+            code="edit_session_not_found",
+            details={"session_id": session_id},
+        ) from exc
+    except (EditSessionMetadataError, OSError) as exc:
+        raise SkillSyncError(
+            str(exc),
+            code="invalid_edit_session_metadata",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
 
 
 def is_initialized(config_path: str | Path | None = None) -> bool:

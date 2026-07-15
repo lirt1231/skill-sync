@@ -292,6 +292,44 @@ class EditSessionStore:
             )
         return metadata
 
+    def list_metadata(self) -> list[EditSessionMetadata]:
+        """Return every session in deterministic order without changing local state.
+
+        Enumeration is deliberately strict.  An unexpected entry or one broken
+        metadata document makes the whole inspection fail closed instead of
+        presenting a partial, incorrectly healthy view.
+        """
+
+        self._assert_safe_root_for_read()
+        if not self.root.exists():
+            return []
+
+        metadata: list[EditSessionMetadata] = []
+        try:
+            entries = sorted(self.root.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise EditSessionMetadataError(
+                f"cannot safely enumerate edit sessions: {self.root}: {exc}"
+            ) from exc
+        for entry in entries:
+            if entry.name == ".locks":
+                if is_link_or_reparse(entry) or not entry.is_dir():
+                    raise EditSessionMetadataError(
+                        f"edit session lock path must be a real directory: {entry}"
+                    )
+                continue
+            try:
+                _validate_session_id(entry.name)
+            except EditSessionMetadataError as exc:
+                raise EditSessionMetadataError(
+                    f"unexpected entry in edit session root: {entry}"
+                ) from exc
+            metadata.append(self.load(entry.name))
+        return sorted(
+            metadata,
+            key=lambda item: (item.created_at, item.session_id),
+        )
+
     def transition(
         self,
         session_id: str,
@@ -315,6 +353,21 @@ class EditSessionStore:
             )
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         if is_link_or_reparse(self.root) or not self.root.is_dir():
+            raise EditSessionMetadataError(
+                f"edit session root must be a real directory: {self.root}"
+            )
+
+    def _assert_safe_root_for_read(self) -> None:
+        for path in (self.data_root, self.root):
+            if is_link_or_reparse(path):
+                raise EditSessionMetadataError(
+                    f"edit session root must not contain a link or reparse point: {path}"
+                )
+        if self.data_root.exists() and not self.data_root.is_dir():
+            raise EditSessionMetadataError(
+                f"edit session data root must be a real directory: {self.data_root}"
+            )
+        if self.root.exists() and not self.root.is_dir():
             raise EditSessionMetadataError(
                 f"edit session root must be a real directory: {self.root}"
             )

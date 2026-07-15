@@ -184,6 +184,47 @@ class EditSessionStoreTest(unittest.TestCase):
                 store.create(replace(metadata, actor="workbuddy"))
             self.assertEqual(paths.metadata.read_bytes(), original)
 
+    def test_list_metadata_is_read_only_and_deterministically_sorted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = Path(temp_dir) / "data"
+            store = EditSessionStore(data_root)
+
+            self.assertEqual(store.list_metadata(), [])
+            self.assertFalse(data_root.exists())
+
+            later = self.make_metadata(
+                created_at="2026-07-15T08:31:00Z",
+                updated_at="2026-07-15T08:31:00Z",
+            )
+            earlier = self.make_metadata()
+            store.create(later)
+            store.create(earlier)
+
+            self.assertEqual(store.list_metadata(), [earlier, later])
+
+    def test_list_metadata_fails_closed_on_corrupt_or_unexpected_entries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = EditSessionStore(Path(temp_dir))
+            metadata = self.make_metadata()
+            paths = store.create(metadata)
+            paths.metadata.write_text("{broken", encoding="utf-8")
+
+            with self.assertRaises(EditSessionMetadataError):
+                store.list_metadata()
+
+            paths.metadata.write_text(json.dumps(metadata.to_dict()), encoding="utf-8")
+            (store.root / "unexpected").mkdir()
+            with self.assertRaises(EditSessionMetadataError):
+                store.list_metadata()
+
+    def test_list_metadata_rejects_non_directory_data_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = Path(temp_dir) / "data"
+            data_root.write_text("not a directory", encoding="utf-8")
+
+            with self.assertRaises(EditSessionMetadataError):
+                EditSessionStore(data_root).list_metadata()
+
     def test_linked_data_root_is_rejected_before_creating_session_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             work = Path(temp_dir)

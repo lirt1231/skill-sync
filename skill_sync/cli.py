@@ -176,6 +176,26 @@ def _build_parser() -> argparse.ArgumentParser:
         protocol_command="deploy gc",
     )
 
+    edit_parser = subparsers.add_parser("edit", help="inspect managed Skill edit sessions")
+    edit_subparsers = edit_parser.add_subparsers(dest="edit_action", required=True)
+    edit_list_parser = edit_subparsers.add_parser(
+        "list", help="list machine-local edit sessions"
+    )
+    edit_list_parser.add_argument("--json", action="store_true", help="print JSON output")
+    edit_list_parser.set_defaults(
+        handler=_handle_edit_list,
+        protocol_command="edit list",
+    )
+    edit_status_parser = edit_subparsers.add_parser(
+        "status", help="show one machine-local edit session"
+    )
+    edit_status_parser.add_argument("session_id", help="edit session UUID")
+    edit_status_parser.add_argument("--json", action="store_true", help="print JSON output")
+    edit_status_parser.set_defaults(
+        handler=_handle_edit_status,
+        protocol_command="edit status",
+    )
+
     web_parser = subparsers.add_parser("web", help="start the local management Web UI")
     web_parser.add_argument("--host", default="127.0.0.1")
     web_parser.add_argument("--port", type=int, default=8765)
@@ -387,6 +407,37 @@ def _handle_deploy_gc(args: argparse.Namespace) -> Any:
     if result.get("skipped"):
         lines.append(f"Skipped: {len(result['skipped'])} unsafe or referenced entries")
     return "\n".join(lines)
+
+
+def _handle_edit_list(args: argparse.Namespace) -> Any:
+    result = core.list_edit_sessions(config_path=args.config)
+    if args.json:
+        return result
+    sessions = result["sessions"]
+    if not sessions:
+        return "No edit sessions."
+    return "\n".join(
+        f"- {item['session_id']} [{item['status']}] {item['logical_skill']} "
+        f"(actor {item['actor'] or 'none'}, updated {item['updated_at']})"
+        for item in sessions
+    )
+
+
+def _handle_edit_status(args: argparse.Namespace) -> Any:
+    result = core.edit_session_status(args.session_id, config_path=args.config)
+    if args.json:
+        return result
+    return "\n".join(
+        (
+            f"Session: {result['session_id']}",
+            f"Skill: {result['logical_skill']}",
+            f"Status: {result['status']}",
+            f"Actor: {result['actor'] or 'none'}",
+            f"Baseline: {result['baseline_hash']}",
+            f"Created: {result['created_at']}",
+            f"Updated: {result['updated_at']}",
+        )
+    )
 
 
 def _handle_web(args: argparse.Namespace) -> None:
