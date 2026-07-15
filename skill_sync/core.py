@@ -29,8 +29,17 @@ from skill_sync.deployment import (
 from skill_sync.edit_session import (
     ActiveEditSessionError,
     CanonicalSkillChangedError,
+    EditSessionMetadata,
     EditSessionMetadataError,
+    EditSessionStatus,
     EditSessionStore,
+)
+from skill_sync.edit_validation import (
+    EditTreeInspectionError,
+    TreeInspection,
+    build_diff,
+    inspect_tree,
+    validate_workspace,
 )
 from skill_sync.errors import SkillSyncError
 from skill_sync.hash import hash_skill_dir, is_link_or_reparse
@@ -431,6 +440,115 @@ def edit_abort(
             code="edit_abort_failed",
             details={"session_id": session_id},
         ) from exc
+
+
+def edit_diff(
+    session_id: str,
+    *,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Diff an active Base edit workspace without changing any state."""
+
+    metadata, baseline, workspace = _active_edit_trees(session_id, config_path)
+    try:
+        result = build_diff(baseline, workspace)
+    except EditTreeInspectionError as exc:
+        raise SkillSyncError(
+            f"could not safely diff edit workspace: {exc}",
+            code="invalid_edit_workspace",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+    return {
+        "session_id": metadata.session_id,
+        "skill": metadata.logical_skill,
+        "scope": "base",
+        "status": metadata.status.value,
+        **result,
+    }
+
+
+def edit_validate(
+    session_id: str,
+    *,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Validate an active Base edit workspace without changing any state."""
+
+    metadata, baseline, workspace = _active_edit_trees(session_id, config_path)
+    issues = validate_workspace(workspace, logical_skill=metadata.logical_skill)
+    workspace_hash = workspace.hash
+    return {
+        "session_id": metadata.session_id,
+        "skill": metadata.logical_skill,
+        "scope": "base",
+        "status": metadata.status.value,
+        "valid": not issues,
+        "changed": workspace_hash != baseline.hash,
+        "baseline_hash": baseline.hash,
+        "workspace_hash": workspace_hash,
+        "issues": [issue.to_dict() for issue in issues],
+    }
+
+
+def _active_edit_trees(
+    session_id: str,
+    config_path: str | Path | None,
+) -> tuple[EditSessionMetadata, TreeInspection, TreeInspection]:
+    config = _load_local_config(config_path)
+    store = EditSessionStore(_data_root(config))
+    try:
+        metadata = store.load(session_id)
+    except FileNotFoundError as exc:
+        raise SkillSyncError(
+            f"edit session does not exist: {session_id}",
+            code="edit_session_not_found",
+            details={"session_id": session_id},
+        ) from exc
+    except (EditSessionMetadataError, OSError) as exc:
+        raise SkillSyncError(
+            f"could not safely inspect edit session: {exc}",
+            code="invalid_edit_session_metadata",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+
+    if metadata.status is not EditSessionStatus.ACTIVE:
+        raise SkillSyncError(
+            f"edit session is not active: {session_id} ({metadata.status.value})",
+            code="edit_session_not_active",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id, "status": metadata.status.value},
+        )
+
+    paths = store.paths(session_id)
+    for label, path in (("baseline", paths.baseline), ("workspace", paths.workspace)):
+        if is_link_or_reparse(path) or not path.is_dir():
+            raise SkillSyncError(
+                f"edit session {label} is missing or unsafe: {path}",
+                code="edit_session_incomplete",
+                exit_code=EXIT_SAFETY,
+                details={"session_id": session_id, "component": label},
+            )
+    try:
+        baseline = inspect_tree(paths.baseline)
+        workspace = inspect_tree(paths.workspace)
+    except (EditTreeInspectionError, OSError) as exc:
+        raise SkillSyncError(
+            f"could not safely inspect edit session trees: {exc}",
+            code="edit_session_incomplete",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+
+    if baseline.issues or baseline.hash != metadata.baseline_hash:
+        raise SkillSyncError(
+            "edit session baseline is damaged or does not match its recorded hash",
+            code="unsafe_edit_baseline",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        )
+    return metadata, baseline, workspace
 
 
 def select_skills(

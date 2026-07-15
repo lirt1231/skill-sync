@@ -182,6 +182,26 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_edit_abort,
         protocol_command="edit abort",
     )
+    edit_diff_parser = edit_subparsers.add_parser(
+        "diff", help="show changes in an active Base edit workspace"
+    )
+    edit_diff_parser.add_argument("session_id", help="edit session UUID")
+    edit_diff_parser.add_argument("--json", action="store_true", help="print JSON output")
+    edit_diff_parser.set_defaults(
+        handler=_handle_edit_diff,
+        protocol_command="edit diff",
+    )
+    edit_validate_parser = edit_subparsers.add_parser(
+        "validate", help="validate an active Base edit workspace"
+    )
+    edit_validate_parser.add_argument("session_id", help="edit session UUID")
+    edit_validate_parser.add_argument(
+        "--json", action="store_true", help="print JSON output"
+    )
+    edit_validate_parser.set_defaults(
+        handler=_handle_edit_validate,
+        protocol_command="edit validate",
+    )
 
     deploy_parser = subparsers.add_parser(
         "deploy", help="inspect and migrate rendered Skill deployments"
@@ -426,6 +446,49 @@ def _handle_edit_abort(args: argparse.Namespace) -> Any:
     if args.json:
         return result
     return f"Aborted edit session: {result['session_id']} ({result['skill']})"
+
+
+def _handle_edit_diff(args: argparse.Namespace) -> Any:
+    result = core.edit_diff(args.session_id, config_path=args.config)
+    if args.json:
+        return result
+    lines = [f"Edit diff: {result['session_id']} ({result['skill']}, Base)"]
+    if not result["changed"]:
+        lines.append("No changes.")
+        return "\n".join(lines)
+    summary = result["summary"]
+    lines.append(
+        f"Summary: {summary['added']} added, {summary['modified']} modified, "
+        f"{summary['deleted']} deleted"
+    )
+    for item in result["files"]:
+        lines.append(f"- {item['change']} {item['kind']}: {item['path']}")
+        lines.append(
+            f"  hashes: {item['old_hash'] or 'none'} -> {item['new_hash'] or 'none'}; "
+            f"bytes: {item['old_size'] if item['old_size'] is not None else 'none'} -> "
+            f"{item['new_size'] if item['new_size'] is not None else 'none'}"
+        )
+        if item["kind"] == "text" and item["diff"]:
+            lines.append(item["diff"].rstrip("\n"))
+    return "\n".join(lines)
+
+
+def _handle_edit_validate(args: argparse.Namespace) -> Any:
+    result = core.edit_validate(args.session_id, config_path=args.config)
+    if args.json:
+        return result
+    state = "valid" if result["valid"] else "invalid"
+    lines = [
+        f"Validation: {state} ({result['session_id']}, {result['skill']}, Base)",
+        f"Workspace: {result['workspace_hash'] or 'unsafe'}",
+        f"Changes: {'yes' if result['changed'] else 'no'}",
+        f"Issues: {len(result['issues'])}",
+    ]
+    lines.extend(
+        f"- {issue['code']} {issue['path']}: {issue['message']}"
+        for issue in result["issues"]
+    )
+    return "\n".join(lines)
 
 
 def _handle_deploy_preview(args: argparse.Namespace) -> str:
