@@ -1208,9 +1208,20 @@ staging、逐文件核验并用 no-replace rename 原子发布，已存在或并
 `kimi-desktop` 覆盖 `kimi`、目录/文件删除、共享 script 和噪音排除。该 commit 不接
 registry/CLI，不计算 layer/resolution hash，也不写 provenance；这些仍由 7.3 负责。
 
-当前合并顺序为：先保留已完成的 7.2，再将并行的 `7.4 add variant source management
-commands` rebase 到 7.2 后合并。主 resolver 链下一项是 `7.3 add layered resolution
-provenance`。
+commit `7.4 add variant source management commands` 已完成并 rebase 到 7.2 之后。
+CLI 新增 `variant list`、`variant create <skill> --family|--client <id>` 和
+`variant validate <skill>`；family/client flag 强制二选一并分别使用静态注册 ID。
+Variant root 只由本机 `skills_root` 的 sibling `variants` 推导，不写 registry 中的机器
+路径；create 只用 no-replace rename 原子发布最小 overlay manifest，不复制 Base、不接
+resolver/deployment/Web/edit session，也不调用 Git。list/validate 完全只读，重复 target、
+非法或大小写歧义 Skill 名、linked source 和不安全目录均 fail closed；空 overlay、
+Codex/WorkBuddy 同名 family/client ID 和 malformed manifest 均有回归测试。只读检查还会
+将 orphan/unsafe canonical Base 和非便携顶层 Variant Skill 名记录为结构化 issue，并保留
+其他可检查 Variant 行；Base safety 复用 7.2 resolver 的同一个只读 Base-only plan，
+不另复制 path rules。overlay file count 只排除 target root 的 `variant.yaml`。
+
+7.2 与 7.4 的既定合并顺序至此完成。主 resolver 链下一项是
+`7.3 add layered resolution provenance`。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

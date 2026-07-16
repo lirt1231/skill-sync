@@ -8,7 +8,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from skill_sync import core
+from skill_sync import core, variant_source
 from skill_sync.errors import SkillSyncError
 from skill_sync.protocol import error_envelope, success_envelope
 from skill_sync.version import __version__
@@ -136,6 +136,54 @@ def _build_parser() -> argparse.ArgumentParser:
     managed_check_parser.set_defaults(
         handler=_handle_managed_check,
         protocol_command="managed check",
+    )
+
+    variant_parser = subparsers.add_parser(
+        "variant", help="manage portable family and client Variant sources"
+    )
+    variant_subparsers = variant_parser.add_subparsers(
+        dest="variant_action", required=True
+    )
+    variant_list_parser = variant_subparsers.add_parser(
+        "list", help="list portable Variant sources"
+    )
+    variant_list_parser.add_argument("--skill", help="restrict to one logical Skill")
+    variant_list_parser.add_argument(
+        "--json", action="store_true", help="print JSON output"
+    )
+    variant_list_parser.set_defaults(
+        handler=_handle_variant_list,
+        protocol_command="variant list",
+    )
+    variant_create_parser = variant_subparsers.add_parser(
+        "create",
+        help="create a minimal overlay Variant source",
+        epilog=(
+            "creates only variants/<skill>/<target>/variant.yaml; does not copy "
+            "the Base Skill, deploy, commit, or push"
+        ),
+    )
+    variant_create_parser.add_argument("skill", help="logical Base Skill name")
+    variant_scope = variant_create_parser.add_mutually_exclusive_group(required=True)
+    variant_scope.add_argument("--family", help="registered Agent family ID")
+    variant_scope.add_argument("--client", help="registered concrete client ID")
+    variant_create_parser.add_argument(
+        "--json", action="store_true", help="print JSON output"
+    )
+    variant_create_parser.set_defaults(
+        handler=_handle_variant_create,
+        protocol_command="variant create",
+    )
+    variant_validate_parser = variant_subparsers.add_parser(
+        "validate", help="validate one logical Skill's Variant sources"
+    )
+    variant_validate_parser.add_argument("skill", help="logical Base Skill name")
+    variant_validate_parser.add_argument(
+        "--json", action="store_true", help="print JSON output"
+    )
+    variant_validate_parser.set_defaults(
+        handler=_handle_variant_validate,
+        protocol_command="variant validate",
     )
 
     edit_parser = subparsers.add_parser(
@@ -491,6 +539,67 @@ def _handle_managed_check(args: argparse.Namespace) -> Any:
             f"Recommended action: {action}",
         )
     )
+
+
+def _handle_variant_list(args: argparse.Namespace) -> Any:
+    result = variant_source.list_variants(
+        skill=args.skill,
+        config_path=args.config,
+    )
+    if args.json:
+        return result
+    if not result["variants"]:
+        suffix = f" for {args.skill}" if args.skill else ""
+        return f"No Variant sources{suffix}."
+    lines = [
+        f"Variant sources: {result['variant_count']} "
+        f"({'valid' if result['valid'] else 'invalid'})"
+    ]
+    for item in result["variants"]:
+        kinds = "/".join(item["target_kinds"]) or "unknown"
+        state = "valid" if item["valid"] else "invalid"
+        lines.append(
+            f"- {item['skill']} [{kinds}:{item['target']}] {state}: {item['path']}"
+        )
+    return "\n".join(lines)
+
+
+def _handle_variant_create(args: argparse.Namespace) -> Any:
+    scope = "family" if args.family is not None else "client"
+    target = args.family if args.family is not None else args.client
+    result = variant_source.create_variant(
+        args.skill,
+        scope=scope,
+        target=target,
+        config_path=args.config,
+    )
+    if args.json:
+        return result
+    return "\n".join(
+        (
+            f"Created Variant: {result['skill']} ({scope}:{target})",
+            f"Source: {result['path']}",
+            f"Resolution order: {' -> '.join(result['resolution_order'])}",
+        )
+    )
+
+
+def _handle_variant_validate(args: argparse.Namespace) -> Any:
+    result = variant_source.validate_variants(
+        args.skill,
+        config_path=args.config,
+    )
+    if args.json:
+        return result
+    lines = [
+        f"Variant validation: {'valid' if result['valid'] else 'invalid'} "
+        f"({result['skill']}, {result['variant_count']} targets)"
+    ]
+    lines.extend(
+        f"- {issue.get('target') or issue.get('skill') or 'source'}: {issue['message']}"
+        for issue in result["issues"]
+    )
+    return "\n".join(lines)
 
 
 def _handle_edit_begin(args: argparse.Namespace) -> Any:

@@ -68,9 +68,9 @@ skill-sync preview --json
 
 ### Machine-readable CLI output
 
-`version`, `scan`, `status`, `preview`, `doctor`, `managed check`, all `edit`
-subcommands, `deploy status`, and `deploy gc` support `--json`. During the
-pre-1.0 releases, their machine-readable contract uses
+`version`, `scan`, `status`, `preview`, `doctor`, `managed check`, all current
+`variant` and `edit` subcommands, `deploy status`, and `deploy gc` support
+`--json`. During the pre-1.0 releases, their machine-readable contract uses
 schema version 1 and always returns the same top-level envelope:
 
 ```json
@@ -99,6 +99,43 @@ to stderr and the command returns its structured exit code:
 - `4`: operation blocked by a safety check
 
 Text mode remains intended for interactive use and keeps its concise output.
+
+### Create and inspect Variant sources
+
+Portable client differences live beside the canonical Skill root. With the
+default `~/.agents/skills` root, Variant sources are stored under
+`~/.agents/variants/<skill>/<target>/`; a custom `skills_root` likewise uses a
+sibling `variants` directory. These machine paths are derived from local
+configuration and are never written into the portable registry.
+
+Create either a registered Agent-family overlay or a registered concrete-client
+overlay, then inspect it:
+
+```bash
+skill-sync variant create my-skill --family kimi
+skill-sync variant create my-skill --client kimi-desktop
+skill-sync variant list
+skill-sync variant list --skill my-skill --json
+skill-sync variant validate my-skill
+```
+
+`variant create` atomically creates only a minimal `variant.yaml`; it does not
+copy the Base Skill, resolve an overlay, rebuild a deployment, alter Agent
+links, update the registry, or invoke Git. A minimal overlay with no content
+files is valid. Family and client flags are mutually exclusive and checked
+against the static client registry. An existing target, unsafe path, linked
+source, or case-insensitive name ambiguity is a stop condition.
+
+`variant list` and `variant validate` are fully local and read-only. They
+cross-check each discovered or requested Variant Skill against a real,
+portable, link-free canonical Base using the same read-only Base plan and path
+rules as the 7.2 resolver. They report malformed manifests, orphan or unsafe
+Bases, and invalid top-level Skill names in `issues` without hiding other
+inspectable Variant rows. Each JSON row exposes `manifest_valid`,
+`base_valid`, `skill_name_valid`, and their conjunction `valid`; callers must
+also check the top-level `result.valid` field before treating a Variant source
+as usable. `overlay_file_count` excludes only the target root's manifest, so a
+nested file named `variant.yaml` remains normal overlay content.
 
 Before migrating existing Agent links away from editable canonical sources,
 preview every affected Skill/client pair, perform the migration, and inspect
