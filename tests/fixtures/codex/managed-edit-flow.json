@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "client": "codex",
+  "actor": "codex",
+  "skill": "alpha",
+  "target_path": "$CODEX_HOME/skills/alpha/SKILL.md",
+  "initial_skill_md": "---\nname: alpha\ndescription: Original Codex fixture\n---\n\n# Alpha\n",
+  "edited_skill_md": "---\nname: alpha\ndescription: Edited through a Codex workspace\n---\n\n# Alpha\n\nThis change came from the managed edit workspace.\n",
+  "command_sequence": [
+    "managed check",
+    "edit begin",
+    "edit diff",
+    "edit validate",
+    "edit impact",
+    "edit apply"
+  ],
+  "only_agent_write": "$WORKSPACE/SKILL.md",
+  "forbidden_agent_writes": [
+    "$CANONICAL/**",
+    "$DEPLOYMENT/**",
+    "$CODEX_HOME/skills/alpha/**"
+  ],
+  "forbidden_implicit_actions": [
+    "git commit",
+    "skill-sync push",
+    "git push"
+  ]
+}
