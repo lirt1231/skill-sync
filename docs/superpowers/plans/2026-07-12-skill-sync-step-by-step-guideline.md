@@ -1044,10 +1044,20 @@ README 和 `edit --help` 已记录完整 Base managed edit/recovery 工作流、
 边界；隔离 wheel e2e 已覆盖 `list/status/begin/abort/diff/validate/impact/apply/recover`
 的帮助和统一 JSON envelope。本 commit 不新增 core 行为。
 
-下一 commit 是 `6.1 require managed checks before skill edits`：只更新
-`skill-sync-manager` 的操作约束和最低 CLI 版本，让 Agent 在任何托管 Skill 修改前
-执行 ownership check，再进入 begin/diff/validate/impact/apply；不在该 commit 夹带
-真实 Codex/WorkBuddy 流程验证。
+commit `6.1 require managed checks before skill edits` 已完成：全局
+`skill-sync-manager` 现在强制 Agent 在修改任何已有 Skill 前执行 ownership check；
+只有 `managed=true, healthy=true` 才能进入目标专属的
+begin/diff/validate/impact/apply workspace 流程。Skill 明确要求从统一 JSON envelope
+的 `.result` 读取 session 和 workspace，遇到旧 CLI、歧义 ownership、非健康状态或
+exit code 4 时 fail closed，并记录最低 Skill Sync 版本为 `0.1.0`。tampered
+deployment 只允许先预览，再由用户明确选择 capture 或 discard。
+
+该 Skill 已通过结构校验和独立前向测试，并通过 edit session 应用到 canonical；
+Codex、WorkBuddy、Kimi Code、Kimi Desktop、Claude Code 共 5 个 deployment 已重建并
+保持 `linked-render`。对应 `agent-skills` 本地 commit 为 `6c737de`，尚未 push。
+
+下一 commit 是 `6.2 verify managed edits from codex`：只加入 Codex 真实流程 fixture、
+执行记录和必要兼容修复，验证 Codex 不写 deployment/canonical，也不隐式 push。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 
