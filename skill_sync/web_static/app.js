@@ -5,41 +5,99 @@ let activeImportAgent = "codex";
 let detailSkill = null;
 const selected = new Set();
 const selectedImports = new Set();
+const loadedViews = new Set();
 const $ = selector => document.querySelector(selector);
 
+function viewsFor(view) {
+  if (view === "skills") return ["summary", "inventory", "agents"];
+  if (view === "agents") return ["agents"];
+  return ["import-candidates"];
+}
+
+function stateUrl(views) {
+  const params = new URLSearchParams();
+  views.forEach(view => params.append("view", view));
+  return `/api/state?${params}`;
+}
+
+function mergeState(partial) {
+  if (!state || state.initialized !== partial.initialized) {
+    state = {initialized: partial.initialized, status: {skills: []}, doctor: {agents: [], matrix: [], issues: []}, import_candidates: []};
+    loadedViews.clear();
+  }
+  state = {...state, ...partial};
+  (partial.loaded_views || []).forEach(view => loadedViews.add(view));
+  hydrateSkillAgents();
+}
+
+function hydrateSkillAgents() {
+  const skills = state?.status?.skills || [];
+  const agents = state?.doctor?.agents || [];
+  const matrix = new Map((state?.doctor?.matrix || []).map(item => [`${item.skill}\u0000${item.agent}`, item.state]));
+  skills.forEach(skill => {
+    skill.agents = Object.fromEntries(agents.map(agent => [agent.name, matrix.get(`${skill.name}\u0000${agent.name}`) || "not-detected"]));
+  });
+}
+
+async function loadViews(views, force = false) {
+  const requested = force ? views : views.filter(view => !loadedViews.has(view));
+  if (!requested.length) return;
+  const response = await fetch(stateUrl(requested));
+  const partial = await response.json();
+  if (!response.ok) throw new Error(partial.error || "状态加载失败");
+  mergeState(partial); render();
+}
+
+async function loadActiveView(force = false) {
+  if (activeView === "skills") {
+    // Inventory is intentionally independent so a large Agent diagnosis does
+    // not delay the first useful list paint.
+    await loadViews(["inventory"], force);
+    if (state?.initialized) await loadViews(["summary", "agents"], force);
+    return;
+  }
+  await loadViews(viewsFor(activeView), force);
+}
+
 async function getState() {
-  const [tokenResult, stateResult] = await Promise.all([fetch("/api/token").then(r => r.json()), fetch("/api/state").then(r => r.json())]);
-  token = tokenResult.token; state = stateResult; render();
+  if (!token) token = (await fetch("/api/token").then(r => r.json())).token;
+  await loadActiveView(true);
 }
 
 async function action(path, body = {}) {
   toast("正在处理…");
-  const response = await fetch(path, {method:"POST",headers:{"Content-Type":"application/json","X-Skill-Sync-Token":token},body:JSON.stringify(body)});
+  const response = await fetch(path, {method:"POST",headers:{"Content-Type":"application/json","X-Skill-Sync-Token":token},body:JSON.stringify({...body, views: viewsFor(activeView)})});
   const data = await response.json();
   if (!response.ok) { toast(data.error || "操作失败", true); return false; }
-  state = data.state; render(); toast(data.result?.backup_path ? `已备份到 ${data.result.backup_path}` : "操作完成"); return true;
+  loadedViews.clear(); mergeState(data.state); render(); toast(data.result?.backup_path ? `已备份到 ${data.result.backup_path}` : "操作完成"); return true;
 }
 
 function render() {
   $("#setup").classList.toggle("hidden", state.initialized); $("#app").classList.toggle("hidden", !state.initialized);
   if (!state.initialized) return;
   const preview = state.preview;
-  $("#sync-label").textContent = label(preview.action);
-  $("#sync-summary").textContent = previewSummary(preview.action);
-  $("#sync").disabled = ["blocked","conflict"].includes(preview.action);
-  renderIssues(preview.issues || []);
-  renderSkills(state.status.skills || []);
-  renderAgents(state.doctor.agents || []);
+  if (preview) {
+    $("#sync-label").textContent = label(preview.action);
+    $("#sync-summary").textContent = previewSummary(preview.action);
+    $("#sync").disabled = ["blocked","conflict"].includes(preview.action);
+  }
+  renderIssues(preview?.issues || []);
+  renderSkills(state.status?.skills || []);
+  renderAgents(state.doctor?.agents || []);
   renderImports(state.import_candidates || []);
   renderDetail();
-  switchView(activeView);
+  showView(activeView);
 }
 
-function switchView(view) {
-  activeView = view;
+function showView(view) {
   document.querySelectorAll(".view").forEach(item => item.classList.toggle("active", item.id === `view-${view}`));
   document.querySelectorAll(".nav-item[data-view]").forEach(item => item.classList.toggle("active", item.dataset.view === view));
   $("#detail-drawer").classList.toggle("hidden", view !== "skills" || !detailSkill);
+}
+
+function switchView(view) {
+  activeView = view; showView(view);
+  loadActiveView().catch(error => toast(error.message, true));
 }
 
 function renderIssues(issues) {
@@ -53,7 +111,7 @@ function renderSkills(skills) {
   for (const name of [...selected]) if (!skills.some(skill => skill.name === name)) selected.delete(name);
   const shown = visibleSkills(skills);
   $("#skill-list").innerHTML = shown.map(skill => {
-    const agents = state.doctor.agents || [];
+    const agents = state.doctor?.agents || [];
     const coverage = agents.map(agent => `<i class="agent-dot ${agentStateClass(skill.agents?.[agent.name])}" title="${escapeHtml(agent.display_name)}: ${escapeHtml(skill.agents?.[agent.name] || "未知")}"></i>`).join("");
     return `<article class="skill-row ${detailSkill === skill.name ? "focused" : ""}" onclick="openDetail('${escapeJs(skill.name)}')"><input type="checkbox" aria-label="选择 ${escapeHtml(skill.name)}" ${selected.has(skill.name)?"checked":""} onclick="event.stopPropagation()" onchange="toggle('${escapeJs(skill.name)}',this.checked)"><span class="file-icon"><i class="ri-file-text-line"></i></span><strong>${escapeHtml(skill.name)}</strong><span class="coverage">${coverage}</span><span class="row-status ${skill.changed_local ? "pending" : ""}">${skill.changed_local ? "本地待推送" : (skill.selected ? "已同步" : "未加入同步")}</span><button class="icon-button" aria-label="查看详情" onclick="event.stopPropagation();openDetail('${escapeJs(skill.name)}')"><i class="ri-more-2-fill"></i></button></article>`;
   }).join("") || `<p class="empty">没有符合条件的 Skill</p>`;
@@ -91,7 +149,7 @@ function renderDetail() {
   $("#detail-description").textContent=skill.description||"暂无 description";
   $("#detail-sync").textContent=skill.selected?"已加入同步":"仅保存在本地";
   $("#detail-path").textContent=skill.local_path;
-  $("#detail-agents").innerHTML=(state.doctor.agents||[]).map(agent=>`<div><span><i class="agent-dot ${agentStateClass(skill.agents?.[agent.name])}"></i>${escapeHtml(agent.display_name)}</span><b>${agentStateLabel(skill.agents?.[agent.name])}</b></div>`).join("");
+  $("#detail-agents").innerHTML=(state.doctor?.agents||[]).map(agent=>`<div><span><i class="agent-dot ${agentStateClass(skill.agents?.[agent.name])}"></i>${escapeHtml(agent.display_name)}</span><b>${agentStateLabel(skill.agents?.[agent.name])}</b></div>`).join("");
 }
 
 function toggle(name,checked){checked?selected.add(name):selected.delete(name);renderSkills(state.status.skills||[]);}

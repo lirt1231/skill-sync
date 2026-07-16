@@ -10,13 +10,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from skill_sync import core
 from skill_sync.errors import SkillSyncError
 
 
 STATIC_DIR = Path(__file__).with_name("web_static")
+STATE_VIEWS = ("summary", "inventory", "agents", "import-candidates")
 
 
 def serve(host: str = "127.0.0.1", port: int = 8765, config_path: str | None = None, open_browser: bool = True) -> None:
@@ -39,9 +40,15 @@ def serve(host: str = "127.0.0.1", port: int = 8765, config_path: str | None = N
 def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
             if path == "/api/state":
-                self._json(_state(config_path))
+                try:
+                    views = _query_views(parsed.query)
+                except SkillSyncError as exc:
+                    self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return
+                self._json(_state(config_path, views=views))
                 return
             if path == "/api/preview":
                 self._json(core.sync_preview(config_path=config_path, fetch_remote=False))
@@ -71,6 +78,7 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(length) or b"{}")
+                views = _body_views(body.get("views"))
                 path = urlparse(self.path).path
                 kwargs = {"skill_names": body.get("skills"), "config_path": config_path}
                 if path == "/api/init":
@@ -114,7 +122,7 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                 else:
                     self._json({"error": "unknown action"}, HTTPStatus.NOT_FOUND)
                     return
-                self._json({"result": result, "state": _state(config_path)})
+                self._json({"result": result, "state": _state(config_path, views=views)})
             except (SkillSyncError, ValueError, OSError) as exc:
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
@@ -132,23 +140,100 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
     return Handler
 
 
-def _state(config_path: str | None) -> dict[str, Any]:
-    preview = core.sync_preview(config_path=config_path, fetch_remote=False)
-    if not preview["initialized"]:
-        agents = [
-            {"name": agent.name, "display_name": agent.display_name, "detected": agent.detected,
-             "enabled": True, "skills_dir": str(agent.skills_dir), "skills_dirs": [str(path) for path in agent.skill_dirs]}
-            for agent in core.detect_agents()
-        ]
-        return {
-            "schema_version": 1,
-            "initialized": False,
-            "preview": preview,
-            "status": {"skills": []},
-            "doctor": {"agents": agents, "matrix": [], "issues": []},
-            "import_candidates": [],
-        }
-    diagnosis = core.doctor(config_path=config_path)
+def _query_views(query: str) -> tuple[str, ...] | None:
+    requested = tuple(parse_qs(query).get("view", ()))
+    return _validate_views(requested) if requested else None
+
+
+def _body_views(value: Any) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise SkillSyncError("views must be a list of Web state view names")
+    return _validate_views(tuple(value))
+
+
+def _validate_views(views: tuple[str, ...]) -> tuple[str, ...]:
+    unknown = set(views) - set(STATE_VIEWS)
+    if unknown:
+        raise SkillSyncError("unknown Web state view: " + ", ".join(sorted(unknown)))
+    # Keep the caller's ordering for predictable incremental state merges while
+    # ensuring a repeated query parameter cannot trigger duplicate core reads.
+    return tuple(dict.fromkeys(views))
+
+
+def _state(
+    config_path: str | None,
+    *,
+    views: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    legacy_full_state = views is None
+    requested = STATE_VIEWS if views is None else _validate_views(views)
+    initialized = core.is_initialized(config_path)
+    diagnosis = (
+        core.doctor(config_path=config_path)
+        if initialized and "agents" in requested
+        else None
+    )
+    preview = None
+    if "summary" in requested:
+        preview = core.sync_preview(
+            config_path=config_path,
+            fetch_remote=False,
+            **({"diagnosis": diagnosis} if diagnosis is not None else {}),
+        )
+        initialized = preview["initialized"]
+
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "initialized": initialized,
+    }
+    if not legacy_full_state:
+        result["loaded_views"] = list(requested)
+
+    if not initialized:
+        if "summary" in requested:
+            result["preview"] = preview
+        if "inventory" in requested:
+            result["status"] = {"skills": []}
+        if "agents" in requested:
+            agents = [
+                {
+                    "name": agent.name,
+                    "display_name": agent.display_name,
+                    "detected": agent.detected,
+                    "enabled": True,
+                    "skills_dir": str(agent.skills_dir),
+                    "skills_dirs": [str(path) for path in agent.skill_dirs],
+                }
+                for agent in core.detect_agents()
+            ]
+            result["doctor"] = {"agents": agents, "matrix": [], "issues": []}
+        if "import-candidates" in requested:
+            result["import_candidates"] = []
+        return result
+
+    if "summary" in requested:
+        result["preview"] = preview
+    if "agents" in requested:
+        result["doctor"] = diagnosis
+    if "inventory" in requested:
+        result["status"] = _inventory(config_path, diagnosis=diagnosis)
+    if "import-candidates" in requested:
+        try:
+            result["import_candidates"] = core.scan_import_candidates(
+                config_path=config_path
+            )
+        except SkillSyncError:
+            result["import_candidates"] = []
+    return result
+
+
+def _inventory(
+    config_path: str | None,
+    *,
+    diagnosis: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
         sync_status = core.status(config_path=config_path, fetch_remote=False)
     except SkillSyncError as exc:
@@ -169,19 +254,17 @@ def _state(config_path: str | None) -> dict[str, Any]:
         }
     for name, item in selected.items():
         skills[name] = {**skills.get(name, {}), **item}
-    matrix = {(item["skill"], item["agent"]): item["state"] for item in diagnosis["matrix"]}
-    for skill in skills.values():
-        skill["agents"] = {agent["name"]: matrix.get((skill["name"], agent["name"]), "not-detected") for agent in diagnosis["agents"]}
+    if diagnosis is not None:
+        matrix = {
+            (item["skill"], item["agent"]): item["state"]
+            for item in diagnosis["matrix"]
+        }
+        for skill in skills.values():
+            skill["agents"] = {
+                agent["name"]: matrix.get(
+                    (skill["name"], agent["name"]), "not-detected"
+                )
+                for agent in diagnosis["agents"]
+            }
     sync_status["skills"] = [skills[name] for name in sorted(skills)]
-    try:
-        import_candidates = core.scan_import_candidates(config_path=config_path)
-    except SkillSyncError:
-        import_candidates = []
-    return {
-        "schema_version": 1,
-        "initialized": True,
-        "preview": preview,
-        "status": sync_status,
-        "doctor": diagnosis,
-        "import_candidates": import_candidates,
-    }
+    return sync_status

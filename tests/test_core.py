@@ -1019,6 +1019,22 @@ class CoreWorkflowTest(unittest.TestCase):
         self.assertEqual(preview["action"], "noop")
         self.assertFalse(preview["repo"]["remote_checked"])
 
+    def test_sync_preview_reuses_a_precomputed_diagnosis(self):
+        self.init_from_remote()
+        self.select_default_skill("alpha", "# alpha v1\n")
+        push(config_path=self.config_path, skill_names=["alpha"])
+        diagnosis = core_module.doctor(config_path=self.config_path)
+
+        with mock.patch.object(core_module, "doctor") as doctor:
+            preview = sync_preview(
+                config_path=self.config_path,
+                diagnosis=diagnosis,
+            )
+
+        doctor.assert_not_called()
+        self.assertEqual(preview["action"], "noop")
+        self.assertFalse(preview["repo"]["remote_checked"])
+
     def test_core_reports_git_fail_closed_divergence_and_missing_remote_branch(self):
         self.init_from_remote()
         self.select_default_skill("alpha")

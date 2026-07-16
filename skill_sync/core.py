@@ -136,11 +136,14 @@ def sync_preview(
     config_path: str | Path | None = None,
     *,
     fetch_remote: bool = False,
+    diagnosis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Describe the next safe synchronization action without changing state.
 
     ``fetch_remote`` is deliberately opt-in: dashboards stay fast and offline,
     while an explicit sync operation asks Git for fresh remote state.
+    A caller that already built ``diagnosis`` may supply it so one Web request
+    does not repeat the same read-only deployment inspection.
     """
     if not is_initialized(config_path):
         return {
@@ -168,8 +171,11 @@ def sync_preview(
         local_changed = _any_local_changed(
             config, registry, [name for name in targets if not _needs_local_install(config, registry, name)]
         )
+        current_diagnosis = (
+            doctor(config_path=config_path) if diagnosis is None else diagnosis
+        )
         link_issues = [
-            issue for issue in doctor(config_path=config_path)["issues"]
+            issue for issue in current_diagnosis["issues"]
             if issue.get("type") not in {"missing-skill"}
         ]
         issues.extend(link_issues)
