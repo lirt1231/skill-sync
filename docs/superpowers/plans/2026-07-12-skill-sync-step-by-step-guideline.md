@@ -1139,10 +1139,22 @@ Codex、WorkBuddy、Kimi Code、Kimi Desktop、Claude Code 共 5 个 deployment 
 保持 `linked-render`。对应 `agent-skills` commit 为 `6c737de`，已推送到远程
 `main`。
 
-下一批是 `6.2`–`6.4` 的真实 Agent 验证；三项可以在独立分支并行开发并按编号
-合并。同时可以并行开发 `6.5 lazy load web view data`，但必须等 `6.2`–`6.4` 进入
-`main` 后 rebase 再合并。随后按 Step 6B 的 `6.6`–`6.10` 完成当前 Web UI
-稳定化，再进入 `7.1 add strict variant manifest parser`。
+commits `6.2`–`6.4` 已按编号完成并合并：Codex、WorkBuddy、Claude Code、Kimi
+Code 和 Kimi Desktop 都有独立 v1 fixture、可复现验证记录和隔离 HOME 自动化测试。
+五个流程均强制执行 managed check → begin → diff → validate → impact → apply，Agent
+只写 workspace；apply 前 canonical、旧 deployment 和全部客户端链接保持不变，且
+测试会阻断任何 Git 调用。对应 commits 为 `9308d04`、`e2768fe`、`17bd5ef`。
+
+commit `6.5 lazy load web view data` 已完成并在 `6.2`–`6.4` 后 rebase 合并，对应
+`5779798`。Web API 新增 summary、inventory、agents、import-candidates 的 view-scoped
+读取；旧 `/api/state` 完整合约保留，但新版前端只有进入 Import Skills 时才扫描导入
+候选，所有普通读取都使用 `fetch_remote=False`。100 Skill 临时 fixture 的 warm
+inventory 实测约 `0.100s`–`0.126s`，自动测试使用稳定 work-count 边界而非脆弱的
+wall-clock 断言。
+
+当前下一 commit 是 `6.6 add web operation progress states`：只为 refresh 和现有
+mutation 增加操作级 loading、重复提交保护和明确结果，不提前混入 drawer、筛选或
+preview model。随后 `6.7` 和 `6.9` 可以独立并行开发，再按依赖进入 `6.8`、`6.10`。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 
