@@ -52,6 +52,8 @@ from skill_sync.edit_validation import (
 from skill_sync.errors import SkillSyncError
 from skill_sync.hash import hash_skill_dir, is_link_or_reparse
 from skill_sync.linking import (
+    DirectoryLinkSwap,
+    DirectoryLinkSwapRecoveryRequired,
     create_directory_link,
     link_state,
     remove_directory_link,
@@ -1010,6 +1012,9 @@ def _edit_apply_locked(
         ) from exc
 
     swap: CanonicalSwap | None = None
+    deployment_transaction: dict[str, Any] | None = None
+    applied_link_swaps: list[DirectoryLinkSwap] = []
+    cleanup_pending: list[str] = []
     applying = False
     applied_metadata = False
     try:
@@ -1027,12 +1032,53 @@ def _edit_apply_locked(
             target=EditSessionStatus.APPLYING,
         )
         applying = True
+        _assert_no_incomplete_deployment_receipts(store.data_root)
+        receipt["phase"] = "deployments-preparing"
+        receipt_writer.update(receipt)
+        deployment_transaction = _prepare_edit_deployments(
+            config,
+            registry,
+            metadata.logical_skill,
+            source,
+            paths.workspace,
+            workspace_hash,
+            session_id,
+        )
+        receipt["clients"] = deployment_transaction["clients"]
+        receipt["phase"] = "deployments-ready"
+        receipt_writer.update(receipt)
         receipt["status"] = "applying"
         receipt["phase"] = "canonical-replace"
         receipt_writer.update(receipt)
 
         swap.apply()
         receipt["phase"] = "canonical-applied"
+        receipt_writer.update(receipt)
+        receipt["phase"] = "links-swapping"
+        receipt["completed_clients"] = []
+        receipt_writer.update(receipt)
+        for link_swap in deployment_transaction["swaps"]:
+            link_swap.apply()
+            applied_link_swaps.append(link_swap)
+            receipt["completed_clients"].append(
+                deployment_transaction["swap_clients"][link_swap.destination]
+            )
+            receipt_writer.update(receipt)
+        if hash_skill_dir(source) != workspace_hash:
+            raise SkillSyncError(
+                "canonical Skill changed during deployment link swaps",
+                code="edit_canonical_changed_during_deploy",
+                exit_code=EXIT_CONFLICT,
+            )
+        for row in deployment_transaction["active"]:
+            if link_state(Path(row["deployment_path"]), Path(row["destination"])) != "linked":
+                raise SkillSyncError(
+                    "an applied deployment link failed final verification",
+                    code="edit_deployment_verification_failed",
+                    exit_code=EXIT_SAFETY,
+                    details={"client": row["client"]},
+                )
+        receipt["phase"] = "links-applied"
         receipt_writer.update(receipt)
         _transition_edit_metadata(
             store,
@@ -1041,11 +1087,58 @@ def _edit_apply_locked(
             target=EditSessionStatus.APPLIED,
         )
         applied_metadata = True
-        swap.finalize()
         receipt["status"] = "completed"
         receipt["phase"] = "completed"
         receipt["completed_at"] = time.time()
         receipt_writer.update(receipt)
+        for link_swap in applied_link_swaps:
+            try:
+                link_swap.finalize()
+            except Exception as exc:
+                cleanup_pending.append(
+                    str(
+                        exc.recovery_path
+                        if isinstance(exc, DirectoryLinkSwapRecoveryRequired)
+                        else link_swap.backup
+                    )
+                )
+        try:
+            swap.finalize()
+        except Exception as exc:
+            cleanup_pending.append(
+                str(
+                    exc.recovery_path
+                    if isinstance(exc, CanonicalSwapRecoveryRequired)
+                    else swap.previous
+                )
+            )
+        if cleanup_pending:
+            receipt["status"] = "cleanup-pending"
+            receipt["phase"] = "cleanup-pending"
+            receipt["cleanup_pending"] = cleanup_pending
+            try:
+                receipt_writer.update(receipt)
+            except Exception:
+                cleanup_pending.append(str(receipt_path))
+    except DirectoryLinkSwapRecoveryRequired as exc:
+        _mark_edit_apply_recovery(
+            store,
+            session_id,
+            receipt,
+            receipt_path,
+            receipt_writer,
+            recovery_path=exc.recovery_path,
+        )
+        raise SkillSyncError(
+            "deployment link swap requires recovery",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "receipt_path": str(receipt_path),
+                "recovery_path": str(exc.recovery_path),
+            },
+        ) from exc
     except ReceiptRecoveryRequired as exc:
         recovery_path = (
             swap.previous
@@ -1140,10 +1233,41 @@ def _edit_apply_locked(
                     "receipt_path": str(receipt_path),
                 },
             ) from exc
+        links_rolled_back = True
+        for link_swap in reversed(applied_link_swaps):
+            try:
+                if not link_swap.rollback():
+                    links_rolled_back = False
+            except Exception:
+                links_rolled_back = False
         try:
-            rolled_back = swap is None or swap.rollback()
+            rolled_back = links_rolled_back and (swap is None or swap.rollback())
         except Exception:
             rolled_back = False
+        if rolled_back and swap is not None:
+            for link_swap in applied_link_swaps:
+                try:
+                    link_swap.finalize()
+                except Exception as cleanup_exc:
+                    cleanup_pending.append(
+                        str(
+                            cleanup_exc.recovery_path
+                            if isinstance(
+                                cleanup_exc, DirectoryLinkSwapRecoveryRequired
+                            )
+                            else link_swap.backup
+                        )
+                    )
+            try:
+                swap.finalize()
+            except Exception as cleanup_exc:
+                cleanup_pending.append(
+                    str(
+                        cleanup_exc.recovery_path
+                        if isinstance(cleanup_exc, CanonicalSwapRecoveryRequired)
+                        else swap.previous
+                    )
+                )
         if applying and rolled_back:
             try:
                 _transition_edit_metadata(
@@ -1157,11 +1281,6 @@ def _edit_apply_locked(
                 OSError,
                 _EditTransitionRecoveryRequired,
             ):
-                rolled_back = False
-        if rolled_back and swap is not None:
-            try:
-                swap.finalize()
-            except Exception:
                 rolled_back = False
         if not rolled_back:
             recovery_path = swap.previous if swap is not None else backup_path
@@ -1187,6 +1306,8 @@ def _edit_apply_locked(
         receipt["phase"] = "rolled-back"
         receipt["error_code"] = "edit_apply_failed"
         receipt["completed_at"] = time.time()
+        if cleanup_pending:
+            receipt["cleanup_pending"] = cleanup_pending
         receipt_writer.update(receipt)
         raise SkillSyncError(
             "edit apply failed; the previous canonical Skill was restored",
@@ -1207,7 +1328,11 @@ def _edit_apply_locked(
         "applied_hash": workspace_hash,
         "backup_path": str(backup_path),
         "receipt_path": str(receipt_path),
-        "deployments_rebuilt": False,
+        "deployments_rebuilt": bool(deployment_transaction["deployments"]),
+        "deployments": deployment_transaction["deployments"],
+        "clients_relinked": len(applied_link_swaps),
+        "skipped_clients": deployment_transaction["skipped"],
+        "cleanup_pending": cleanup_pending,
     }
 
 
@@ -1243,6 +1368,127 @@ def _mark_edit_apply_recovery(
     if transition_error is not None:
         receipt["metadata_transition_failed"] = True
     receipt_writer.update(receipt)
+
+
+def _prepare_edit_deployments(
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    skill_name: str,
+    canonical_source: Path,
+    workspace: Path,
+    workspace_hash: str,
+    session_id: str,
+) -> dict[str, Any]:
+    """Render and verify one immutable deployment per applicable client."""
+
+    clients = detect_clients()
+    disabled = _disabled_agents(config)
+    entry = registry.get("skills", {}).get(skill_name, {})
+    configured = _configured_client_targets(entry)
+    rendered_root = _rendered_root(config)
+    rows: list[dict[str, Any]] = []
+    active: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    deployments: list[dict[str, Any]] = []
+    swaps: list[DirectoryLinkSwap] = []
+    swap_clients: dict[Path, str] = {}
+
+    for client in clients:
+        reason: str | None = None
+        if configured and not {client.id, client.family_id}.intersection(configured):
+            reason = "config-excluded"
+        elif client.family_id in disabled:
+            reason = "disabled"
+        elif not client.detected:
+            reason = "undetected"
+        if reason is not None:
+            row = {
+                "client": client.id,
+                "agent": client.family_id,
+                "status": "skipped",
+                "reason": reason,
+                "destination": str(client.skills_dir / skill_name),
+            }
+            rows.append(row)
+            skipped.append({"client": client.id, "reason": reason})
+            continue
+
+        deployed = render_base_deployment(
+            workspace,
+            rendered_root,
+            skill_name,
+            client.id,
+        )
+        verification = verify_deployment(
+            deployed.path,
+            expected_provenance=expected_provenance(
+                skill_name, workspace_hash, client.id
+            ),
+        )
+        if not verification.ok:
+            raise SkillSyncError(
+                "rendered edit deployment failed verification",
+                code="edit_deployment_verification_failed",
+                exit_code=EXIT_SAFETY,
+                details={"client": client.id, "state": verification.state},
+            )
+        destination = client.skills_dir / skill_name
+        current_state, current_target = _deployment_link_state(
+            canonical_source,
+            destination,
+            deployed.path,
+            rendered_root,
+            skill_name,
+            client.id,
+        )
+        action = _deployment_action(current_state, "valid")
+        if action == "blocked":
+            raise SkillSyncError(
+                "edit deployment is blocked by an unsafe Agent path",
+                code="edit_deployment_blocked",
+                exit_code=EXIT_SAFETY,
+                details={"client": client.id, "state": current_state},
+            )
+        row = {
+            "client": client.id,
+            "agent": client.family_id,
+            "status": "ready",
+            "action": action,
+            "destination": str(destination),
+            "deployment_path": str(deployed.path),
+            "deployment_created": deployed.created,
+            "previous_state": current_state,
+            "previous_target": None if current_target is None else str(current_target),
+        }
+        rows.append(row)
+        active.append(row)
+        deployments.append(
+            {
+                "client": client.id,
+                "path": str(deployed.path),
+                "created": deployed.created,
+            }
+        )
+        if action == "noop":
+            continue
+        allowed = () if current_target is None else (current_target,)
+        link_swap = DirectoryLinkSwap.prepare(
+            deployed.path,
+            destination,
+            allowed_current_sources=allowed,
+            token=f"{session_id}-{client.id}",
+        )
+        swaps.append(link_swap)
+        swap_clients[destination] = client.id
+
+    return {
+        "clients": rows,
+        "active": active,
+        "skipped": skipped,
+        "deployments": deployments,
+        "swaps": swaps,
+        "swap_clients": swap_clients,
+    }
 
 
 def _transition_edit_metadata(
@@ -2487,7 +2733,11 @@ def _deployment_link_state(
             "linked-render" if verification.ok else f"{verification.state}-render",
             desired,
         )
-    if not destination.exists() and not destination.is_symlink():
+    if (
+        not destination.exists()
+        and not destination.is_symlink()
+        and not is_link_or_reparse(destination)
+    ):
         return "missing", None
 
     target = _directory_link_target(destination)

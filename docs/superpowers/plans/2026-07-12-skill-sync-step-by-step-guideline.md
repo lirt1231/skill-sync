@@ -1020,18 +1020,22 @@ edit apply 直接影响用户源数据或托管部署，不能通过并行开发
 
 ## 20. 现在应该从哪里开始
 
-Step 0–4 和 commit `5.1`–`5.6` 已完成并验收。当前所有托管客户端都使用只读
+Step 0–4 和 commit `5.1`–`5.7` 已完成并验收。当前所有托管客户端都使用只读
 rendered deployment；edit session 已具备严格 metadata、只读
 `list/status/diff/validate/impact`、Base baseline snapshot、writable workspace、
 `begin/abort` 和 transactional `apply`。apply 使用 `deployment.lock → per-Skill
 lock`，检查 baseline conflict 和 workspace validation，持久化私有 backup/receipt，
-再通过同父目录 no-replace rename 替换 canonical；外部 winner 永不覆盖。apply
-中断会留下可判定的 receipt phase、session 状态和恢复 artifact，但本阶段不重建
-deployment，也不执行 Git 操作。
+再通过同父目录 no-replace rename 替换 canonical。apply 只为受影响且实际启用的
+concrete clients 构建并验证新的 rendered deployment，并在同一事务中切换 Agent
+链接；原始相对 symlink、链式链接或 Windows junction 对象会保留到全局提交点。
+普通失败按相反顺序恢复所有链接，再恢复 canonical；外部 winner 永不覆盖。任一
+回滚结果不确定时保留 winner、backup 和 artifact，并将 session/receipt 标记为
+`needs-recovery`。canonical、链接、metadata 和 completed receipt 提交后的清理异常
+只记录为 `cleanup_pending`，不会把已提交事务重新回滚。apply 仍不执行 Git 操作。
 
-下一 commit 是 `5.7 rebuild deployments after edit apply`：只针对 apply 影响的
-clients 构建、验证并切换新的 rendered deployment；任何失败都必须恢复 canonical
-和原链接。它仍位于串行关键链上，不与 `5.8 recovery` 并行开发。
+下一 commit 是 `5.8 add managed edit recovery`：提供 tampered deployment diff 和
+显式 capture/discard 流程，绝不自动采用被篡改内容。它位于串行关键链上，不与
+`5.7` 或 `5.9` 并行开发。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

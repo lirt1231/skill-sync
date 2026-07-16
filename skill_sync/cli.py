@@ -544,7 +544,11 @@ def _handle_edit_apply(args: argparse.Namespace) -> Any:
             f"Canonical: {result['previous_hash']} -> {result['applied_hash']}",
             f"Backup: {result['backup_path']}",
             f"Receipt: {result['receipt_path']}",
-            "Deployments rebuilt: no (run the later deployment stage)",
+            (
+                f"Deployments rebuilt: {'yes' if result['deployments_rebuilt'] else 'no'}; "
+                f"clients relinked: {result.get('clients_relinked', 0)}"
+            ),
+            f"Cleanup pending: {len(result.get('cleanup_pending', []))}",
         )
     )
 

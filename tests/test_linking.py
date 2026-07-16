@@ -1,10 +1,12 @@
 import tempfile
 import unittest
 import os
+import subprocess
 from pathlib import Path
 from unittest import mock
 
 from skill_sync.linking import (
+    DirectoryLinkSwap,
     create_directory_link,
     link_state,
     remove_directory_link,
@@ -14,6 +16,135 @@ import skill_sync.linking as linking_module
 
 
 class LinkingTest(unittest.TestCase):
+    def test_windows_broken_reparse_endpoint_is_not_missing(self):
+        source = Path("C:/global/alpha")
+        destination = Path("C:/agent/alpha")
+        with mock.patch.object(linking_module.os, "name", "nt"), mock.patch.object(
+            linking_module,
+            "_is_windows_reparse_point",
+            return_value=True,
+        ):
+            self.assertEqual(link_state(source, destination), "broken-link")
+
+    def test_directory_link_swap_rejects_broken_reparse_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "rendered" / "alpha"
+            destination = root / "agent" / "alpha"
+            source.mkdir(parents=True)
+            backup = destination.with_name(".alpha.edit-previous-collision")
+            real_is_link = linking_module._is_directory_link
+
+            def broken_backup(path):
+                return Path(path) == backup or real_is_link(Path(path))
+
+            with mock.patch.object(
+                linking_module,
+                "_is_directory_link",
+                side_effect=broken_backup,
+            ):
+                with self.assertRaisesRegex(FileExistsError, "backup already exists"):
+                    DirectoryLinkSwap.prepare(
+                        source,
+                        destination,
+                        token="collision",
+                    )
+
+    def test_directory_link_swap_restores_original_after_move_fsync_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_source = root / "global" / "alpha"
+            new_source = root / "rendered" / "alpha"
+            destination = root / "agent" / "alpha"
+            old_source.mkdir(parents=True)
+            new_source.mkdir(parents=True)
+            destination.parent.mkdir(parents=True)
+            relative_target = os.path.relpath(old_source, destination.parent)
+            destination.symlink_to(relative_target, target_is_directory=True)
+            original_identity = linking_module._link_identity(destination)
+            swap = DirectoryLinkSwap.prepare(
+                new_source,
+                destination,
+                allowed_current_sources=[old_source],
+                token="fsync-failure",
+            )
+            real_fsync = linking_module._fsync_link_directory
+            calls = 0
+
+            def fail_first_fsync(directory):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError("injected fsync failure")
+                return real_fsync(directory)
+
+            with mock.patch.object(
+                linking_module,
+                "_fsync_link_directory",
+                side_effect=fail_first_fsync,
+            ):
+                with self.assertRaisesRegex(OSError, "rolled back"):
+                    swap.apply()
+
+            self.assertEqual(os.readlink(destination), relative_target)
+            self.assertEqual(linking_module._link_identity(destination), original_identity)
+            self.assertEqual(link_state(old_source, destination), "linked")
+            self.assertFalse(swap.backup.exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires real Windows junctions")
+    def test_directory_link_swap_preserves_real_windows_junction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_source = root / "global" / "alpha"
+            new_source = root / "rendered" / "alpha"
+            destination = root / "agent" / "alpha"
+            old_source.mkdir(parents=True)
+            new_source.mkdir(parents=True)
+            destination.parent.mkdir(parents=True)
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(destination), str(old_source)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            original_identity = linking_module._link_identity(destination)
+            swap = DirectoryLinkSwap.prepare(
+                new_source,
+                destination,
+                allowed_current_sources=[old_source],
+                token="junction",
+            )
+
+            swap.apply()
+            self.assertEqual(link_state(new_source, destination), "linked")
+            self.assertTrue(swap.rollback())
+            self.assertEqual(linking_module._link_identity(destination), original_identity)
+            self.assertEqual(link_state(old_source, destination), "linked")
+
+            swap = DirectoryLinkSwap.prepare(
+                new_source,
+                destination,
+                allowed_current_sources=[old_source],
+                token="junction-finalize",
+            )
+            swap.apply()
+            backup = swap.backup
+            self.assertTrue(linking_module._is_directory_link(backup))
+            swap.finalize()
+            self.assertFalse(backup.exists())
+
+            winner = root / "winner"
+            winner.mkdir()
+            destination.rmdir()
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(destination), str(winner)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertFalse(swap.rollback())
+            self.assertEqual(link_state(winner, destination), "linked")
+
     def test_create_is_idempotent_and_remove_only_removes_correct_link(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -12,11 +12,15 @@ from skill_sync import cli
 import skill_sync.core as core_module
 import skill_sync.edit_apply as edit_apply_module
 import skill_sync.edit_session as edit_session_module
-from skill_sync.config import empty_config, save_config
+import skill_sync.linking as linking_module
+from skill_sync.agents import AgentClient
+from skill_sync.config import empty_config, load_config, save_config
 from skill_sync.core import edit_apply, edit_begin
+from skill_sync.deployment import render_base_deployment, verify_deployment
 from skill_sync.edit_session import EditSessionStatus, EditSessionStore
 from skill_sync.errors import SkillSyncError
 from skill_sync.hash import hash_skill_dir
+from skill_sync.linking import create_directory_link
 from skill_sync.registry import save_registry
 
 
@@ -72,6 +76,9 @@ class EditApplyTest(unittest.TestCase):
                 },
             },
         )
+        detected = mock.patch.object(core_module, "detect_clients", return_value=[])
+        detected.start()
+        self.addCleanup(detected.stop)
 
     def begin_changed(self) -> dict:
         session = edit_begin("alpha", actor="codex", config_path=self.config_path)
@@ -86,6 +93,33 @@ class EditApplyTest(unittest.TestCase):
         operations = self.data_root / "operations"
         return sorted(operations.glob("edit-apply-*.json")) if operations.exists() else []
 
+    def clients(self, *ids: str) -> list[AgentClient]:
+        families = {
+            "codex": "codex",
+            "workbuddy": "workbuddy",
+            "claude-code": "claude",
+        }
+        return [
+            AgentClient(
+                client_id,
+                families[client_id],
+                client_id,
+                self.root / "clients" / client_id / "skills",
+                True,
+            )
+            for client_id in ids
+        ]
+
+    def install_current_deployment(self, client: AgentClient) -> Path:
+        deployed = render_base_deployment(
+            self.skill,
+            self.data_root / "rendered",
+            "alpha",
+            client.id,
+        )
+        create_directory_link(deployed.path, client.skills_dir / "alpha")
+        return deployed.path
+
     def test_apply_replaces_canonical_keeps_backup_and_writes_redacted_receipt(self):
         baseline_hash = hash_skill_dir(self.skill)
         session = self.begin_changed()
@@ -95,10 +129,6 @@ class EditApplyTest(unittest.TestCase):
             core_module.git,
             "run_git",
             side_effect=AssertionError("edit apply must not access Git"),
-        ), mock.patch.object(
-            core_module,
-            "detect_clients",
-            side_effect=AssertionError("5.6 must not rebuild deployments"),
         ):
             result = edit_apply(session["session_id"], config_path=self.config_path)
 
@@ -128,6 +158,278 @@ class EditApplyTest(unittest.TestCase):
             [path.name for path in self.skills_root.iterdir()],
             ["alpha"],
         )
+
+    def test_apply_rebuilds_and_switches_each_detected_client(self):
+        clients = self.clients("codex", "workbuddy")
+        old_targets = {
+            client.id: self.install_current_deployment(client) for client in clients
+        }
+        session = self.begin_changed()
+
+        with mock.patch.object(core_module, "detect_clients", return_value=clients):
+            result = edit_apply(session["session_id"], config_path=self.config_path)
+
+        self.assertTrue(result["deployments_rebuilt"])
+        self.assertEqual(result["clients_relinked"], 2)
+        self.assertEqual(result["skipped_clients"], [])
+        self.assertEqual(result["cleanup_pending"], [])
+        self.assertEqual(len(result["deployments"]), 2)
+        for client in clients:
+            destination = client.skills_dir / "alpha"
+            target = destination.resolve()
+            self.assertNotEqual(target, old_targets[client.id].resolve())
+            self.assertTrue(verify_deployment(target).ok)
+            self.assertEqual(
+                verify_deployment(target).provenance["target_client"], client.id
+            )
+        receipt = json.loads(self.receipts()[0].read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["phase"], "completed")
+        self.assertEqual(set(receipt["completed_clients"]), {"codex", "workbuddy"})
+
+    def test_render_failure_restores_active_session_and_old_canonical(self):
+        clients = self.clients("codex")
+        old_target = self.install_current_deployment(clients[0])
+        session = self.begin_changed()
+
+        with mock.patch.object(
+            core_module, "detect_clients", return_value=clients
+        ), mock.patch.object(
+            core_module,
+            "render_base_deployment",
+            side_effect=OSError("render failed"),
+        ):
+            with self.assertRaises(SkillSyncError) as raised:
+                edit_apply(session["session_id"], config_path=self.config_path)
+
+        self.assertEqual(raised.exception.code, "edit_apply_failed")
+        self.assertEqual(hash_skill_dir(self.skill), session["baseline_hash"])
+        self.assertEqual(
+            (clients[0].skills_dir / "alpha").resolve(), old_target.resolve()
+        )
+        self.assertEqual(
+            EditSessionStore(self.data_root).load(session["session_id"]).status,
+            EditSessionStatus.ACTIVE,
+        )
+        receipt = json.loads(self.receipts()[0].read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "rolled-back")
+
+    def test_link_move_fsync_failure_restores_link_and_canonical(self):
+        clients = self.clients("codex")
+        old_target = self.install_current_deployment(clients[0])
+        destination = clients[0].skills_dir / "alpha"
+        original_link_text = os.readlink(destination)
+        original_identity = linking_module._link_identity(destination)
+        session = self.begin_changed()
+        real_fsync = linking_module._fsync_link_directory
+        calls = 0
+
+        def fail_first_link_fsync(directory):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("injected link fsync failure")
+            return real_fsync(directory)
+
+        with mock.patch.object(
+            core_module, "detect_clients", return_value=clients
+        ), mock.patch.object(
+            linking_module,
+            "_fsync_link_directory",
+            side_effect=fail_first_link_fsync,
+        ):
+            with self.assertRaises(SkillSyncError) as raised:
+                edit_apply(session["session_id"], config_path=self.config_path)
+
+        self.assertEqual(raised.exception.code, "edit_apply_failed")
+        self.assertEqual(hash_skill_dir(self.skill), session["baseline_hash"])
+        self.assertEqual(os.readlink(destination), original_link_text)
+        self.assertEqual(linking_module._link_identity(destination), original_identity)
+        self.assertEqual(destination.resolve(), old_target.resolve())
+        self.assertEqual(
+            EditSessionStore(self.data_root).load(session["session_id"]).status,
+            EditSessionStatus.ACTIVE,
+        )
+
+    def test_disabled_and_undetected_clients_are_reported_without_mutation(self):
+        codex, workbuddy, claude = self.clients(
+            "codex", "workbuddy", "claude-code"
+        )
+        workbuddy = AgentClient(
+            workbuddy.id,
+            workbuddy.family_id,
+            workbuddy.display_name,
+            workbuddy.skills_dir,
+            False,
+        )
+        config = load_config(self.config_path)
+        config["disabled_agents"] = ["claude"]
+        save_config(self.config_path, config)
+        session = self.begin_changed()
+
+        with mock.patch.object(
+            core_module,
+            "detect_clients",
+            return_value=[codex, workbuddy, claude],
+        ):
+            result = edit_apply(session["session_id"], config_path=self.config_path)
+
+        self.assertEqual(result["clients_relinked"], 1)
+        self.assertEqual(
+            result["skipped_clients"],
+            [
+                {"client": "workbuddy", "reason": "undetected"},
+                {"client": "claude-code", "reason": "disabled"},
+            ],
+        )
+        self.assertTrue((codex.skills_dir / "alpha").is_symlink())
+        self.assertFalse((workbuddy.skills_dir / "alpha").exists())
+        self.assertFalse((claude.skills_dir / "alpha").exists())
+
+    def test_second_link_failure_restores_exact_chain_and_canonical(self):
+        codex, claude = self.clients("codex", "claude-code")
+        codex.skills_dir.mkdir(parents=True)
+        claude.skills_dir.mkdir(parents=True)
+        codex_link = codex.skills_dir / "alpha"
+        claude_link = claude.skills_dir / "alpha"
+        codex_link.symlink_to(self.skill, target_is_directory=True)
+        relative_codex = os.path.relpath(codex_link, claude_link.parent)
+        claude_link.symlink_to(relative_codex, target_is_directory=True)
+        original_targets = (os.readlink(codex_link), os.readlink(claude_link))
+        session = self.begin_changed()
+        real_apply = core_module.DirectoryLinkSwap.apply
+        calls = 0
+
+        def fail_second_link(swap):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("second client swap failed")
+            return real_apply(swap)
+
+        with mock.patch.object(
+            core_module, "detect_clients", return_value=[codex, claude]
+        ), mock.patch.object(
+            core_module.DirectoryLinkSwap,
+            "apply",
+            autospec=True,
+            side_effect=fail_second_link,
+        ):
+            with self.assertRaises(SkillSyncError) as raised:
+                edit_apply(session["session_id"], config_path=self.config_path)
+
+        self.assertEqual(raised.exception.code, "edit_apply_failed")
+        self.assertEqual(hash_skill_dir(self.skill), session["baseline_hash"])
+        self.assertEqual(
+            (os.readlink(codex_link), os.readlink(claude_link)), original_targets
+        )
+        self.assertEqual(claude_link.resolve(), self.skill.resolve())
+        self.assertEqual(
+            EditSessionStore(self.data_root).load(session["session_id"]).status,
+            EditSessionStatus.ACTIVE,
+        )
+
+    def test_link_rollback_failure_keeps_new_canonical_and_marks_recovery(self):
+        clients = self.clients("codex", "workbuddy")
+        for client in clients:
+            self.install_current_deployment(client)
+        session = self.begin_changed()
+        workspace_hash = hash_skill_dir(Path(session["workspace_path"]))
+        real_apply = core_module.DirectoryLinkSwap.apply
+        calls = 0
+
+        def fail_second_link(swap):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("second client swap failed")
+            return real_apply(swap)
+
+        with mock.patch.object(
+            core_module, "detect_clients", return_value=clients
+        ), mock.patch.object(
+            core_module.DirectoryLinkSwap,
+            "apply",
+            autospec=True,
+            side_effect=fail_second_link,
+        ), mock.patch.object(
+            core_module.DirectoryLinkSwap,
+            "rollback",
+            autospec=True,
+            return_value=False,
+        ):
+            with self.assertRaises(SkillSyncError) as raised:
+                edit_apply(session["session_id"], config_path=self.config_path)
+
+        self.assertEqual(raised.exception.code, "edit_apply_recovery_required")
+        self.assertEqual(hash_skill_dir(self.skill), workspace_hash)
+        self.assertEqual(
+            EditSessionStore(self.data_root).load(session["session_id"]).status,
+            EditSessionStatus.NEEDS_RECOVERY,
+        )
+        receipt = json.loads(self.receipts()[0].read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "needs-recovery")
+
+    def test_plain_cleanup_error_after_commit_is_reported_without_rollback(self):
+        clients = self.clients("codex")
+        self.install_current_deployment(clients[0])
+        session = self.begin_changed()
+        workspace_hash = hash_skill_dir(Path(session["workspace_path"]))
+
+        with mock.patch.object(
+            core_module, "detect_clients", return_value=clients
+        ), mock.patch.object(
+            core_module.DirectoryLinkSwap,
+            "finalize",
+            autospec=True,
+            side_effect=OSError("cleanup failed"),
+        ):
+            result = edit_apply(session["session_id"], config_path=self.config_path)
+
+        self.assertEqual(hash_skill_dir(self.skill), workspace_hash)
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(len(result["cleanup_pending"]), 1)
+        self.assertEqual(
+            EditSessionStore(self.data_root).load(session["session_id"]).status,
+            EditSessionStatus.APPLIED,
+        )
+        receipt = json.loads(self.receipts()[0].read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "cleanup-pending")
+        self.assertEqual(receipt["cleanup_pending"], result["cleanup_pending"])
+
+    def test_rollback_cleanup_error_keeps_session_and_receipt_rolled_back(self):
+        session = self.begin_changed()
+        original_hash = hash_skill_dir(self.skill)
+        original_transition = EditSessionStore.transition_locked
+
+        def fail_applied_transition(store, session_id, status, **kwargs):
+            if status is EditSessionStatus.APPLIED:
+                raise OSError("simulated metadata failure")
+            return original_transition(store, session_id, status, **kwargs)
+
+        with mock.patch.object(
+            EditSessionStore,
+            "transition_locked",
+            autospec=True,
+            side_effect=fail_applied_transition,
+        ), mock.patch.object(
+            edit_apply_module.CanonicalSwap,
+            "finalize",
+            autospec=True,
+            side_effect=OSError("rollback cleanup failed"),
+        ):
+            with self.assertRaises(SkillSyncError) as raised:
+                edit_apply(session["session_id"], config_path=self.config_path)
+
+        self.assertEqual(raised.exception.code, "edit_apply_failed")
+        self.assertEqual(hash_skill_dir(self.skill), original_hash)
+        self.assertEqual(
+            EditSessionStore(self.data_root).load(session["session_id"]).status,
+            EditSessionStatus.ACTIVE,
+        )
+        receipt = json.loads(self.receipts()[0].read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "rolled-back")
+        self.assertEqual(len(receipt["cleanup_pending"]), 1)
 
     def test_apply_rejects_stale_canonical_without_creating_backup_or_receipt(self):
         session = self.begin_changed()

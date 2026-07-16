@@ -9,8 +9,173 @@ import subprocess
 import uuid
 from pathlib import Path
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from skill_sync.copying import rename_no_replace
+
+
+class DirectoryLinkSwapRecoveryRequired(OSError):
+    """A link swap could not restore an exact previous endpoint object."""
+
+    def __init__(self, message: str, *, recovery_path: Path) -> None:
+        super().__init__(message)
+        self.recovery_path = recovery_path
+
+
+@dataclass
+class DirectoryLinkSwap:
+    """Delay deletion of an original symlink/junction until global commit."""
+
+    source: Path
+    destination: Path
+    backup: Path
+    allowed_current_sources: tuple[Path, ...]
+    old_identity: tuple[int, int, int] | None
+    installed_identity: tuple[int, int, int] | None = None
+    backup_moved: bool = False
+
+    @classmethod
+    def prepare(
+        cls,
+        source: Path,
+        destination: Path,
+        *,
+        allowed_current_sources: Iterable[Path] = (),
+        token: str,
+    ) -> "DirectoryLinkSwap":
+        source = Path(source)
+        destination = Path(destination)
+        allowed = tuple(Path(item) for item in allowed_current_sources)
+        if link_state(source, destination) == "linked":
+            raise ValueError(f"link already points at requested source: {destination}")
+        exists = (
+            destination.exists()
+            or destination.is_symlink()
+            or _is_directory_link(destination)
+        )
+        old_identity: tuple[int, int, int] | None = None
+        if exists:
+            if not _is_directory_link(destination):
+                raise FileExistsError(
+                    f"refusing to replace a real Agent directory: {destination}"
+                )
+            if not any(link_state(old, destination) == "linked" for old in allowed):
+                raise FileExistsError(
+                    f"refusing to replace an unowned Agent link: {destination}"
+                )
+            old_identity = _link_identity(destination)
+            if old_identity is None:
+                raise OSError(f"could not identify Agent link: {destination}")
+        backup = destination.with_name(f".{destination.name}.edit-previous-{token}")
+        if backup.exists() or backup.is_symlink() or _is_directory_link(backup):
+            raise FileExistsError(f"link transaction backup already exists: {backup}")
+        return cls(source, destination, backup, allowed, old_identity)
+
+    def apply(self) -> str:
+        if self.old_identity is not None:
+            if (
+                _link_identity(self.destination) != self.old_identity
+                or not any(
+                    link_state(old, self.destination) == "linked"
+                    for old in self.allowed_current_sources
+                )
+            ):
+                raise FileExistsError(
+                    f"Agent link changed before swap: {self.destination}"
+                )
+
+        try:
+            if self.old_identity is not None:
+                rename_no_replace(self.destination, self.backup)
+                self.backup_moved = True
+                _fsync_link_directory(self.destination.parent)
+                moved_identity = _link_identity(self.backup)
+                if (
+                    moved_identity != self.old_identity
+                    or not _is_directory_link(self.backup)
+                ):
+                    raise OSError("moved Agent link failed identity verification")
+
+            method = create_directory_link(self.source, self.destination)
+            self.installed_identity = _link_identity(self.destination)
+            if self.installed_identity is None:
+                raise OSError(f"installed Agent link has no identity: {self.destination}")
+            if link_state(self.source, self.destination) != "linked":
+                raise OSError(f"installed Agent link failed verification: {self.destination}")
+            _fsync_link_directory(self.destination.parent)
+            return method
+        except Exception as exc:
+            try:
+                rolled_back = self.rollback()
+            except Exception:
+                rolled_back = False
+            if rolled_back:
+                raise OSError("Agent link swap was rolled back") from exc
+            raise DirectoryLinkSwapRecoveryRequired(
+                "Agent link swap failed and the previous endpoint could not be restored",
+                recovery_path=self.backup,
+            ) from exc
+
+    def rollback(self) -> bool:
+        failed: Path | None = None
+        failed_identity: tuple[int, int, int] | None = None
+        if (
+            self.destination.exists()
+            or self.destination.is_symlink()
+            or _is_directory_link(self.destination)
+        ):
+            if (
+                self.installed_identity is None
+                or _link_identity(self.destination) != self.installed_identity
+                or link_state(self.source, self.destination) != "linked"
+            ):
+                return False
+            failed = self.destination.with_name(
+                f".{self.destination.name}.edit-failed-{uuid.uuid4().hex}"
+            )
+            rename_no_replace(self.destination, failed)
+            failed_identity = _link_identity(failed)
+            _fsync_link_directory(self.destination.parent)
+            if failed_identity != self.installed_identity:
+                if failed_identity is not None and not self.destination.exists():
+                    _restore_link_object(failed, self.destination, failed_identity)
+                return False
+
+        if self.old_identity is not None:
+            if not self._restore_identity(self.old_identity):
+                if failed is not None and not self.destination.exists():
+                    _restore_link_object(failed, self.destination, failed_identity)
+                return False
+            self.backup_moved = False
+        elif (
+            self.destination.exists()
+            or self.destination.is_symlink()
+            or _is_directory_link(self.destination)
+        ):
+            return False
+
+        if failed is not None and not _remove_owned_link_object(
+            failed, failed_identity
+        ):
+            return False
+        _fsync_link_directory(self.destination.parent)
+        return True
+
+    def finalize(self) -> None:
+        if self.backup_moved and not _remove_owned_link_object(
+            self.backup, self.old_identity
+        ):
+            raise DirectoryLinkSwapRecoveryRequired(
+                "could not remove committed Agent link backup",
+                recovery_path=self.backup,
+            )
+        self.backup_moved = False
+        _fsync_link_directory(self.destination.parent)
+
+    def _restore_identity(self, identity: tuple[int, int, int]) -> bool:
+        if _link_identity(self.backup) != identity:
+            return False
+        return _restore_link_object(self.backup, self.destination, identity)
 
 
 def link_state(source: Path, destination: Path) -> str:
@@ -23,6 +188,8 @@ def link_state(source: Path, destination: Path) -> str:
         if os.name == "nt" and _same_file(source, destination):
             return "linked"
         return "conflict"
+    if os.name == "nt" and _is_windows_reparse_point(destination):
+        return "broken-link"
     return "missing"
 
 
@@ -226,6 +393,55 @@ def _remove_verified_link_path(
     else:
         return False
     return True
+
+
+def _restore_link_object(
+    moved: Path,
+    destination: Path,
+    identity: tuple[int, int, int] | None,
+) -> bool:
+    if identity is None or _link_identity(moved) != identity:
+        return False
+    if destination.exists() or destination.is_symlink() or _is_directory_link(destination):
+        return False
+    try:
+        rename_no_replace(moved, destination)
+    except (OSError, FileExistsError):
+        return False
+    _fsync_link_directory(destination.parent)
+    return _link_identity(destination) == identity
+
+
+def _remove_owned_link_object(
+    path: Path, identity: tuple[int, int, int] | None
+) -> bool:
+    if identity is None or _link_identity(path) != identity or not _is_directory_link(path):
+        return False
+    if path.is_symlink():
+        path.unlink()
+    elif os.name == "nt" and _is_windows_reparse_point(path):
+        if not _remove_windows_reparse_directory(path, identity):
+            return False
+    else:
+        return False
+    _fsync_link_directory(path.parent)
+    return True
+
+
+def _fsync_link_directory(directory: Path) -> None:
+    if not directory.is_dir() or directory.is_symlink():
+        raise OSError(f"link parent must be a real directory: {directory}")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError:
+        if os.name == "nt":
+            return
+        raise
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _same_file(source: Path, destination: Path) -> bool:
