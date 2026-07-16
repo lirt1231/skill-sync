@@ -923,6 +923,7 @@ Batch B 完成后，产品具备“多设备同步 + 多 Agent Client 适配管�
 | 6.6 | `add web operation progress states` | 为 refresh 和现有 mutation 增加 operation-specific loading、按钮禁用、成功/失败结果；不改变 core action | 重复点击只产生一次请求；刷新保留 view、筛选、选择和详情状态 |
 | 6.7 | `fix web detail drawer navigation` | drawer 固定可见、独立滚动、Escape 关闭、打开和关闭焦点恢复；不增加详情字段 | 从长列表底部打开立即可见；Tab/Shift+Tab/Enter/Escape 测试 |
 | 6.8 | `add inventory filters and agent labels` | 常驻搜索、同步状态/来源/Agent 筛选、可见 Agent 标签；不增加 Variant badge | 组合筛选、全选仅作用于可见项、状态不只依赖颜色 |
+| 6.9-pre | `serialize delete with managed edits` | delete 按稳定顺序持有 deployment + 每 Skill lock，并在锁内阻止 unfinished edit session；不改 Web/API | begin/delete 双向真实争用无 TOCTOU；大小写同锁去重；非法名称加锁前失败 |
 | 6.9 | `add web mutation preview models` | 为 sync、import、agent enable/disable、link repair、delete 提供复用 core 的只读 plan JSON；不改 UI | preview 不写文件、不 fetch、不 commit、不 push；plan 与正式 action 输入一致 |
 | 6.10 | `add web mutation confirmation flows` | 用统一 plan -> confirm -> running -> result 交互替换原生 confirm；多项永久删除加强确认 | 确认前零 mutation；展示受影响 Skill/client、backup/recovery 信息；失败后保留可操作结果 |
 

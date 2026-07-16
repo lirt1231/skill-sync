@@ -11,6 +11,7 @@ import os
 import shutil
 import time
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -4190,16 +4191,145 @@ def delete_global_skills(
     names: Iterable[str],
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    config = _load_local_config(config_path)
+    requested_names = _validate_delete_names(names)
+    initial_config = _load_local_config(config_path)
+    locked_data_root = _data_root(initial_config)
     try:
-        with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
-            return _delete_global_skills_unlocked(
-                names, config_path, _config=config
+        with local_file_lock(locked_data_root / "locks" / "deployment.lock"):
+            config = _load_local_config(config_path)
+            if _data_root(config) != locked_data_root:
+                raise SkillSyncError(
+                    "configured data_root changed while acquiring the deployment lock",
+                    code="delete_config_changed",
+                    exit_code=EXIT_SAFETY,
+                )
+            registry = _load_local_registry(config)
+            name_list = _resolve_delete_names(
+                requested_names,
+                global_root=_global_skill_root(config),
+                config=config,
+                registry=registry,
             )
+            store = EditSessionStore(locked_data_root)
+            with ExitStack() as skill_locks:
+                lock_names: dict[str, str] = {}
+                for name in name_list:
+                    lock_path = store.skill_lock_path(name)
+                    lock_names.setdefault(os.path.normcase(str(lock_path)), name)
+                for _, name in sorted(lock_names.items()):
+                    skill_locks.enter_context(store.skill_lock(name))
+                _assert_delete_has_no_active_edits(store, name_list)
+                return _delete_global_skills_unlocked(
+                    name_list, config_path, _config=config
+                )
     except TimeoutError as exc:
         raise SkillSyncError(
             str(exc), code="deployment_lock_timeout", exit_code=EXIT_SAFETY
         ) from exc
+
+
+def _validate_delete_names(names: Iterable[str]) -> list[str]:
+    if isinstance(names, (str, bytes)):
+        raise SkillSyncError("delete requires a list of Skill names")
+    try:
+        name_list = list(dict.fromkeys(names))
+    except (TypeError, ValueError) as exc:
+        raise SkillSyncError("delete requires a list of Skill names") from exc
+    if not name_list:
+        raise SkillSyncError("delete requires at least one Skill name")
+    for name in name_list:
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).name != name
+            or name in {".", ".."}
+        ):
+            raise SkillSyncError(f"invalid Skill name: {name}")
+    return name_list
+
+
+def _resolve_delete_names(
+    name_list: Iterable[str],
+    *,
+    global_root: Path,
+    config: dict[str, Any],
+    registry: dict[str, Any],
+) -> list[str]:
+    identity_names: dict[str, set[str]] = {}
+    if is_link_or_reparse(global_root):
+        raise SkillSyncError(
+            f"global Skill root is a symlink or reparse point: {global_root}",
+            code="delete_skill_root_unsafe",
+            exit_code=EXIT_SAFETY,
+        )
+    if global_root.is_dir():
+        try:
+            children = list(global_root.iterdir())
+        except OSError as exc:
+            raise SkillSyncError(
+                f"cannot safely inspect global Skill names: {exc}",
+                code="delete_skill_names_unreadable",
+                exit_code=EXIT_SAFETY,
+            ) from exc
+        for child in children:
+            identity_names.setdefault(child.name.casefold(), set()).add(child.name)
+    for container in (config.get("skills", {}), registry.get("skills", {})):
+        if not isinstance(container, dict):
+            raise SkillSyncError("Skill metadata must be a mapping")
+        for name in container:
+            if isinstance(name, str):
+                identity_names.setdefault(name.casefold(), set()).add(name)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for requested in name_list:
+        matches = sorted(identity_names.get(requested.casefold(), set()))
+        if len(matches) > 1:
+            raise SkillSyncError(
+                f"ambiguous case-insensitive Skill name: {requested}",
+                code="delete_skill_name_ambiguous",
+                exit_code=EXIT_SAFETY,
+                details={"requested": requested, "matches": sorted(matches)},
+            )
+        resolved = matches[0] if matches else requested
+        identity = resolved.casefold()
+        if identity not in seen:
+            seen.add(identity)
+            normalized.append(resolved)
+    return normalized
+
+
+def _assert_delete_has_no_active_edits(
+    store: EditSessionStore,
+    names: Iterable[str],
+) -> None:
+    requested = {name.casefold() for name in names}
+    blockers = [
+        metadata
+        for metadata in store.list_metadata()
+        if metadata.logical_skill.casefold() in requested
+        and metadata.status
+        in {
+            EditSessionStatus.ACTIVE,
+            EditSessionStatus.APPLYING,
+            EditSessionStatus.NEEDS_RECOVERY,
+        }
+    ]
+    if blockers:
+        raise SkillSyncError(
+            "cannot delete a Skill with an unfinished edit session",
+            code="delete_edit_session_blocked",
+            exit_code=EXIT_SAFETY,
+            details={
+                "sessions": [
+                    {
+                        "skill": item.logical_skill,
+                        "session_id": item.session_id,
+                        "status": item.status.value,
+                    }
+                    for item in blockers
+                ]
+            },
+        )
 
 
 def _delete_global_skills_unlocked(
