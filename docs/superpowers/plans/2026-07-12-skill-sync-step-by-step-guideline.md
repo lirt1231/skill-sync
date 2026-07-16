@@ -465,6 +465,58 @@ CLI 能力存在后，再让 Codex、WorkBuddy 等 Agent 强制遵循新流程�
 - 管理 Skill 不引用不存在的命令。
 - 旧版 CLI 遇到新版管理 Skill 时能得到明确升级提示。
 
+## 9.1 Step 6B：Web UI 快速稳定化
+
+### 目标
+
+在进入 Variant 开发前，先解决当前 Web UI 已经影响日常使用的性能、反馈、
+长列表导航和高风险操作问题。本阶段只稳定现有 Skill Inventory、Agent 连接、导入
+和批量操作，不提前实现 Step 10 的 Variant、Deployment Matrix 或 Edit Session UI。
+
+### 当前基线
+
+2026-07-16 的真实机器审计确认：
+
+- Figma 审计画布：[Skill Sync Web UI Audit & Roadmap](https://www.figma.com/design/D0P2RbKF6ttpoax81gdc61)，
+  按 Skill Library → Skill Detail → Agent Connections → Import Skills → Bulk Selection →
+  More Actions → Detail Scroll Loss 展示现状、健康度和对应 commit。
+
+- `/api/state` 连续三次本地请求分别约为 `2.44s`、`2.04s`、`2.00s`；普通刷新会
+  同时计算当前页面不需要的 import candidates。
+- 刷新没有明确 loading 状态；mutation 只显示通用 toast，按钮仍可重复触发。
+- 从长列表底部打开 Skill 时，详情抽屉内容仍位于文档顶部，当前视口会看到空白
+  drawer。
+- 搜索默认折叠，缺少同步状态、来源和 Agent 筛选；Agent 覆盖主要依赖无文字圆点。
+- 停用 Agent、导入、同步和永久删除缺少统一的 plan -> confirm -> result 交互；
+  删除和导入仍使用浏览器原生 confirm。
+
+### 性能和交互约束
+
+1. 普通页面打开和刷新不执行 Git fetch，不加载当前 view 不需要的大型数据。
+2. 当前 view 的 loading/disabled 反馈在用户操作后立即出现，mutation 完成前禁止
+   重复提交。
+3. 100 个 Skill 的本地 warm inventory 请求阶段目标小于 `500ms`；Step 10.6 再把
+   完整缓存刷新目标收紧到 `300ms`。
+4. 页面刷新保留当前 view、搜索、筛选、选择项和详情目标；失效目标才安全清除。
+5. 每个 mutation 都复用 core 的只读 plan 和正式 action，不在前端复制业务判断。
+6. 高风险操作在确认前不产生写入，不自动 commit，不自动 push。
+7. 键盘必须能完成导航、选择、打开/关闭详情和确认/取消；状态不能只依赖颜色。
+
+### 本阶段非目标
+
+- 不增加 Base/Family/Client Variant badge。
+- 不实现 Edit Session diff/validate/impact/apply 页面。
+- 不实现完整 Deployment Matrix、Conflict Center 或 Markdown 文件树。
+- 不重做品牌视觉，不引入新的前端框架。
+
+### 完成标准
+
+- 首页、连接和导入页只加载本 view 所需数据，真实机器延迟达到阶段目标。
+- 从列表任意位置打开详情都立即可见，drawer 独立滚动并正确恢复焦点。
+- 用户无需悬停即可判断 Skill 的同步状态和 Agent 覆盖。
+- 同步、导入、Agent 停用、修复链接和删除均先展示具体影响，再由用户确认。
+- HTTP、DOM、键盘、重复提交和 mutation-before-confirm 测试覆盖主要交互。
+
 ## 10. Step 7：实现 Variant Source 和 Resolver
 
 ### 目标
@@ -614,6 +666,10 @@ skill-sync edit begin <skill> --client codex --actor codex
 ### 目标
 
 先把已有 CLI 能力可视化，不在 UI 中发明另一套业务逻辑。
+
+Step 10 复用 Step 6B 已完成的 view-scoped loading、操作状态、详情导航、筛选和
+mutation preview 基础，只扩展 Variant、Deployment 和 Edit Session 数据模型，
+不重复实现第二套通用 Web 状态层。
 
 ### 页面顺序
 
@@ -799,6 +855,16 @@ skill-sync edit begin <skill> --client codex --actor codex
 Batch A 完成后，当前“Codex 修改软链接导致全局立即变化”的风险才算真正
 解决。
 
+### Batch A.5：稳定当前 Web UI
+
+按顺序完成 Step 6B 的 `6.5`–`6.10`。其中真实 Agent 验证 `6.2`–`6.4` 可以与
+`6.5` 的独立分支并行开发，但必须先按编号合并完 `6.2`–`6.4`，再将 `6.5`
+rebase 到最新 `main` 后进入主线。
+
+Batch A.5 完成后，当前 UI 应具备可接受的本地响应速度、长列表管理能力、键盘
+导航和高风险操作确认；Variant、Edit Session 和 Deployment Matrix 仍由 Step 10
+负责。
+
 ### Batch B：实现多 Agent Client 适配
 
 按顺序完成：
@@ -849,6 +915,17 @@ Batch B 完成后，产品具备“多设备同步 + 多 Agent Client 适配管�
 | 6.3 | `verify managed edits from workbuddy` | 只加入 WorkBuddy 真实流程和必要兼容修复 | 与 Codex 相同的完整闭环 |
 | 6.4 | `verify managed edits from remaining clients` | Claude、Kimi Code/Desktop 的兼容验证；独立 adapter bug 另拆 fix commit | 每个可测 client 有明确结果和限制说明 |
 
+### Step 6B：Web UI 快速稳定化
+
+| Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
+| --- | --- | --- | --- |
+| 6.5 | `lazy load web view data` | 拆分 summary/inventory/agents/import candidates 的 view-scoped 读取；导入候选只在导入页加载；暂不做通用 hash cache | 普通刷新不 fetch；100 Skill warm inventory 小于 500ms；未打开导入页时不扫描 imports |
+| 6.6 | `add web operation progress states` | 为 refresh 和现有 mutation 增加 operation-specific loading、按钮禁用、成功/失败结果；不改变 core action | 重复点击只产生一次请求；刷新保留 view、筛选、选择和详情状态 |
+| 6.7 | `fix web detail drawer navigation` | drawer 固定可见、独立滚动、Escape 关闭、打开和关闭焦点恢复；不增加详情字段 | 从长列表底部打开立即可见；Tab/Shift+Tab/Enter/Escape 测试 |
+| 6.8 | `add inventory filters and agent labels` | 常驻搜索、同步状态/来源/Agent 筛选、可见 Agent 标签；不增加 Variant badge | 组合筛选、全选仅作用于可见项、状态不只依赖颜色 |
+| 6.9 | `add web mutation preview models` | 为 sync、import、agent enable/disable、link repair、delete 提供复用 core 的只读 plan JSON；不改 UI | preview 不写文件、不 fetch、不 commit、不 push；plan 与正式 action 输入一致 |
+| 6.10 | `add web mutation confirmation flows` | 用统一 plan -> confirm -> running -> result 交互替换原生 confirm；多项永久删除加强确认 | 确认前零 mutation；展示受影响 Skill/client、backup/recovery 信息；失败后保留可操作结果 |
+
 ### Step 7：Variant Source 和 Resolver
 
 | Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
@@ -884,12 +961,12 @@ Batch B 完成后，产品具备“多设备同步 + 多 Agent Client 适配管�
 
 | Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
 | --- | --- | --- | --- |
-| 10.1 | `add deployment and session web read models` | 复用 core 的只读 API；不改页面 | Web/CLI 同输入输出一致，普通请求不 fetch |
+| 10.1 | `add deployment and session web read models` | 在 Step 6B 通用 Web 状态层上增加 Variant、Deployment 和 Session 只读模型；不改页面 | Web/CLI 同输入输出一致，普通请求不 fetch |
 | 10.2 | `show managed skill inventory` | inventory、source hash、deployment/session/variant badges | 搜索、选择和空状态测试 |
 | 10.3 | `show family client deployment matrix` | client matrix、Kimi 分组、stale/tampered/conflict 状态 | 具体 client 问题不被 family 汇总掩盖 |
 | 10.4 | `add managed edit session interface` | begin/diff/validate/impact/apply/abort UI | mutation 都显示 plan/result，不能写 deployment |
 | 10.5 | `add tamper recovery interface` | capture/discard recovery UI | 高风险动作确认、错误时保留恢复信息 |
-| 10.6 | `cache web inventory hashes` | affected-only refresh 和 hash cache；不改变业务状态 | 100 Skill 缓存刷新目标小于 300 ms |
+| 10.6 | `cache web inventory hashes` | 在 6.5 view-scoped loading 上增加 affected-only refresh 和持久 hash cache；不改变业务状态 | 100 Skill 完整缓存刷新目标小于 300 ms |
 
 ### Step 11：Adapter 扩展
 
@@ -959,7 +1036,8 @@ Batch B 完成后，产品具备“多设备同步 + 多 Agent Client 适配管�
 | --- | --- | --- | --- |
 | `5.1` 完成 | `5.2`、`5.3` | 先合并 `5.2`，`5.3` rebase 后验收 | 中：可能同时修改 edit CLI |
 | `5.3` 完成 | `5.4`、`5.5` | 按 ID 合并；`5.6` 等两者完成 | 高：diff/validation 与 impact 相对独立 |
-| `6.1` 完成 | `6.2`、`6.3`、`6.4` | 各 client 兼容修复不得混入其他分支 | 高：真实 Agent 流程相互独立 |
+| `6.1` 完成 | `6.2`、`6.3`、`6.4`、`6.5` | 先按 ID 合并 client 验证；`6.5` 不夹带 Agent 兼容修复，最后 rebase 合并 | 高：真实 Agent 流程与 view loading 相互独立 |
+| `6.6` 完成 | `6.7`、`6.9` | `6.7` 只改 drawer/focus；`6.9` 只做 core preview model，按 ID 合并 | 高：前端导航与只读 core plan 相互独立 |
 | `7.1` 完成 | `7.2`、`7.4` | `7.2` 先进入 resolver 主链；`7.4` rebase 后合并 | 中：core overlay 与 source CLI 分离 |
 | `10.1` 完成 | `10.2`、`10.3` | 拆分页面组件，按 ID 合并并重跑前端测试 | 中：业务独立但可能共享页面文件 |
 | `11.3` 完成 | `11.4`–`11.8` | 每个 adapter 单独 commit，按 ID 合并 | 最高：Agent adapter 相互独立 |
@@ -977,6 +1055,10 @@ Batch B 完成后，产品具备“多设备同步 + 多 Agent Client 适配管�
     └── 5.5
         ↓
 5.6 → 5.7 → 5.8 → 5.9 → 6.1
+
+6.2 → 6.3 → 6.4 → 6.5 → 6.6
+                         ├── 6.7 → 6.8 ─┐
+                         └── 6.9 ───────┴→ 6.10
 
 7.2 → 7.3 → 7.5 → 7.6
 8.1 → 8.2 → 8.3 → 8.4 → 8.5
@@ -1054,10 +1136,13 @@ deployment 只允许先预览，再由用户明确选择 capture 或 discard。
 
 该 Skill 已通过结构校验和独立前向测试，并通过 edit session 应用到 canonical；
 Codex、WorkBuddy、Kimi Code、Kimi Desktop、Claude Code 共 5 个 deployment 已重建并
-保持 `linked-render`。对应 `agent-skills` 本地 commit 为 `6c737de`，尚未 push。
+保持 `linked-render`。对应 `agent-skills` commit 为 `6c737de`，已推送到远程
+`main`。
 
-下一 commit 是 `6.2 verify managed edits from codex`：只加入 Codex 真实流程 fixture、
-执行记录和必要兼容修复，验证 Codex 不写 deployment/canonical，也不隐式 push。
+下一批是 `6.2`–`6.4` 的真实 Agent 验证；三项可以在独立分支并行开发并按编号
+合并。同时可以并行开发 `6.5 lazy load web view data`，但必须等 `6.2`–`6.4` 进入
+`main` 后 rebase 再合并。随后按 Step 6B 的 `6.6`–`6.10` 完成当前 Web UI
+稳定化，再进入 `7.1 add strict variant manifest parser`。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 
