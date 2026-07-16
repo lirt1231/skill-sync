@@ -6,7 +6,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from skill_sync.hash import hash_skill_dir
+from skill_sync.hash import (
+    hash_skill_dir,
+    hash_skill_files_with_modes,
+    portable_skill_file_mode,
+)
 
 
 def write_file(root: Path, relative_path: str, data: bytes) -> None:
@@ -39,6 +43,15 @@ def old_delimiter_hash(entries: dict[str, bytes]) -> str:
 
 
 class HashSkillDirTest(unittest.TestCase):
+    def test_mode_aware_hash_uses_portable_content_semantics(self):
+        content = (("SKILL.md", b"# Example\n", 0o644),)
+
+        self.assertEqual(portable_skill_file_mode(b"# Example\n"), 0o644)
+        self.assertEqual(portable_skill_file_mode(b"#!/bin/sh\nexit 0\n"), 0o755)
+        self.assertEqual(hash_skill_files_with_modes(content), hash_skill_files_with_modes(content))
+        with self.assertRaisesRegex(ValueError, "portable content mode"):
+            hash_skill_files_with_modes((("SKILL.md", b"# Example\n", 0o755),))
+
     def test_hash_is_deterministic_regardless_of_file_creation_order(self):
         entries = {
             "SKILL.md": b"# Example\n",

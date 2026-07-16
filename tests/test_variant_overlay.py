@@ -374,6 +374,11 @@ class VariantOverlaySafetyTest(unittest.TestCase):
                     (),
                     (VariantOverlayFile("SKILL.md", b"# Skill\n", 0o1000),),
                 ),
+                "non-portable mode": VariantOverlayPlan(
+                    base,
+                    (),
+                    (VariantOverlayFile("SKILL.md", b"# Skill\n", 0o751),),
+                ),
                 "collision": VariantOverlayPlan(
                     base,
                     (),
@@ -418,7 +423,7 @@ class VariantOverlaySafetyTest(unittest.TestCase):
                     self.assertFalse(destination.exists())
 
     @unittest.skipIf(os.name == "nt", "POSIX executable bits are unavailable")
-    def test_materialization_preserves_authored_file_mode(self):
+    def test_materialization_derives_executable_mode_from_shebang_content(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             work = Path(temp_dir)
             base = self.make_base(work)
@@ -429,7 +434,37 @@ class VariantOverlaySafetyTest(unittest.TestCase):
 
             materialize_variant_overlay(plan, destination)
 
-            self.assertEqual((destination / "scripts/run.sh").stat().st_mode & 0o777, 0o751)
+            self.assertEqual((destination / "scripts/run.sh").stat().st_mode & 0o777, 0o755)
+
+    def test_windows_source_and_materialization_modes_use_content_semantics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            work = Path(temp_dir)
+            base = self.make_base(work)
+            script = write(base, "scripts/run.sh", b"#!/bin/sh\n")
+            script.chmod(0o644)
+            plan = plan_variant_overlay(base, ())
+            planned_script = next(
+                entry
+                for entry in plan.files
+                if entry.relative_path == "scripts/run.sh"
+            )
+            destination = work / "resolved"
+            import skill_sync.variant_overlay as variant_overlay
+
+            original_mode = variant_overlay._materialized_file_mode
+            with mock.patch.object(
+                variant_overlay,
+                "_materialized_file_mode",
+                side_effect=lambda st_mode, content: original_mode(
+                    st_mode,
+                    content,
+                    platform="nt",
+                ),
+            ):
+                materialize_variant_overlay(plan, destination)
+
+            self.assertEqual(planned_script.mode, 0o755)
+            self.assertEqual((destination / "scripts/run.sh").read_bytes(), b"#!/bin/sh\n")
 
 
 if __name__ == "__main__":

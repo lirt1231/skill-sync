@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 from skill_sync.agents import AGENT_FAMILIES
 from skill_sync.hash import is_link_or_reparse
-from skill_sync.registry import load_registry
+from skill_sync.registry import parse_registry_text
 
 
 VARIANT_MANIFEST_FILE = "variant.yaml"
@@ -69,7 +69,32 @@ def load_variant_manifest(
 
     variant_root = manifest_path.parent
     _validate_variant_tree(variant_root)
-    raw = load_registry(manifest_path)
+    try:
+        content = manifest_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"Cannot read Variant manifest: {manifest_path}") from exc
+    return parse_variant_manifest_bytes(
+        content,
+        directory_target=variant_root.name,
+        expected_target=expected_target,
+    )
+
+
+def parse_variant_manifest_bytes(
+    content: bytes,
+    *,
+    directory_target: str,
+    expected_target: str | None = None,
+) -> VariantManifest:
+    """Parse manifest semantics from the exact immutable authored bytes."""
+
+    if type(content) is not bytes:
+        raise ValueError("Variant manifest snapshot must be immutable bytes")
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Variant manifest must be valid UTF-8") from exc
+    raw = parse_registry_text(text)
     if not isinstance(raw, dict):
         raise ValueError("Variant manifest root must be a mapping")
 
@@ -87,7 +112,6 @@ def load_variant_manifest(
     target = raw["target"]
     if not isinstance(target, str) or target not in known_variant_targets():
         raise ValueError(f"Unknown variant target: {target!r}")
-    directory_target = variant_root.name
     if target != directory_target:
         raise ValueError(
             f"Variant target {target!r} does not match directory {directory_target!r}"

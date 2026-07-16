@@ -620,13 +620,29 @@ Deliverables:
   requires `managed check` before every Skill modification.
 - Hashing, path traversal, symlink, atomic build, and cleanup tests.
 
-Implementation checkpoint: commits 7.1 and 7.2 now provide the strict
-`variant.yaml` parser and the registry-independent file overlay core. The core
-accepts caller-ordered layers, snapshots Base and Variant bytes read-only,
-applies delete then add/replace semantics, excludes `variant.yaml`, and
-publishes only through a staged no-replace rename. Layer selection, hashes,
-resolution provenance, registry integration, and CLI exposure remain in 7.3+
-and must not be inferred from the 7.2 API.
+Implementation checkpoint: commits 7.1 through 7.3 now provide the strict
+`variant.yaml` parser, registry-independent file overlay core, and read-only
+layered resolution provenance. The resolver derives the registered family from
+an exact client ID, selects Base → family → exact-client sources, applies a
+shared family/client target only once when the IDs coincide, and records
+immutable ordered layer metadata. Every source layer has a deterministic
+mode-aware hash over the exact immutable bytes and normalized file modes used
+by the overlay plan. Modes use host-independent content semantics: immutable
+bytes beginning with a `#!` shebang become `0755`; every other regular file
+becomes `0644`. Host `st_mode` is never a resolution input, so chmod-only
+differences across macOS and Windows do not change output identity. The same
+planned mode is materialized, with exact staged-mode verification on POSIX and
+content-semantic verification on Windows. Variant manifest semantics are parsed
+directly from the captured `variant.yaml` bytes stored in that layer, so the
+hashed input and applied delete behavior cannot diverge during a race. The
+resolution hash length-prefixes resolver version, exact client, family,
+ordered layer roles/targets, and layer hashes. Local source paths and
+filesystem identities remain explanation/safety evidence but are deliberately
+excluded from the portable hash. Applicable target names plus directory
+identities are rescanned before return; appearance, removal, replacement, or
+case ambiguity fails closed. Registry integration, rendered provenance files,
+CLI exposure, and cache mutation remain later commits and must not be inferred
+from this read-only API.
 
 Acceptance criteria:
 

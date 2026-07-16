@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 import struct
+from collections.abc import Iterable
 from pathlib import Path
 
 IGNORED_DIR_NAMES = frozenset({"__pycache__", ".git"})
@@ -52,10 +53,101 @@ def hash_skill_dir(path: str | Path) -> str:
     if not root.is_dir():
         raise ValueError(f"Skill path is not a directory: {root}")
 
+    return hash_skill_files(
+        (relative_path, file_path.read_bytes())
+        for relative_path, file_path in _iter_hashable_files(root)
+    )
+
+
+def hash_skill_files(files: Iterable[tuple[str, bytes]]) -> str:
+    """Hash an immutable Skill file snapshot with directory-hash framing.
+
+    Paths are sorted before hashing so callers such as the Variant resolver can
+    hash an in-memory overlay plan without materializing it first. File modes
+    remain intentionally excluded, matching :func:`hash_skill_dir`.
+    """
+
+    entries = tuple(files)
+    for relative_path, content in entries:
+        if not isinstance(relative_path, str) or not relative_path:
+            raise ValueError("Skill hash paths must be non-empty strings")
+        if type(content) is not bytes:
+            raise ValueError(f"Skill hash content must be immutable bytes: {relative_path}")
+    paths = [relative_path for relative_path, _ in entries]
+    if len(set(paths)) != len(paths):
+        raise ValueError("Skill hash snapshot contains duplicate paths")
+
     digest = hashlib.sha256()
-    for relative_path, file_path in _iter_hashable_files(root):
-        _update_file_hash(digest, relative_path, file_path.read_bytes())
+    for relative_path, content in sorted(entries, key=lambda item: item[0]):
+        _update_file_hash(digest, relative_path, content)
     return f"sha256:{digest.hexdigest()}"
+
+
+def portable_skill_file_mode(content: bytes) -> int:
+    """Return a host-independent planned mode derived only from file bytes.
+
+    A file whose immutable content starts with a shebang is executable
+    (``0755``); every other regular file is ``0644``. Host ``st_mode`` is never
+    an authored input, so the same source bytes resolve identically on POSIX
+    and Windows filesystems.
+    """
+
+    if type(content) is not bytes:
+        raise ValueError("Skill mode content must be immutable bytes")
+    return 0o755 if content.startswith(b"#!") else 0o644
+
+
+def hash_skill_files_with_modes(
+    files: Iterable[tuple[str, bytes, int]],
+) -> str:
+    """Hash immutable Skill files including normalized executable semantics."""
+
+    entries = tuple(files)
+    paths: list[str] = []
+    normalized: list[tuple[str, bytes, int]] = []
+    for relative_path, content, mode in entries:
+        if not isinstance(relative_path, str) or not relative_path:
+            raise ValueError("Skill hash paths must be non-empty strings")
+        if type(content) is not bytes:
+            raise ValueError(f"Skill hash content must be immutable bytes: {relative_path}")
+        paths.append(relative_path)
+        expected_mode = portable_skill_file_mode(content)
+        if mode != expected_mode:
+            raise ValueError(
+                f"Skill hash mode does not match portable content mode: {relative_path}"
+            )
+        normalized.append((relative_path, content, expected_mode))
+    if len(set(paths)) != len(paths):
+        raise ValueError("Skill hash snapshot contains duplicate paths")
+
+    digest = hashlib.sha256()
+    for relative_path, content, mode in sorted(normalized, key=lambda item: item[0]):
+        digest.update(b"file-mode-v1\0")
+        _update_length_prefixed(digest, relative_path.encode("utf-8"))
+        _update_length_prefixed(digest, f"{mode:04o}".encode("ascii"))
+        _update_length_prefixed(digest, content)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def hash_portable_skill_dir(path: str | Path) -> str:
+    """Hash an actual materialized Skill and verify its portable file modes."""
+
+    root = Path(path)
+    if is_link_or_reparse(root):
+        raise ValueError(f"Cannot hash skill directory symlink or reparse point: {root}")
+    if not root.is_dir():
+        raise ValueError(f"Skill path is not a directory: {root}")
+
+    entries: list[tuple[str, bytes, int]] = []
+    for relative_path, file_path in _iter_hashable_files(root):
+        content = file_path.read_bytes()
+        mode = (
+            portable_skill_file_mode(content)
+            if os.name == "nt"
+            else stat.S_IMODE(file_path.stat().st_mode) & 0o777
+        )
+        entries.append((relative_path, content, mode))
+    return hash_skill_files_with_modes(entries)
 
 
 def _update_file_hash(digest, relative_path: str, content: bytes) -> None:
@@ -65,6 +157,11 @@ def _update_file_hash(digest, relative_path: str, content: bytes) -> None:
     digest.update(path_bytes)
     digest.update(struct.pack(">Q", len(content)))
     digest.update(content)
+
+
+def _update_length_prefixed(digest, value: bytes) -> None:
+    digest.update(struct.pack(">Q", len(value)))
+    digest.update(value)
 
 
 def _iter_hashable_files(root: Path) -> list[tuple[str, Path]]:

@@ -11,10 +11,15 @@ from pathlib import Path
 from typing import Iterable
 
 from skill_sync.copying import rename_no_replace
-from skill_sync.hash import is_ignored_path, is_link_or_reparse
+from skill_sync.hash import (
+    is_ignored_path,
+    is_link_or_reparse,
+    portable_skill_file_mode,
+)
 from skill_sync.variant import (
     VARIANT_MANIFEST_FILE,
-    load_variant_manifest,
+    VariantManifest,
+    parse_variant_manifest_bytes,
     validate_portable_relative_path,
 )
 
@@ -29,12 +34,29 @@ class VariantOverlayFile:
 
 
 @dataclass(frozen=True, slots=True)
+class VariantOverlayLayer:
+    """One exact immutable source snapshot used by an overlay plan."""
+
+    source_root: Path
+    source_identity: tuple[int, int, int, int]
+    files: tuple[VariantOverlayFile, ...]
+    manifest: VariantManifest | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceTreeSnapshot:
+    source_identity: tuple[int, int, int, int]
+    files: tuple[VariantOverlayFile, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class VariantOverlayPlan:
     """A read-only, deterministic snapshot ready for materialization."""
 
     base_root: Path
     variant_roots: tuple[Path, ...]
     files: tuple[VariantOverlayFile, ...]
+    layers: tuple[VariantOverlayLayer, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,24 +82,41 @@ def plan_variant_overlay(
     variants = tuple(Path(root) for root in variant_roots)
     resolved: dict[str, VariantOverlayFile] = {}
 
-    for source_file in _stable_source_snapshot(base):
-        if source_file.relative_path == VARIANT_MANIFEST_FILE:
-            continue
+    base_snapshot = _stable_source_snapshot(base)
+    base_files = tuple(
+        source_file
+        for source_file in base_snapshot.files
+        if source_file.relative_path != VARIANT_MANIFEST_FILE
+    )
+    layers: list[VariantOverlayLayer] = [
+        VariantOverlayLayer(
+            source_root=base.absolute(),
+            source_identity=base_snapshot.source_identity,
+            files=base_files,
+            manifest=None,
+        )
+    ]
+    for source_file in base_files:
         resolved[source_file.relative_path.casefold()] = source_file
     _validate_resolved_paths(resolved.values())
 
     for variant in variants:
-        first_snapshot = _snapshot_source_tree(variant)
-        manifest = load_variant_manifest(variant / VARIANT_MANIFEST_FILE)
-        second_snapshot = _snapshot_source_tree(variant)
-        verified_manifest = load_variant_manifest(variant / VARIANT_MANIFEST_FILE)
-        third_snapshot = _snapshot_source_tree(variant)
-        if (
-            first_snapshot != second_snapshot
-            or second_snapshot != third_snapshot
-            or manifest != verified_manifest
-        ):
-            raise ValueError(f"Variant source changed while planning overlay: {variant}")
+        variant_snapshot = _stable_source_snapshot(variant)
+        manifest_file = next(
+            (
+                entry
+                for entry in variant_snapshot.files
+                if entry.relative_path == VARIANT_MANIFEST_FILE
+            ),
+            None,
+        )
+        if manifest_file is None:
+            raise ValueError(f"Variant source is missing {VARIANT_MANIFEST_FILE}: {variant}")
+        manifest = parse_variant_manifest_bytes(
+            manifest_file.content,
+            directory_target=variant.name,
+            expected_target=variant.name,
+        )
         for deleted_path in manifest.delete:
             deleted_identity = deleted_path.casefold()
             prefix = deleted_identity + "/"
@@ -87,7 +126,15 @@ def plan_variant_overlay(
                 if identity != deleted_identity and not identity.startswith(prefix)
             }
 
-        for source_file in third_snapshot:
+        layers.append(
+            VariantOverlayLayer(
+                source_root=variant.absolute(),
+                source_identity=variant_snapshot.source_identity,
+                files=variant_snapshot.files,
+                manifest=manifest,
+            )
+        )
+        for source_file in variant_snapshot.files:
             if source_file.relative_path == VARIANT_MANIFEST_FILE:
                 continue
             identity = source_file.relative_path.casefold()
@@ -111,9 +158,10 @@ def plan_variant_overlay(
         )
     )
     return VariantOverlayPlan(
-        base_root=base.resolve(strict=True),
-        variant_roots=tuple(root.resolve(strict=True) for root in variants),
+        base_root=base.absolute(),
+        variant_roots=tuple(root.absolute() for root in variants),
         files=files,
+        layers=tuple(layers),
     )
 
 
@@ -161,7 +209,7 @@ def materialize_variant_overlay(
             shutil.rmtree(temp_root)
 
 
-def _stable_source_snapshot(root: Path) -> tuple[VariantOverlayFile, ...]:
+def _stable_source_snapshot(root: Path) -> _SourceTreeSnapshot:
     first = _snapshot_source_tree(root)
     second = _snapshot_source_tree(root)
     if first != second:
@@ -169,7 +217,7 @@ def _stable_source_snapshot(root: Path) -> tuple[VariantOverlayFile, ...]:
     return second
 
 
-def _snapshot_source_tree(root: Path) -> tuple[VariantOverlayFile, ...]:
+def _snapshot_source_tree(root: Path) -> _SourceTreeSnapshot:
     if is_link_or_reparse(root) or not root.is_dir():
         raise ValueError(f"Overlay source must be a real directory, not a link or reparse point: {root}")
 
@@ -227,7 +275,7 @@ def _snapshot_source_tree(root: Path) -> tuple[VariantOverlayFile, ...]:
     if root_after != root_before:
         raise ValueError(f"Overlay source root changed while planning: {root}")
     files.sort(key=lambda item: item.relative_path)
-    return tuple(files)
+    return _SourceTreeSnapshot(root_before, tuple(files))
 
 
 def _read_regular_file_snapshot(path: Path) -> tuple[bytes, int]:
@@ -246,8 +294,22 @@ def _read_regular_file_snapshot(path: Path) -> tuple[bytes, int]:
     finally:
         os.close(descriptor)
 
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        stat.S_IMODE(before.st_mode) & 0o777,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        stat.S_IMODE(after.st_mode) & 0o777,
+    )
     try:
         current = os.lstat(path)
     except OSError as exc:
@@ -257,10 +319,12 @@ def _read_regular_file_snapshot(path: Path) -> tuple[bytes, int]:
         current.st_ino,
         current.st_size,
         current.st_mtime_ns,
+        current.st_ctime_ns,
+        stat.S_IMODE(current.st_mode) & 0o777,
     )
     if identity_before != identity_after or identity_after != identity_current:
         raise ValueError(f"Overlay file changed while reading: {path}")
-    return content, stat.S_IMODE(before.st_mode) & 0o777
+    return content, portable_skill_file_mode(content)
 
 
 def _validate_resolved_paths(files: Iterable[VariantOverlayFile]) -> None:
@@ -299,7 +363,11 @@ def _validate_materialization_plan(plan: VariantOverlayPlan) -> None:
         identities.add(identity)
         if type(entry.content) is not bytes:
             raise ValueError(f"Overlay plan content must be immutable bytes: {relative_path}")
-        if type(entry.mode) is not int or not 0 <= entry.mode <= 0o777:
+        if (
+            type(entry.mode) is not int
+            or not 0 <= entry.mode <= 0o777
+            or portable_skill_file_mode(entry.content) != entry.mode
+        ):
             raise ValueError(f"Overlay plan mode is invalid: {relative_path}")
 
     if tuple(sorted(plan.files, key=lambda item: item.relative_path)) != plan.files:
@@ -351,13 +419,26 @@ def _verify_staged_plan(root: Path, plan: VariantOverlayPlan) -> None:
             raise ValueError(f"Staged overlay contains a link or reparse point: {path}")
         if path.is_file():
             actual[path.relative_to(root).as_posix()] = (
-                path.read_bytes(),
-                stat.S_IMODE(path.stat().st_mode) & 0o777,
+                (content := path.read_bytes()),
+                _materialized_file_mode(path.stat().st_mode, content),
             )
         elif not path.is_dir():
             raise ValueError(f"Staged overlay contains an unsupported entry: {path}")
     if actual != expected:
         raise ValueError("Staged overlay does not match the immutable resolution plan")
+
+
+def _materialized_file_mode(
+    st_mode: int,
+    content: bytes,
+    *,
+    platform: str | None = None,
+) -> int:
+    platform_name = os.name if platform is None else platform
+    permission_bits = stat.S_IMODE(st_mode) & 0o777
+    if platform_name == "nt":
+        return portable_skill_file_mode(content)
+    return permission_bits
 
 
 def _reject_destination_inside_sources(
@@ -366,7 +447,7 @@ def _reject_destination_inside_sources(
 ) -> None:
     resolved_destination = destination.resolve(strict=False)
     for source in (plan.base_root, *plan.variant_roots):
-        resolved_source = source
+        resolved_source = source.resolve(strict=False)
         if resolved_destination == resolved_source or resolved_destination.is_relative_to(
             resolved_source
         ):
@@ -375,9 +456,14 @@ def _reject_destination_inside_sources(
             )
 
 
-def _path_identity(path: Path) -> tuple[int, int, int] | None:
+def _path_identity(path: Path) -> tuple[int, int, int, int] | None:
     try:
         metadata = os.lstat(path)
     except OSError:
         return None
-    return (metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode))
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_ctime_ns,
+    )

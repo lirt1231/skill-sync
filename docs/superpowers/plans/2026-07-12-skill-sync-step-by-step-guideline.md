@@ -1206,7 +1206,7 @@ staging、逐文件核验并用 no-replace rename 原子发布，已存在或并
 
 7.2 的 golden fixtures 覆盖 Base only、Base+family、Base+client、Base+family+client、
 `kimi-desktop` 覆盖 `kimi`、目录/文件删除、共享 script 和噪音排除。该 commit 不接
-registry/CLI，不计算 layer/resolution hash，也不写 provenance；这些仍由 7.3 负责。
+registry/CLI，不计算 layer/resolution hash，也不写 provenance；这些由 7.3 补齐。
 
 commit `7.4 add variant source management commands` 已完成并 rebase 到 7.2 之后。
 CLI 新增 `variant list`、`variant create <skill> --family|--client <id>` 和
@@ -1220,8 +1220,33 @@ Codex/WorkBuddy 同名 family/client ID 和 malformed manifest 均有回归测�
 其他可检查 Variant 行；Base safety 复用 7.2 resolver 的同一个只读 Base-only plan，
 不另复制 path rules。overlay file count 只排除 target root 的 `variant.yaml`。
 
-7.2 与 7.4 的既定合并顺序至此完成。主 resolver 链下一项是
-`7.3 add layered resolution provenance`。
+commit `7.3 add layered resolution provenance` 已完成。只读 resolver 只接受已注册的
+exact client ID，自动推导 family 并选择 Base → family → exact client；Codex、WorkBuddy
+这类 family/client ID 相同的 source 只应用一次，并在 layer role 中明确说明。7.2 plan
+现在同时保留 Base 和每个 Variant 的 exact immutable layer snapshot；Base 排除 root
+`variant.yaml`，Variant 则保留 manifest bytes、file bytes 和 mode。manifest 直接从该层捕获
+的 bytes 解析，hash、delete semantics 和 provenance 共用同一个 immutable input，不再额外
+读取 live source。文件 mode 完全由 immutable content 决定：以 `#!` 开头为 `0755`，其余
+为 `0644`，host `st_mode` 不进入 resolution input，因此 macOS/Windows 的 chmod 差异不会
+制造不同 identity。layer 和 resolved output 使用 mode-aware length-prefixed framing；
+POSIX staging 精确核验 mode，Windows 按 content 验证 portable mode semantics。resolution hash
+包含 resolver version、exact client、family 和按序 layer role/target/hash，不包含本机
+source path/identity。immutable provenance 保留本机路径、manifest mode/delete、output
+hash 和 applied target chain，足以解释任意只读解析结果。
+
+7.3 的隔离测试证明：相同 sources 位于不同机器路径时 resolution hash 一致；只修改
+`kimi-desktop` client variant 时，Kimi Code hash 保持不变；target client 即使共享相同
+family output 仍有不同 resolution identity；同 content 的 `0644→0755` chmod 不改变
+identity，而 shebang content 在 POSIX/Windows 都规划为 `0755`；content 与 manifest ABA
+下的 hash 和 delete 语义都绑定 exact plan snapshot。materialized output hash 会重新遍历
+实际 destination bytes/effective portable modes 验证，不复用 plan input 代替验收。
+resolver 会在 plan 前后重扫 applicable family/client 名称与 directory identity，
+missing→present、remove/replace 和 case ambiguity 全部 fail closed。该 commit 不写
+provenance 文件，不接 registry/CLI/Web，不 materialize cache，也不修改真实 Agent link。
+
+7.2 → 7.4 → 7.3 的既定并行集成顺序至此完成，且 7.4 source commands 与 7.3
+read-only resolver 保持独立边界。主 resolver 链下一项为 7.5；registry、rendered
+provenance 持久化和 deployment mutation 仍留在后续独立 commit。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

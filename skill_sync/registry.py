@@ -45,13 +45,18 @@ def load_registry(path: str | Path) -> dict[str, Any]:
     - comments and blank lines
     """
 
-    registry_path = Path(path)
+    return parse_registry_text(Path(path).read_text(encoding="utf-8"))
+
+
+def parse_registry_text(text: str) -> dict[str, Any]:
+    """Parse constrained mapping-only YAML from an immutable text snapshot."""
+
+    if not isinstance(text, str):
+        raise ValueError("Registry text snapshot must be a string")
     root: dict[str, Any] = {}
     stack: list[dict[str, Any]] = [root]
 
-    for line_number, raw_line in enumerate(
-        registry_path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = _strip_comment(raw_line)
         if not line.strip():
             continue
