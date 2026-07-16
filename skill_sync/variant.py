@@ -166,8 +166,8 @@ def validate_portable_relative_path(
 
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError("Variant paths must be non-empty unpadded strings")
-    if "\x00" in value or "\n" in value or "\r" in value:
-        raise ValueError("Variant paths must be single-line strings")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("Variant paths must not contain control characters")
     if any(character in value for character in _WINDOWS_RESERVED_CHARACTERS):
         raise ValueError(f"Variant path is not portable: {value!r}")
 

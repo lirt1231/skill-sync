@@ -137,6 +137,28 @@ also check the top-level `result.valid` field before treating a Variant source
 as usable. `overlay_file_count` excludes only the target root's manifest, so a
 nested file named `variant.yaml` remains normal overlay content.
 
+Inspect one resolved client view, or compare it with the authored Base, without
+creating a rendered directory:
+
+```bash
+skill-sync resolve my-skill --client kimi-desktop --dry-run
+skill-sync resolve my-skill --client codex --dry-run --json
+skill-sync diff my-skill --base --client kimi-desktop
+skill-sync diff my-skill --base --client claude-code --json
+```
+
+Both commands derive Base and resolved sides from one immutable, layered
+snapshot in Base → family → exact-client order. `resolve` requires the explicit
+`--dry-run` safety flag in this release and reports ordered layers and hashes;
+its JSON output also reports final-file origins. It never accepts an output
+path. `diff` reports deterministic added/modified/deleted paths. Binary files
+and files whose combined comparison input exceeds 64 KiB are metadata-only
+(hash, size, and portable mode). Text unified-diff input is also capped at
+256 KiB across one command, in deterministic path order; later changes become
+metadata-only when that budget is exhausted.
+Neither command materializes a deployment, changes
+source/config/registry state, invokes Git, fetches, commits, or pushes.
+
 Before migrating existing Agent links away from editable canonical sources,
 preview every affected Skill/client pair, perform the migration, and inspect
 the rendered deployment state:

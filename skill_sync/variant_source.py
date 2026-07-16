@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
@@ -19,7 +21,7 @@ from skill_sync.errors import SkillSyncError
 from skill_sync.hash import is_link_or_reparse
 from skill_sync.protocol import EXIT_SAFETY
 from skill_sync.variant import VARIANT_MANIFEST_FILE, load_variant_manifest
-from skill_sync.variant_overlay import plan_variant_overlay
+from skill_sync.variant_overlay import VariantOverlayLayer, plan_variant_overlay
 
 
 _FAMILIES = {family.id: family for family in AGENT_FAMILIES}
@@ -36,6 +38,30 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 _WINDOWS_RESERVED_CHARACTERS = frozenset('<>:"/\\|?*')
 
 
+@dataclass(frozen=True, slots=True)
+class VariantSourcePaths:
+    """Validated local source roots for one logical Skill."""
+
+    skill: str
+    portable_root: Path
+    skills_root: Path
+    variants_root: Path
+    base_root: Path
+    variant_skill_root: Path
+    initial_base_layer: VariantOverlayLayer
+    observations: tuple["VariantSourceObservation", ...]
+
+
+@dataclass(frozen=True, slots=True)
+class VariantSourceObservation:
+    """One initial path state that must remain stable through resolution."""
+
+    role: str
+    path: Path
+    state: str
+    identity: tuple[int, int, int, int] | None
+
+
 def variants_root(config_path: str | Path | None = None) -> Path:
     """Return the portable Variant root derived from the canonical Skill root."""
 
@@ -49,6 +75,322 @@ def variants_root(config_path: str | Path | None = None) -> Path:
             exit_code=EXIT_SAFETY,
         )
     return skills_root.absolute().parent / "variants"
+
+
+def resolve_variant_source_paths(
+    skill: str,
+    *,
+    config_path: str | Path | None = None,
+) -> VariantSourcePaths:
+    """Resolve safe Base and Variant roots without creating or changing them."""
+
+    _validate_skill_name(skill)
+    config = _load_config(config_path)
+    skills_root, root = _configured_roots(config)
+    portable_root = skills_root.parent
+    boundaries = _capture_boundary_observations(
+        portable_root=portable_root,
+        skills_root=skills_root,
+        variants_root=root,
+    )
+    base_layers: list[VariantOverlayLayer] = []
+    try:
+        resolved = _resolve_base_skill(
+            skill,
+            skills_root,
+            root,
+            base_layers=base_layers,
+        )
+    except SkillSyncError:
+        _verify_source_observations(boundaries)
+        raise
+    _verify_source_observations(boundaries)
+    if len(base_layers) != 1:
+        raise SkillSyncError(
+            "Base validation did not capture one immutable source layer",
+            code="variant_source_unsafe",
+            exit_code=EXIT_SAFETY,
+        )
+    initial_base_layer = base_layers[0]
+    base_root = skills_root / resolved
+    variant_skill_root = root / resolved
+    observations = _capture_source_observations(
+        boundaries=boundaries,
+        initial_base_layer=initial_base_layer,
+        variants_root=root,
+        variant_skill_root=variant_skill_root,
+    )
+    return VariantSourcePaths(
+        skill=resolved,
+        portable_root=portable_root,
+        skills_root=skills_root,
+        variants_root=root,
+        base_root=base_root,
+        variant_skill_root=variant_skill_root,
+        initial_base_layer=initial_base_layer,
+        observations=observations,
+    )
+
+
+def verify_variant_source_paths(
+    sources: VariantSourcePaths,
+    *,
+    resolution: Any | None = None,
+) -> None:
+    """Fail if configured source boundaries changed during a read transaction."""
+
+    if type(sources) is not VariantSourcePaths:
+        raise TypeError("sources must be VariantSourcePaths")
+    try:
+        _verify_source_observations(sources.observations)
+        _verify_source_names(sources)
+        _verify_source_observations(sources.observations)
+        if resolution is not None:
+            _verify_resolution_sources(sources, resolution)
+    except SkillSyncError as exc:
+        if exc.code == "variant_source_changed":
+            raise
+        raise _source_changed_error(sources, message=str(exc)) from exc
+
+
+def _capture_source_observations(
+    *,
+    boundaries: tuple[VariantSourceObservation, ...],
+    initial_base_layer: VariantOverlayLayer,
+    variants_root: Path,
+    variant_skill_root: Path,
+) -> tuple[VariantSourceObservation, ...]:
+    observations = [
+        *boundaries,
+        VariantSourceObservation(
+            "base-skill",
+            initial_base_layer.source_root,
+            "directory",
+            initial_base_layer.source_identity,
+        ),
+        _observe_source_path(
+            "variant-skill-root",
+            variant_skill_root,
+            allow_missing=True,
+        ),
+    ]
+    variant_skill = observations[-1]
+    if variant_skill.state == "directory":
+        names = _real_child_directories(
+            variant_skill_root,
+            label=f"Variant Skill {variant_skill_root.name}",
+        )
+        _reject_casefold_duplicates(
+            names,
+            label=f"Variant target for {variant_skill_root.name}",
+        )
+        observations.extend(
+            _observe_source_path(
+                f"variant-target:{name}",
+                variant_skill_root / name,
+                allow_missing=False,
+            )
+            for name in sorted(names, key=lambda value: (value.casefold(), value))
+        )
+    return tuple(observations)
+
+
+def _capture_boundary_observations(
+    *,
+    portable_root: Path,
+    skills_root: Path,
+    variants_root: Path,
+) -> tuple[VariantSourceObservation, ...]:
+    """Capture configured boundaries before any Base or Variant tree scan."""
+
+    return (
+        _observe_source_path("portable-root", portable_root, allow_missing=False),
+        _observe_source_path("skills-root", skills_root, allow_missing=False),
+        _observe_source_path("variants-root", variants_root, allow_missing=True),
+    )
+
+
+def _observe_source_path(
+    role: str,
+    path: Path,
+    *,
+    allow_missing: bool,
+) -> VariantSourceObservation:
+    absolute = path.absolute()
+    try:
+        metadata = os.lstat(absolute)
+    except FileNotFoundError:
+        if allow_missing:
+            return VariantSourceObservation(role, absolute, "missing", None)
+        raise SkillSyncError(
+            f"required Variant source boundary is missing: {role}",
+            code="variant_source_unsafe",
+            exit_code=EXIT_SAFETY,
+            details={"role": role, "path": str(absolute)},
+        ) from None
+    except OSError as exc:
+        raise SkillSyncError(
+            f"cannot inspect Variant source boundary: {role}",
+            code="variant_source_unsafe",
+            exit_code=EXIT_SAFETY,
+            details={"role": role, "path": str(absolute)},
+        ) from exc
+    if is_link_or_reparse(absolute) or not stat.S_ISDIR(metadata.st_mode):
+        raise SkillSyncError(
+            f"Variant source boundary must be a real directory: {role}",
+            code="variant_source_unsafe",
+            exit_code=EXIT_SAFETY,
+            details={"role": role, "path": str(absolute)},
+        )
+    identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_ctime_ns,
+    )
+    return VariantSourceObservation(role, absolute, "directory", identity)
+
+
+def _verify_source_observations(
+    observations: tuple[VariantSourceObservation, ...],
+) -> None:
+    for initial in observations:
+        try:
+            current = _observe_source_path(
+                initial.role,
+                initial.path,
+                allow_missing=True,
+            )
+        except SkillSyncError as exc:
+            raise SkillSyncError(
+                "Variant source boundaries changed while resolving",
+                code="variant_source_changed",
+                exit_code=EXIT_SAFETY,
+                details={
+                    "role": initial.role,
+                    "path": str(initial.path),
+                    "before": initial.state,
+                    "after": "unsafe",
+                },
+            ) from exc
+        if current != initial:
+            raise SkillSyncError(
+                "Variant source boundaries changed while resolving",
+                code="variant_source_changed",
+                exit_code=EXIT_SAFETY,
+                details={
+                    "role": initial.role,
+                    "path": str(initial.path),
+                    "before": initial.state,
+                    "after": current.state,
+                },
+            )
+
+
+def _verify_source_names(sources: VariantSourcePaths) -> None:
+    base_matches = _casefold_matches(
+        sources.skills_root,
+        sources.skill,
+        label="global Skill root",
+    )
+    if base_matches != [sources.skill]:
+        raise SkillSyncError(
+            "canonical Base Skill identity changed while resolving",
+            code="variant_source_changed",
+            exit_code=EXIT_SAFETY,
+            details={"skill": sources.skill, "matches": base_matches},
+        )
+
+    variant_skill = next(
+        item for item in sources.observations if item.role == "variant-skill-root"
+    )
+    variants_root = next(
+        item for item in sources.observations if item.role == "variants-root"
+    )
+    if variants_root.state == "directory":
+        variant_matches = _casefold_matches(
+            sources.variants_root,
+            sources.skill,
+            label="Variant root",
+        )
+        expected = [sources.skill] if variant_skill.state == "directory" else []
+        if variant_matches != expected:
+            raise SkillSyncError(
+                "logical Variant Skill identity changed while resolving",
+                code="variant_source_changed",
+                exit_code=EXIT_SAFETY,
+                details={"skill": sources.skill, "matches": variant_matches},
+            )
+    if variant_skill.state == "directory":
+        current_targets = _real_child_directories(
+            sources.variant_skill_root,
+            label=f"Variant Skill {sources.skill}",
+        )
+        _reject_casefold_duplicates(
+            current_targets,
+            label=f"Variant target for {sources.skill}",
+        )
+        expected_targets = sorted(
+            item.path.name
+            for item in sources.observations
+            if item.role.startswith("variant-target:")
+        )
+        if sorted(current_targets) != expected_targets:
+            raise SkillSyncError(
+                "Variant targets changed while resolving",
+                code="variant_source_changed",
+                exit_code=EXIT_SAFETY,
+                details={"skill": sources.skill},
+            )
+
+
+def _verify_resolution_sources(
+    sources: VariantSourcePaths,
+    resolution: Any,
+) -> None:
+    try:
+        layers = resolution.overlay_plan.layers
+    except AttributeError as exc:
+        raise SkillSyncError(
+            "resolution does not expose immutable source layers",
+            code="variant_source_changed",
+            exit_code=EXIT_SAFETY,
+        ) from exc
+    if not layers:
+        raise SkillSyncError(
+            "resolution does not contain a Base source layer",
+            code="variant_source_changed",
+            exit_code=EXIT_SAFETY,
+        )
+    initial_by_path = {item.path: item for item in sources.observations}
+    base_layer = layers[0]
+    if base_layer != sources.initial_base_layer:
+        raise _source_changed_error(sources, message="Base snapshot identity changed")
+
+    for layer in layers[1:]:
+        initial = initial_by_path.get(layer.source_root)
+        if (
+            initial is None
+            or not initial.role.startswith("variant-target:")
+            or layer.source_identity != initial.identity
+        ):
+            raise _source_changed_error(
+                sources,
+                message="Variant snapshot identity changed",
+            )
+
+
+def _source_changed_error(
+    sources: VariantSourcePaths,
+    *,
+    message: str,
+) -> SkillSyncError:
+    return SkillSyncError(
+        "Variant source boundaries changed while resolving",
+        code="variant_source_changed",
+        exit_code=EXIT_SAFETY,
+        details={"skill": sources.skill, "reason": message},
+    )
 
 
 def create_variant(
@@ -251,7 +593,13 @@ def _target_metadata(
     )
 
 
-def _resolve_base_skill(skill: str, skills_root: Path, root: Path) -> str:
+def _resolve_base_skill(
+    skill: str,
+    skills_root: Path,
+    root: Path,
+    *,
+    base_layers: list[VariantOverlayLayer] | None = None,
+) -> str:
     if is_link_or_reparse(skills_root):
         raise SkillSyncError(
             f"global Skill root is a link or reparse point: {skills_root}",
@@ -287,7 +635,7 @@ def _resolve_base_skill(skill: str, skills_root: Path, root: Path) -> str:
             exit_code=EXIT_SAFETY,
         )
     try:
-        plan_variant_overlay(base)
+        base_plan = plan_variant_overlay(base)
     except (OSError, ValueError) as exc:
         raise SkillSyncError(
             f"Base Skill is unsafe: {exc}",
@@ -295,6 +643,8 @@ def _resolve_base_skill(skill: str, skills_root: Path, root: Path) -> str:
             exit_code=EXIT_SAFETY,
             details={"skill": resolved, "path": str(base)},
         ) from exc
+    if base_layers is not None:
+        base_layers.append(base_plan.layers[0])
     if root.exists() or is_link_or_reparse(root):
         root_matches = _casefold_matches(root, resolved, label="Variant root")
         if len(root_matches) > 1:

@@ -103,6 +103,9 @@ class VariantManifestTest(unittest.TestCase):
             "references/a.md/",
             "variant.yaml",
             "references/name:stream.md",
+            "references/escape\x1b.md",
+            "references/tab\tname.md",
+            "references/delete\x7f.md",
         ]
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

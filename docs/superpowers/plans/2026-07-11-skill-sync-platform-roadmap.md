@@ -620,10 +620,11 @@ Deliverables:
   requires `managed check` before every Skill modification.
 - Hashing, path traversal, symlink, atomic build, and cleanup tests.
 
-Implementation checkpoint: commits 7.1 through 7.3 now provide the strict
-`variant.yaml` parser, registry-independent file overlay core, and read-only
-layered resolution provenance. The resolver derives the registered family from
-an exact client ID, selects Base → family → exact-client sources, applies a
+Implementation checkpoint: commits 7.1 through 7.5 now provide the strict
+`variant.yaml` parser, registry-independent file overlay core, read-only
+layered resolution provenance, Variant source list/create/validate commands,
+and read-only resolve/Base-to-client diff commands. The resolver derives the
+registered family from an exact client ID, selects Base → family → exact-client sources, applies a
 shared family/client target only once when the IDs coincide, and records
 immutable ordered layer metadata. Every source layer has a deterministic
 mode-aware hash over the exact immutable bytes and normalized file modes used
@@ -640,9 +641,16 @@ ordered layer roles/targets, and layer hashes. Local source paths and
 filesystem identities remain explanation/safety evidence but are deliberately
 excluded from the portable hash. Applicable target names plus directory
 identities are rescanned before return; appearance, removal, replacement, or
-case ambiguity fails closed. Registry integration, rendered provenance files,
-CLI exposure, and cache mutation remain later commits and must not be inferred
-from this read-only API.
+case ambiguity fails closed. Resolve and diff use that same immutable overlay
+plan for both sides, expose the shared JSON v1 envelope, and keep binary or
+large-file changes metadata-only. Text unified-diff input is bounded per change
+and across one command, with later paths deterministically reduced to metadata.
+Configured source-root identities are pinned before validation and rechecked
+against the immutable resolution plan, so ancestor replacement fails closed.
+The commands do not materialize output, invoke Git, fetch, update the registry,
+or mutate a source. Registry integration, rendered provenance files,
+deployment/cache mutation, and scoped edit sessions remain later commits and
+must not be inferred from these read-only APIs.
 
 Acceptance criteria:
 

@@ -8,9 +8,9 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from skill_sync import core, variant_source
+from skill_sync import core, variant_inspect, variant_source
 from skill_sync.errors import SkillSyncError
-from skill_sync.protocol import error_envelope, success_envelope
+from skill_sync.protocol import EXIT_USAGE, error_envelope, success_envelope
 from skill_sync.version import __version__
 
 
@@ -137,6 +137,43 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_managed_check,
         protocol_command="managed check",
     )
+
+    resolve_parser = subparsers.add_parser(
+        "resolve",
+        help="inspect one client-specific Variant resolution without writing it",
+        epilog="read-only; --dry-run is required and no output is materialized",
+    )
+    resolve_parser.add_argument("skill", help="logical Base Skill name")
+    resolve_parser.add_argument(
+        "--client", required=True, help="concrete Agent client ID"
+    )
+    resolve_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="confirm that the resolved output must not be materialized",
+    )
+    resolve_parser.add_argument(
+        "--json", action="store_true", help="print JSON output"
+    )
+    resolve_parser.set_defaults(handler=_handle_resolve)
+
+    diff_parser = subparsers.add_parser(
+        "diff",
+        help="compare the authored Base Skill with one resolved client version",
+        epilog="read-only; binary and large files are reported as metadata only",
+    )
+    diff_parser.add_argument("skill", help="logical Base Skill name")
+    diff_parser.add_argument(
+        "--base",
+        action="store_true",
+        required=True,
+        help="compare from the canonical Base layer",
+    )
+    diff_parser.add_argument(
+        "--client", required=True, help="concrete Agent client ID"
+    )
+    diff_parser.add_argument("--json", action="store_true", help="print JSON output")
+    diff_parser.set_defaults(handler=_handle_variant_diff)
 
     variant_parser = subparsers.add_parser(
         "variant", help="manage portable family and client Variant sources"
@@ -539,6 +576,76 @@ def _handle_managed_check(args: argparse.Namespace) -> Any:
             f"Recommended action: {action}",
         )
     )
+
+
+def _handle_resolve(args: argparse.Namespace) -> Any:
+    if not args.dry_run:
+        raise SkillSyncError(
+            "resolve is read-only in this release; pass --dry-run explicitly",
+            code="variant_dry_run_required",
+            exit_code=EXIT_USAGE,
+        )
+    result = variant_inspect.resolve_variant_dry_run(
+        args.skill,
+        client=args.client,
+        config_path=args.config,
+    )
+    if args.json:
+        return result
+    chain = " -> ".join(
+        layer["role"]
+        if layer["target"] is None
+        else f"{layer['role']}:{layer['target']}"
+        for layer in result["layers"]
+    )
+    return "\n".join(
+        (
+            f"Resolved {result['skill']} for {result['client']} (dry run)",
+            f"Layers: {chain}",
+            f"Files: {result['file_count']}",
+            f"Output hash: {result['output_hash']}",
+            f"Resolution hash: {result['resolution_hash']}",
+        )
+    )
+
+
+def _handle_variant_diff(args: argparse.Namespace) -> Any:
+    result = variant_inspect.diff_base_to_client(
+        args.skill,
+        client=args.client,
+        config_path=args.config,
+    )
+    if args.json:
+        return result
+    summary = result["summary"]
+    lines = [
+        f"Base -> {result['client']}: {summary['added']} added, "
+        f"{summary['modified']} modified, {summary['deleted']} deleted"
+    ]
+    if not result["files"]:
+        lines.append("No differences.")
+        return "\n".join(lines)
+    for item in result["files"]:
+        lines.append(f"- {item['change']} {item['kind']}: {item['path']}")
+        if item["kind"] == "text" and item.get("diff"):
+            lines.append(item["diff"].rstrip("\n"))
+        elif item["kind"] in {"binary", "large"} or item.get("diff_omitted"):
+            old = item["base"]
+            new = item["client"]
+            old_label = (
+                "none"
+                if old is None
+                else f"{old['hash']} ({old['size']} bytes, {old['mode']})"
+            )
+            new_label = (
+                "none"
+                if new is None
+                else f"{new['hash']} ({new['size']} bytes, {new['mode']})"
+            )
+            lines.append(f"  metadata: {old_label} -> {new_label}")
+            if item.get("diff_omitted"):
+                lines.append(f"  diff omitted: {item['diff_omitted']}")
+    return "\n".join(lines)
 
 
 def _handle_variant_list(args: argparse.Namespace) -> Any:

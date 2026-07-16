@@ -938,6 +938,15 @@ Batch B 完成后，产品具备“多设备同步 + 多 Agent Client 适配管�
 | 7.5 | `add variant resolve and diff commands` | `resolve --dry-run`、Base/client diff 和 JSON 输出 | Kimi family/client 优先级、binary metadata diff |
 | 7.6 | `document variant resolution model` | README、architecture、迁移限制；不新增行为 | wheel CLI help 与文档命令逐项核对 |
 
+当前检查点：7.1–7.5 已完成；下一小提交是 7.6。7.5 的 Base/client
+两侧必须来自同一个 immutable `LayeredVariantResolution.overlay_plan`，只对安全且
+单项合计不超过 64 KiB 的 UTF-8 文本生成 unified diff；单次命令的 text
+unified-diff input 总预算为 256 KiB，按 path 顺序耗尽后返回
+`diff_omitted=total_size_limit`。Binary、大文件和超总预算项只返回 hash、size、
+portable mode。Configured roots 在初检前绑定 identity，并在 immutable plan
+完成后复验。`resolve` 必须显式传 `--dry-run`，两个命令均不得 materialize、
+修改 source/config/registry、调用 Git 或触发 fetch/commit/push。
+
 ### Step 8：Family/Client Edit Session
 
 | Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
