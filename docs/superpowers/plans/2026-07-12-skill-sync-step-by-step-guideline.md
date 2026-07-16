@@ -1197,8 +1197,20 @@ mapping-only stdlib YAML 子集，严格要求 `version: 1`、已注册 family/c
 保留名称、unknown field 及 variant tree 中的 symlink/reparse point 全部 fail closed。
 parser 只读取 manifest 和验证 source tree，不解析或生成 resolved Skill 内容。
 
-当前可按并行表启动 `7.2 add deterministic variant overlay engine` 与 `7.4 add variant
-source management commands`；合并时必须先进入 `7.2`，再将 `7.4` rebase 到最新集成点。
+commit `7.2 add deterministic variant overlay engine` 已完成。纯文件级 resolver 接受
+caller 按 Base → family → client 提供的 layer 顺序，先应用 manifest delete，再执行
+文件 add/replace；root `variant.yaml` 不进入输出。plan 会只读快照 bytes 和 mode，路径按
+确定性 POSIX 顺序输出，大小写歧义、非便携路径、symlink/reparse point、file/directory
+collision 和缺失 `SKILL.md` 全部 fail closed。materialize 在 destination sibling 中完整
+staging、逐文件核验并用 no-replace rename 原子发布，已存在或并发出现的 winner 均保留。
+
+7.2 的 golden fixtures 覆盖 Base only、Base+family、Base+client、Base+family+client、
+`kimi-desktop` 覆盖 `kimi`、目录/文件删除、共享 script 和噪音排除。该 commit 不接
+registry/CLI，不计算 layer/resolution hash，也不写 provenance；这些仍由 7.3 负责。
+
+当前合并顺序为：先保留已完成的 7.2，再将并行的 `7.4 add variant source management
+commands` rebase 到 7.2 后合并。主 resolver 链下一项是 `7.3 add layered resolution
+provenance`。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

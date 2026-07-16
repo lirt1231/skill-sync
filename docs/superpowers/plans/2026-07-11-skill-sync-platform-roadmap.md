@@ -620,6 +620,14 @@ Deliverables:
   requires `managed check` before every Skill modification.
 - Hashing, path traversal, symlink, atomic build, and cleanup tests.
 
+Implementation checkpoint: commits 7.1 and 7.2 now provide the strict
+`variant.yaml` parser and the registry-independent file overlay core. The core
+accepts caller-ordered layers, snapshots Base and Variant bytes read-only,
+applies delete then add/replace semantics, excludes `variant.yaml`, and
+publishes only through a staged no-replace rename. Layer selection, hashes,
+resolution provenance, registry integration, and CLI exposure remain in 7.3+
+and must not be inferred from the 7.2 API.
+
 Acceptance criteria:
 
 - One Skill can produce different Codex and Claude `SKILL.md` files while

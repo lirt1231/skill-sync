@@ -1,0 +1,4 @@
+version: 1
+target: kimi
+mode: overlay
+delete: references/remove.md

@@ -121,7 +121,7 @@ def _parse_delete_paths(value: Any) -> tuple[str, ...]:
     normalized: list[str] = []
     identities: dict[str, str] = {}
     for raw_path in values:
-        path = _validate_portable_relative_path(raw_path)
+        path = validate_portable_relative_path(raw_path)
         identity = path.casefold()
         previous = identities.get(identity)
         if previous is not None:
@@ -133,7 +133,13 @@ def _parse_delete_paths(value: Any) -> tuple[str, ...]:
     return tuple(sorted(normalized, key=lambda item: (item.casefold(), item)))
 
 
-def _validate_portable_relative_path(value: str) -> str:
+def validate_portable_relative_path(
+    value: str,
+    *,
+    allow_manifest: bool = False,
+) -> str:
+    """Validate one normalized, cross-platform relative Variant path."""
+
     if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError("Variant paths must be non-empty unpadded strings")
     if "\x00" in value or "\n" in value or "\r" in value:
@@ -149,7 +155,7 @@ def _validate_portable_relative_path(value: str) -> str:
         raise ValueError(f"Variant path must be normalized POSIX syntax: {value!r}")
     if any(part in {"", ".", ".."} for part in posix_path.parts):
         raise ValueError(f"Variant path escapes or aliases the Skill root: {value!r}")
-    if value == VARIANT_MANIFEST_FILE:
+    if value == VARIANT_MANIFEST_FILE and not allow_manifest:
         raise ValueError("Variant manifest cannot delete itself")
 
     for part in posix_path.parts:
