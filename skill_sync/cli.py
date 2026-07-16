@@ -220,6 +220,35 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_edit_apply,
         protocol_command="edit apply",
     )
+    edit_recover_parser = edit_subparsers.add_parser(
+        "recover", help="inspect or recover one tampered client deployment"
+    )
+    edit_recover_parser.add_argument("skill", help="selected logical Skill name")
+    edit_recover_parser.add_argument(
+        "--client", required=True, help="concrete client ID"
+    )
+    recovery_action = edit_recover_parser.add_mutually_exclusive_group()
+    recovery_action.add_argument(
+        "--capture",
+        action="store_const",
+        const="capture",
+        dest="recovery_action",
+        help="capture authored tampering into a new Base edit session",
+    )
+    recovery_action.add_argument(
+        "--discard",
+        action="store_const",
+        const="discard",
+        dest="recovery_action",
+        help="discard tampering and rebuild from canonical",
+    )
+    edit_recover_parser.add_argument(
+        "--json", action="store_true", help="print JSON output"
+    )
+    edit_recover_parser.set_defaults(
+        handler=_handle_edit_recover,
+        protocol_command="edit recover",
+    )
 
     deploy_parser = subparsers.add_parser(
         "deploy", help="inspect and migrate rendered Skill deployments"
@@ -549,6 +578,58 @@ def _handle_edit_apply(args: argparse.Namespace) -> Any:
                 f"clients relinked: {result.get('clients_relinked', 0)}"
             ),
             f"Cleanup pending: {len(result.get('cleanup_pending', []))}",
+        )
+    )
+
+
+def _handle_edit_recover(args: argparse.Namespace) -> Any:
+    result = core.edit_recover(
+        args.skill,
+        client=args.client,
+        action=args.recovery_action,
+        config_path=args.config,
+    )
+    if args.json:
+        return result
+    if result["action"] == "preview":
+        diff = result["diff"]
+        lines = [
+            f"Tampered deployment: {result['skill']} ({result['client']})",
+            f"Deployment: {result['deployment_path']}",
+            (
+                f"Diff: {diff['summary']['added']} added, "
+                f"{diff['summary']['modified']} modified, "
+                f"{diff['summary']['deleted']} deleted"
+            ),
+        ]
+        for item in diff["files"]:
+            lines.append(f"- {item['change']} {item['kind']}: {item['path']}")
+            if item["kind"] == "text" and item["diff"]:
+                lines.append(item["diff"].rstrip("\n"))
+        lines.extend(
+            (
+                f"Capture: skill-sync edit recover {result['skill']} "
+                f"--client {result['client']} --capture",
+                f"Discard: skill-sync edit recover {result['skill']} "
+                f"--client {result['client']} --discard",
+            )
+        )
+        return "\n".join(lines)
+    if result["action"] == "capture":
+        return "\n".join(
+            (
+                f"Captured tampered deployment: {result['skill']} ({result['client']})",
+                f"Edit session: {result['session_id']}",
+                f"Workspace: {result['workspace_path']}",
+                f"Receipt: {result['receipt_path']}",
+            )
+        )
+    return "\n".join(
+        (
+            f"Discarded tampering: {result['skill']} ({result['client']})",
+            f"Deployment: {result['deployment_path']}",
+            f"Receipt: {result['receipt_path']}",
+            f"Cleanup pending: {len(result['cleanup_pending'])}",
         )
     )
 

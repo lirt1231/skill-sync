@@ -366,6 +366,71 @@ class CliTest(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["errors"][0]["code"], "active_edit_session")
 
+    def test_edit_recover_dispatches_preview_and_requires_explicit_single_action(self):
+        preview = {
+            "skill": "alpha",
+            "client": "codex",
+            "state": "tampered-render",
+            "action": "preview",
+            "canonical_path": "/skills/alpha",
+            "canonical_hash": "sha256:" + "1" * 64,
+            "deployment_path": "/rendered/hash/alpha",
+            "tampered_authored_hash": "sha256:" + "2" * 64,
+            "diff": {
+                "changed": True,
+                "summary": {"added": 0, "modified": 1, "deleted": 0, "total": 1},
+                "files": [
+                    {
+                        "path": "SKILL.md",
+                        "change": "modified",
+                        "kind": "text",
+                        "diff": "--- a/SKILL.md\n+++ b/SKILL.md\n",
+                    }
+                ],
+            },
+            "allowed_actions": ["capture", "discard"],
+            "blocked_by_session": None,
+        }
+        with mock.patch.object(
+            cli.core, "edit_recover", return_value=preview
+        ) as recover:
+            code, stdout, stderr = run_cli(
+                [
+                    "--config",
+                    "/tmp/config.json",
+                    "edit",
+                    "recover",
+                    "alpha",
+                    "--client",
+                    "codex",
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        recover.assert_called_once_with(
+            "alpha", client="codex", action=None, config_path="/tmp/config.json"
+        )
+        payload = json.loads(stdout)
+        self.assertEqual(payload["command"], "edit recover")
+        self.assertEqual(payload["result"]["allowed_actions"], ["capture", "discard"])
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                cli._build_parser().parse_args(
+                    [
+                        "edit",
+                        "recover",
+                        "alpha",
+                        "--client",
+                        "codex",
+                        "--capture",
+                        "--discard",
+                    ]
+                )
+        self.assertEqual(raised.exception.code, 2)
+
     def test_deploy_preview_dispatches_and_prints_each_skill_client(self):
         result = {
             "rendered_root": "/data/rendered",

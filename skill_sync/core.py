@@ -26,6 +26,13 @@ from skill_sync.deployment import (
     resolution_hash,
     verify_deployment,
 )
+from skill_sync.edit_recovery import (
+    CapturedSnapshot,
+    DeploymentQuarantine,
+    DeploymentQuarantineRecoveryRequired,
+    copy_authored_deployment,
+    inspect_authored_deployment,
+)
 from skill_sync.edit_apply import (
     CanonicalSwap,
     CanonicalSwapRecoveryRequired,
@@ -39,6 +46,7 @@ from skill_sync.edit_session import (
     CanonicalSkillChangedError,
     EditSessionMetadata,
     EditSessionMetadataError,
+    EditSessionPublicationRecoveryRequired,
     EditSessionStatus,
     EditSessionStore,
 )
@@ -417,13 +425,6 @@ def edit_begin(
         ) from exc
     except SkillSyncError:
         raise
-    except ReceiptRecoveryRequired as exc:
-        raise SkillSyncError(
-            "edit apply receipt changed and requires recovery",
-            code="edit_apply_recovery_required",
-            exit_code=EXIT_SAFETY,
-            details={"session_id": session_id},
-        ) from exc
     except (OSError, ValueError) as exc:
         raise SkillSyncError(
             f"could not begin edit session: {exc}",
@@ -510,6 +511,536 @@ def edit_validate(
         "workspace_hash": workspace_hash,
         "issues": [issue.to_dict() for issue in issues],
     }
+
+
+def edit_recover(
+    skill_name: str,
+    *,
+    client: str,
+    action: str | None = None,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Preview, capture, or discard one tampered concrete-client deployment."""
+
+    if action not in {None, "capture", "discard"}:
+        raise SkillSyncError(
+            f"unknown edit recovery action: {action}",
+            code="edit_recovery_invalid_action",
+            exit_code=EXIT_SAFETY,
+        )
+    config = _load_local_config(config_path)
+    clients = detect_clients()
+    if action is None:
+        return _edit_recovery_preview(config, skill_name, client, clients=clients)
+
+    data_root = _data_root(config)
+    store = EditSessionStore(data_root)
+    try:
+        with local_file_lock(data_root / "locks" / "deployment.lock"):
+            preview = _edit_recovery_preview(
+                config, skill_name, client, clients=clients
+            )
+            blocked = preview["blocked_by_session"]
+            if blocked is not None:
+                raise SkillSyncError(
+                    "an unfinished edit session blocks deployment recovery",
+                    code="edit_recovery_session_blocked",
+                    exit_code=EXIT_SAFETY,
+                    details={
+                        "skill": skill_name,
+                        "session_id": blocked["session_id"],
+                        "status": blocked["status"],
+                    },
+                )
+            _assert_no_incomplete_deployment_receipts(data_root)
+            if action == "capture":
+                return _edit_recovery_capture(store, preview)
+            with store.skill_lock(skill_name):
+                refreshed = _edit_recovery_preview(
+                    config, skill_name, client, clients=clients
+                )
+                if refreshed["observed_hash"] != preview["observed_hash"]:
+                    raise SkillSyncError(
+                        "tampered deployment changed before recovery",
+                        code="edit_recovery_conflict",
+                        exit_code=EXIT_CONFLICT,
+                    )
+                return _edit_recovery_discard(config, refreshed)
+    except SkillSyncError:
+        raise
+    except TimeoutError as exc:
+        raise SkillSyncError(
+            str(exc), code="edit_recovery_lock_timeout", exit_code=EXIT_SAFETY
+        ) from exc
+    except (EditSessionMetadataError, EditTreeInspectionError, OSError, ValueError) as exc:
+        raise SkillSyncError(
+            f"could not safely recover tampered deployment: {exc}",
+            code="edit_recovery_failed",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill_name, "client": client, "action": action},
+        ) from exc
+
+
+def _edit_recovery_preview(
+    config: dict[str, Any],
+    skill_name: str,
+    client_id: str,
+    *,
+    clients: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    registry = _load_local_registry(config)
+    _target_names(registry, [skill_name])
+    matches = [
+        item for item in (detect_clients() if clients is None else clients)
+        if item.id == client_id
+    ]
+    if len(matches) != 1:
+        raise SkillSyncError(
+            f"recovery requires one concrete client ID: {client_id}",
+            code=(
+                "edit_recovery_client_unknown"
+                if not matches
+                else "edit_recovery_client_ambiguous"
+            ),
+            exit_code=EXIT_SAFETY,
+            details={"client": client_id},
+        )
+    target_client = matches[0]
+    if not target_client.detected:
+        raise SkillSyncError(
+            f"client is not detected: {client_id}",
+            code="edit_recovery_client_unavailable",
+            exit_code=EXIT_SAFETY,
+        )
+    entry = registry.get("skills", {}).get(skill_name, {})
+    configured = _configured_client_targets(entry)
+    if configured and not {client_id, target_client.family_id}.intersection(configured):
+        raise SkillSyncError(
+            f"Skill is not configured for client: {client_id}",
+            code="edit_recovery_client_excluded",
+            exit_code=EXIT_SAFETY,
+        )
+    if target_client.family_id in _disabled_agents(config):
+        raise SkillSyncError(
+            f"client family is disabled: {target_client.family_id}",
+            code="edit_recovery_client_disabled",
+            exit_code=EXIT_SAFETY,
+        )
+
+    canonical = _local_skill_path_or_default(config, registry, skill_name).absolute()
+    _validate_skill_path(canonical)
+    canonical_hash = hash_skill_dir(canonical)
+    rendered_root = _rendered_root(config)
+    expected = deployment_path(
+        rendered_root,
+        skill_name,
+        resolution_hash(skill_name, canonical_hash, client_id),
+    )
+    destination = target_client.skills_dir / skill_name
+    if link_state(expected, destination) != "linked":
+        raise SkillSyncError(
+            "Agent path is not linked to the current canonical deployment",
+            code="edit_recovery_not_tampered",
+            exit_code=EXIT_CONFLICT,
+            details={"client": client_id, "destination": str(destination)},
+        )
+    verification = verify_deployment(
+        expected,
+        expected_provenance=expected_provenance(skill_name, canonical_hash, client_id),
+    )
+    if verification.state != "tampered":
+        raise SkillSyncError(
+            f"deployment is not tampered: {verification.state}",
+            code="edit_recovery_not_tampered",
+            exit_code=EXIT_CONFLICT,
+            details={"client": client_id, "state": verification.state},
+        )
+    try:
+        observed_before = hash_skill_dir(expected)
+        canonical_tree = inspect_tree(canonical)
+        authored = inspect_authored_deployment(expected)
+        if canonical_tree.issues or authored.issues or authored.hash is None:
+            raise EditTreeInspectionError("tampered deployment contains unsafe paths")
+        if canonical_tree.hash != canonical_hash:
+            raise EditTreeInspectionError("canonical Skill changed during recovery preview")
+        diff = build_diff(canonical_tree, authored)
+        observed_hash = hash_skill_dir(expected)
+        if observed_hash != observed_before:
+            raise EditTreeInspectionError(
+                "tampered deployment changed during recovery preview"
+            )
+    except (EditTreeInspectionError, OSError, ValueError) as exc:
+        raise SkillSyncError(
+            f"tampered deployment cannot be inspected safely: {exc}",
+            code="unsafe_tampered_deployment",
+            exit_code=EXIT_SAFETY,
+            details={"client": client_id, "deployment_path": str(expected)},
+        ) from exc
+    blocked = _unfinished_edit_session(
+        store=EditSessionStore(_data_root(config)), skill_name=skill_name
+    )
+    return {
+        "skill": skill_name,
+        "client": client_id,
+        "state": "tampered-render",
+        "action": "preview",
+        "canonical_path": str(canonical),
+        "canonical_hash": canonical_hash,
+        "deployment_path": str(expected),
+        "destination": str(destination),
+        "tampered_authored_hash": authored.hash,
+        "observed_hash": observed_hash,
+        "reason": verification.reason,
+        "diff": diff,
+        "allowed_actions": ["capture", "discard"],
+        "blocked_by_session": blocked,
+    }
+
+
+def _unfinished_edit_session(
+    *, store: EditSessionStore, skill_name: str
+) -> dict[str, str] | None:
+    for metadata in store.list_metadata():
+        if (
+            metadata.logical_skill.casefold() == skill_name.casefold()
+            and metadata.status
+            in {
+                EditSessionStatus.ACTIVE,
+                EditSessionStatus.APPLYING,
+                EditSessionStatus.NEEDS_RECOVERY,
+            }
+        ):
+            return {
+                "session_id": metadata.session_id,
+                "status": metadata.status.value,
+            }
+    return None
+
+
+def _recovery_receipt(
+    data_root: Path,
+    preview: dict[str, Any],
+    action: str,
+    *,
+    operation_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], Path, PrivateJsonReceipt]:
+    operation_id = str(uuid.uuid4()) if operation_id is None else operation_id
+    receipt_path = data_root / "operations" / f"edit-recover-{operation_id}.json"
+    receipt = {
+        "schema_version": 1,
+        "operation": "edit-recover",
+        "operation_id": operation_id,
+        "skill": preview["skill"],
+        "client": preview["client"],
+        "action": action,
+        "status": "prepared",
+        "phase": "prepared",
+        "created_at": time.time(),
+        "canonical_path": preview["canonical_path"],
+        "canonical_hash": preview["canonical_hash"],
+        "deployment_path": preview["deployment_path"],
+        "observed_hash": preview["observed_hash"],
+        "tampered_authored_hash": preview["tampered_authored_hash"],
+        **(extra or {}),
+    }
+    writer = PrivateJsonReceipt.create(receipt_path, receipt)
+    return receipt, receipt_path, writer
+
+
+def _edit_recovery_capture(
+    store: EditSessionStore, preview: dict[str, Any]
+) -> dict[str, Any]:
+    if not preview["diff"]["changed"]:
+        raise SkillSyncError(
+            "tampering affects only deployment metadata; use discard",
+            code="edit_recovery_no_authored_changes",
+            exit_code=EXIT_CONFLICT,
+        )
+    authored = inspect_authored_deployment(preview["deployment_path"])
+    capture_issues = validate_workspace(authored, logical_skill=preview["skill"])
+    if capture_issues:
+        raise SkillSyncError(
+            "tampered authored content is not a valid Base Skill workspace",
+            code="unsafe_tampered_deployment",
+            exit_code=EXIT_SAFETY,
+            details={
+                "client": preview["client"],
+                "issues": [issue.to_dict() for issue in capture_issues],
+            },
+        )
+    snapshot_root = prepare_private_directory(
+        store.data_root / "recovery-snapshots" / preview["skill"]
+    )
+    operation_id = str(uuid.uuid4())
+    snapshot = snapshot_root / operation_id
+    receipt, receipt_path, writer = _recovery_receipt(
+        store.data_root,
+        preview,
+        "capture",
+        operation_id=operation_id,
+        extra={"snapshot_path": str(snapshot)},
+    )
+    metadata: EditSessionMetadata | None = None
+    published_session_id: str | None = None
+    snapshot_owner: CapturedSnapshot | None = None
+    committed = False
+    cleanup_pending: list[str] = []
+    try:
+        receipt["status"] = "applying"
+        receipt["phase"] = "snapshotting"
+        writer.update(receipt)
+        copy_authored_deployment(
+            preview["deployment_path"],
+            snapshot,
+            expected_hash=preview["tampered_authored_hash"],
+        )
+        snapshot_owner = CapturedSnapshot.prepare(
+            snapshot, expected_hash=preview["tampered_authored_hash"]
+        )
+        metadata, paths = store.begin(
+            logical_skill=preview["skill"],
+            source=preview["canonical_path"],
+            baseline_hash=preview["canonical_hash"],
+            actor=f"recovery:{preview['client']}",
+            workspace_source=snapshot,
+            workspace_hash=preview["tampered_authored_hash"],
+        )
+        receipt["session_id"] = metadata.session_id
+        receipt["status"] = "completed"
+        receipt["phase"] = "completed"
+        receipt["completed_at"] = time.time()
+        writer.update(receipt)
+        committed = True
+        try:
+            snapshot_owner.finalize()
+        except Exception as exc:
+            cleanup_pending.append(
+                str(
+                    exc.recovery_path
+                    if isinstance(exc, DeploymentQuarantineRecoveryRequired)
+                    else snapshot
+                )
+            )
+        if cleanup_pending:
+            receipt["status"] = "cleanup-pending"
+            receipt["phase"] = "cleanup-pending"
+            receipt["cleanup_pending"] = cleanup_pending
+            try:
+                writer.update(receipt)
+            except Exception:
+                cleanup_pending.append(str(receipt_path))
+        return {
+            **{
+                key: preview[key]
+                for key in (
+                    "skill",
+                    "client",
+                    "state",
+                    "canonical_path",
+                    "canonical_hash",
+                    "deployment_path",
+                    "tampered_authored_hash",
+                )
+            },
+            "action": "capture",
+            "status": "captured",
+            "session_id": metadata.session_id,
+            "workspace_path": str(paths.workspace.absolute()),
+            "receipt_path": str(receipt_path),
+            "cleanup_pending": cleanup_pending,
+        }
+    except ActiveEditSessionError as exc:
+        receipt["status"] = "rolled-back"
+        receipt["phase"] = "rolled-back"
+        receipt["error_code"] = "active_edit_session"
+        receipt["completed_at"] = time.time()
+        writer.update(receipt)
+        raise SkillSyncError(
+            str(exc),
+            code="active_edit_session",
+            exit_code=EXIT_CONFLICT,
+            details={"skill": exc.logical_skill, "session_id": exc.session_id},
+        ) from exc
+    except ReceiptRecoveryRequired as exc:
+        raise SkillSyncError(
+            "edit recovery receipt changed and requires reconciliation",
+            code="edit_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={
+                "receipt_path": str(receipt_path),
+                "session_id": None if metadata is None else metadata.session_id,
+            },
+        ) from exc
+    except EditSessionPublicationRecoveryRequired as exc:
+        published_session_id = exc.session_id
+        receipt["status"] = "needs-recovery"
+        receipt["phase"] = "needs-recovery"
+        receipt["error_code"] = "edit_recovery_session_publication_ambiguous"
+        receipt["session_id"] = exc.session_id
+        receipt["recovery_path"] = str(store.paths(exc.session_id).root)
+        receipt["completed_at"] = time.time()
+        try:
+            writer.update(receipt)
+        except Exception:
+            pass
+        raise SkillSyncError(
+            "captured edit session publication requires reconciliation",
+            code="edit_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={
+                "receipt_path": str(receipt_path),
+                "session_id": exc.session_id,
+                "recovery_path": str(store.paths(exc.session_id).root),
+            },
+        ) from exc
+    except Exception as exc:
+        if committed:
+            raise
+        receipt["status"] = "needs-recovery" if metadata is not None else "rolled-back"
+        receipt["phase"] = receipt["status"]
+        receipt["error_code"] = "edit_recovery_failed"
+        if metadata is not None:
+            receipt["session_id"] = metadata.session_id
+            receipt["recovery_path"] = str(store.paths(metadata.session_id).root)
+        receipt["completed_at"] = time.time()
+        receipt_update_failed = False
+        try:
+            writer.update(receipt)
+        except Exception:
+            receipt_update_failed = True
+        if receipt_update_failed:
+            raise SkillSyncError(
+                "edit recovery receipt could not be terminalized",
+                code="edit_recovery_required",
+                exit_code=EXIT_SAFETY,
+                details={"receipt_path": str(receipt_path)},
+            ) from exc
+        raise
+    finally:
+        if not committed and published_session_id is None and snapshot_owner is not None:
+            try:
+                snapshot_owner.finalize()
+            except Exception:
+                pass
+
+
+def _edit_recovery_discard(
+    config: dict[str, Any], preview: dict[str, Any]
+) -> dict[str, Any]:
+    data_root = _data_root(config)
+    operation_id = str(uuid.uuid4())
+    quarantine = DeploymentQuarantine.prepare(
+        preview["deployment_path"],
+        expected_hash=preview["observed_hash"],
+        token=operation_id,
+    )
+    receipt, receipt_path, writer = _recovery_receipt(
+        data_root,
+        preview,
+        "discard",
+        operation_id=operation_id,
+        extra={"quarantine_path": str(quarantine.quarantine)},
+    )
+    committed = False
+    cleanup_pending: list[str] = []
+    try:
+        receipt["status"] = "applying"
+        receipt["phase"] = "quarantining"
+        writer.update(receipt)
+        quarantine.apply()
+        receipt["phase"] = "rebuilding"
+        writer.update(receipt)
+        deployed = render_base_deployment(
+            preview["canonical_path"],
+            _rendered_root(config),
+            preview["skill"],
+            preview["client"],
+        )
+        verification = verify_deployment(
+            deployed.path,
+            expected_provenance=expected_provenance(
+                preview["skill"], preview["canonical_hash"], preview["client"]
+            ),
+        )
+        if not verification.ok or link_state(
+            deployed.path, Path(preview["destination"])
+        ) != "linked":
+            raise OSError("rebuilt deployment or Agent link failed verification")
+        receipt["status"] = "completed"
+        receipt["phase"] = "completed"
+        receipt["completed_at"] = time.time()
+        writer.update(receipt)
+        committed = True
+        try:
+            quarantine.finalize()
+        except Exception as exc:
+            cleanup_pending.append(
+                str(
+                    exc.recovery_path
+                    if isinstance(exc, DeploymentQuarantineRecoveryRequired)
+                    else quarantine.quarantine
+                )
+            )
+        if cleanup_pending:
+            receipt["status"] = "cleanup-pending"
+            receipt["phase"] = "cleanup-pending"
+            receipt["cleanup_pending"] = cleanup_pending
+            try:
+                writer.update(receipt)
+            except Exception:
+                cleanup_pending.append(str(receipt_path))
+        return {
+            "skill": preview["skill"],
+            "client": preview["client"],
+            "state": "valid",
+            "action": "discard",
+            "status": "discarded",
+            "canonical_hash": preview["canonical_hash"],
+            "deployment_path": str(deployed.path),
+            "receipt_path": str(receipt_path),
+            "cleanup_pending": cleanup_pending,
+        }
+    except Exception as exc:
+        if committed:
+            raise
+        receipt_changed = isinstance(exc, ReceiptRecoveryRequired)
+        rolled_back = False
+        try:
+            rolled_back = quarantine.rollback()
+        except Exception:
+            rolled_back = False
+        receipt["status"] = "rolled-back" if rolled_back else "needs-recovery"
+        receipt["phase"] = receipt["status"]
+        receipt["error_code"] = "edit_recovery_failed"
+        receipt["completed_at"] = time.time()
+        if not rolled_back:
+            receipt["recovery_path"] = str(quarantine.quarantine)
+        if not receipt_changed:
+            try:
+                writer.update(receipt)
+            except Exception:
+                receipt_changed = True
+        if not rolled_back or receipt_changed:
+            raise SkillSyncError(
+                "discard recovery requires manual reconciliation",
+                code="edit_recovery_required",
+                exit_code=EXIT_SAFETY,
+                details={
+                    "receipt_path": str(receipt_path),
+                    "recovery_path": (
+                        str(receipt_path)
+                        if receipt_changed
+                        else str(quarantine.quarantine)
+                    ),
+                },
+            ) from exc
+        raise SkillSyncError(
+            "discard recovery failed; the tampered deployment was restored",
+            code="edit_recovery_failed",
+            exit_code=EXIT_SAFETY,
+            details={"receipt_path": str(receipt_path)},
+        ) from exc
 
 
 def _active_edit_trees(
@@ -2477,7 +3008,9 @@ def _operation_receipt_references(data_root: Path, rendered_root: Path) -> set[P
     operations = data_root / "operations"
     if not operations.is_dir():
         return references
-    for receipt_path in operations.glob("deploy-migrate-*.json"):
+    receipt_paths = list(operations.glob("deploy-migrate-*.json"))
+    receipt_paths.extend(operations.glob("edit-recover-*.json"))
+    for receipt_path in sorted(receipt_paths):
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:  # pragma: no cover
@@ -2487,7 +3020,10 @@ def _operation_receipt_references(data_root: Path, rendered_root: Path) -> set[P
                 exit_code=EXIT_SAFETY,
                 details={"receipt": str(receipt_path), "cause": str(exc)},
             ) from exc
-        if receipt.get("status") not in {"prepared", "applying", "needs-recovery"}:
+        reference_statuses = {"prepared", "applying", "needs-recovery"}
+        if receipt.get("operation") == "edit-recover":
+            reference_statuses.add("cleanup-pending")
+        if receipt.get("status") not in reference_statuses:
             continue
         for item in receipt.get("links", []):
             if not isinstance(item, dict):
@@ -2501,6 +3037,16 @@ def _operation_receipt_references(data_root: Path, rendered_root: Path) -> set[P
                     deployment = _rendered_deployment_root(target, rendered_root)
                     if deployment is not None:
                         references.add(deployment)
+        if receipt.get("operation") == "edit-recover":
+            for key in ("deployment_path", "quarantine_path", "recovery_path"):
+                value = receipt.get(key)
+                if not isinstance(value, str):
+                    continue
+                deployment = _rendered_deployment_root(
+                    Path(value).resolve(strict=False), rendered_root
+                )
+                if deployment is not None:
+                    references.add(deployment)
     return references
 
 
@@ -2522,7 +3068,11 @@ def _rendered_deployment_root(target: Path, rendered_root: Path) -> Path | None:
 
 
 _ACTIVE_DEPLOYMENT_RECEIPT_STATES = {"prepared", "applying", "needs-recovery"}
-_TERMINAL_DEPLOYMENT_RECEIPT_STATES = {"completed", "rolled-back"}
+_TERMINAL_DEPLOYMENT_RECEIPT_STATES = {
+    "completed",
+    "rolled-back",
+    "cleanup-pending",
+}
 
 
 def _deployment_receipt_health(data_root: Path) -> list[dict[str, Any]]:
@@ -2532,7 +3082,9 @@ def _deployment_receipt_health(data_root: Path) -> list[dict[str, Any]]:
     if not operations.is_dir():
         return []
     recovery: list[dict[str, Any]] = []
-    for receipt_path in sorted(operations.glob("deploy-migrate-*.json")):
+    receipt_paths = list(operations.glob("deploy-migrate-*.json"))
+    receipt_paths.extend(operations.glob("edit-recover-*.json"))
+    for receipt_path in sorted(receipt_paths):
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -2555,6 +3107,20 @@ def _deployment_receipt_health(data_root: Path) -> list[dict[str, Any]]:
                 }
             )
             continue
+        if receipt_path.name.startswith("edit-recover-"):
+            invalid_reason = _invalid_edit_recovery_receipt_reason(
+                receipt_path, receipt
+            )
+            if invalid_reason is not None:
+                recovery.append(
+                    {
+                        "path": str(receipt_path),
+                        "status": "malformed",
+                        "error": invalid_reason,
+                        "recovery": "Inspect this recovery receipt and its recorded artifacts before continuing.",
+                    }
+                )
+                continue
         status = receipt.get("status")
         if status in _TERMINAL_DEPLOYMENT_RECEIPT_STATES:
             continue
@@ -2582,6 +3148,101 @@ def _deployment_receipt_health(data_root: Path) -> list[dict[str, Any]]:
             item["rollback_errors"] = receipt["rollback_errors"]
         recovery.append(item)
     return recovery
+
+
+def _invalid_edit_recovery_receipt_reason(
+    receipt_path: Path, receipt: dict[str, Any]
+) -> str | None:
+    """Return why an edit-recover receipt cannot be trusted, if applicable."""
+
+    operation_id = receipt.get("operation_id")
+    try:
+        parsed_id = str(uuid.UUID(operation_id)) if isinstance(operation_id, str) else None
+    except ValueError:
+        parsed_id = None
+    expected_name = (
+        None if parsed_id is None else f"edit-recover-{parsed_id}.json"
+    )
+    required_strings = (
+        "skill",
+        "client",
+        "phase",
+        "canonical_path",
+        "canonical_hash",
+        "deployment_path",
+        "observed_hash",
+        "tampered_authored_hash",
+    )
+    if receipt.get("schema_version") != 1:
+        return "invalid or missing schema_version"
+    if receipt.get("operation") != "edit-recover":
+        return "invalid or missing operation"
+    if expected_name != receipt_path.name:
+        return "operation_id does not match receipt filename"
+    if receipt.get("action") not in {"capture", "discard"}:
+        return "invalid or missing recovery action"
+    if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in required_strings):
+        return "missing required recovery receipt fields"
+    if not all(
+        receipt[key].startswith("sha256:") and len(receipt[key]) == 71
+        for key in ("canonical_hash", "observed_hash", "tampered_authored_hash")
+    ):
+        return "invalid recovery receipt hash"
+    if not all(
+        Path(receipt[key]).is_absolute()
+        for key in ("canonical_path", "deployment_path")
+    ):
+        return "recovery receipt paths must be absolute"
+    if not isinstance(receipt.get("created_at"), (int, float)):
+        return "invalid or missing created_at"
+    status = receipt.get("status")
+    allowed_statuses = (
+        _ACTIVE_DEPLOYMENT_RECEIPT_STATES
+        | _TERMINAL_DEPLOYMENT_RECEIPT_STATES
+    )
+    if status not in allowed_statuses:
+        return f"unknown or missing receipt status: {status!r}"
+    valid_phases = {
+        "prepared": {"prepared"},
+        "applying": (
+            {"snapshotting"}
+            if receipt["action"] == "capture"
+            else {"quarantining", "rebuilding"}
+        ),
+        "completed": {"completed"},
+        "rolled-back": {"rolled-back"},
+        "needs-recovery": {"needs-recovery"},
+        "cleanup-pending": {"cleanup-pending"},
+    }
+    if receipt["phase"] not in valid_phases[status]:
+        return f"receipt phase {receipt['phase']!r} does not match status {status!r}"
+    if receipt["action"] == "capture":
+        if not isinstance(receipt.get("snapshot_path"), str) or not Path(
+            receipt["snapshot_path"]
+        ).is_absolute():
+            return "capture receipt has no absolute snapshot_path"
+        if status in {"completed", "cleanup-pending", "needs-recovery"} and not isinstance(
+            receipt.get("session_id"), str
+        ):
+            return "capture receipt has no session_id"
+    else:
+        if not isinstance(receipt.get("quarantine_path"), str) or not Path(
+            receipt["quarantine_path"]
+        ).is_absolute():
+            return "discard receipt has no absolute quarantine_path"
+    if status in _TERMINAL_DEPLOYMENT_RECEIPT_STATES | {"needs-recovery"}:
+        if not isinstance(receipt.get("completed_at"), (int, float)):
+            return "terminal recovery receipt has no completed_at"
+    if status == "needs-recovery" and not isinstance(
+        receipt.get("recovery_path"), str
+    ):
+        return "needs-recovery receipt has no recovery_path"
+    if status == "cleanup-pending" and not (
+        isinstance(receipt.get("cleanup_pending"), list)
+        and all(isinstance(item, str) for item in receipt["cleanup_pending"])
+    ):
+        return "cleanup-pending receipt has invalid cleanup paths"
+    return None
 
 
 def _assert_no_malformed_deployment_receipts(data_root: Path) -> None:

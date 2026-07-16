@@ -49,6 +49,14 @@ class CanonicalSkillChangedError(EditSessionMetadataError):
     """Raised when canonical content changes while its snapshot is created."""
 
 
+class EditSessionPublicationRecoveryRequired(EditSessionMetadataError):
+    """A session is visible but its parent-directory durability is ambiguous."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"edit session publication requires recovery: {session_id}")
+        self.session_id = session_id
+
+
 class EditSessionStatus(str, Enum):
     """Durable states for a managed edit transaction."""
 
@@ -297,6 +305,8 @@ class EditSessionStore:
         source: str | Path,
         baseline_hash: str,
         actor: str | None = None,
+        workspace_source: str | Path | None = None,
+        workspace_hash: str | None = None,
     ) -> tuple[EditSessionMetadata, EditSessionPaths]:
         """Atomically create a Base snapshot and writable workspace.
 
@@ -307,6 +317,12 @@ class EditSessionStore:
         """
 
         source_path = Path(source)
+        workspace_source_path = (
+            source_path if workspace_source is None else Path(workspace_source)
+        )
+        expected_workspace_hash = (
+            baseline_hash if workspace_hash is None else workspace_hash
+        )
         metadata = EditSessionMetadata.new(
             logical_skill=logical_skill,
             baseline_hash=baseline_hash,
@@ -331,10 +347,13 @@ class EditSessionStore:
                     raise CanonicalSkillChangedError(
                         "canonical Skill changed while creating the edit baseline"
                     )
-                workspace_hash = copy_skill_dir(staged_baseline, staged_workspace)
-                if workspace_hash != baseline_hash:
+                copied_workspace_hash = copy_skill_dir(
+                    staged_baseline if workspace_source is None else workspace_source_path,
+                    staged_workspace,
+                )
+                if copied_workspace_hash != expected_workspace_hash:
                     raise EditSessionMetadataError(
-                        "edit workspace does not match its baseline snapshot"
+                        "edit workspace does not match its expected snapshot"
                     )
                 _set_snapshot_permissions(staged_baseline, writable=False)
                 _set_snapshot_permissions(staged_workspace, writable=True)
@@ -343,7 +362,18 @@ class EditSessionStore:
                     metadata.to_dict(),
                 )
                 rename_no_replace(staging, paths.root)
-                _fsync_directory(self.root)
+                try:
+                    _fsync_directory(self.root)
+                except OSError as exc:
+                    try:
+                        published = self.load(metadata.session_id)
+                    except (FileNotFoundError, EditSessionMetadataError, OSError):
+                        raise
+                    if published == metadata:
+                        raise EditSessionPublicationRecoveryRequired(
+                            metadata.session_id
+                        ) from exc
+                    raise
             except Exception:
                 if staging.exists() and not is_link_or_reparse(staging):
                     _remove_real_tree(staging)

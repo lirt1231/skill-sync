@@ -1020,7 +1020,7 @@ edit apply 直接影响用户源数据或托管部署，不能通过并行开发
 
 ## 20. 现在应该从哪里开始
 
-Step 0–4 和 commit `5.1`–`5.7` 已完成并验收。当前所有托管客户端都使用只读
+Step 0–4 和 commit `5.1`–`5.8` 已完成并验收。当前所有托管客户端都使用只读
 rendered deployment；edit session 已具备严格 metadata、只读
 `list/status/diff/validate/impact`、Base baseline snapshot、writable workspace、
 `begin/abort` 和 transactional `apply`。apply 使用 `deployment.lock → per-Skill
@@ -1033,9 +1033,15 @@ concrete clients 构建并验证新的 rendered deployment，并在同一事务�
 `needs-recovery`。canonical、链接、metadata 和 completed receipt 提交后的清理异常
 只记录为 `cleanup_pending`，不会把已提交事务重新回滚。apply 仍不执行 Git 操作。
 
-下一 commit 是 `5.8 add managed edit recovery`：提供 tampered deployment diff 和
-显式 capture/discard 流程，绝不自动采用被篡改内容。它位于串行关键链上，不与
-`5.7` 或 `5.9` 并行开发。
+`edit recover <skill> --client <id>` 默认只读展示排除 provenance 的 tampered
+authored-content diff；只有显式 `--capture` 才会把安全快照原子发布为新的 Base edit
+session，显式 `--discard` 才会 quarantine 原 deployment 并从 canonical 原路径重建。
+两种动作都使用私有 receipt，不执行 Git；unfinished session、receipt 歧义和外部
+winner 一律 fail closed，提交后的清理失败只记录为 `cleanup-pending`。单客户端
+recover 不擅自修复 `edit apply` 留下的多链接 transactional `needs-recovery`。
+
+下一 commit 是 `5.9 document base managed edit workflow`：只更新 README、完整
+`--help` 和 CLI e2e fixture，不新增 core 行为。它必须在 5.8 验收并提交后开始。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 
