@@ -1170,9 +1170,20 @@ commit `6.8 add inventory filters and agent labels` 已完成。技能库搜索�
 和选择项会在对应数据加载完成后安全清理。本 commit 没有新增 Variant badge，也没有
 修改 core API、mutation preview 或确认流程。
 
-当前并行中的 commit 是 `6.9 add web mutation preview models`；它必须通过共享
-preflight 保证 preview 与正式 action 的 blocker 一致，并保持完全只读。`6.8` 与
-`6.9` 汇合并统一验收后，再进入 `6.10 add web mutation confirmation flows`。
+前置 safety commit `6.9-pre serialize delete with managed edits` 已完成，对应
+`9090ee7`。永久删除会按稳定顺序持有 deployment 与目标 Skill locks，在锁内使用最新
+config/registry 解析大小写 identity，并阻止 unfinished edit session；begin/delete 的
+双向真实争用、大小写去重、歧义和 stale snapshot 均有回归测试。
+
+commit `6.9 add web mutation preview models` 已完成。sync、import、Agent
+enable/disable、link repair 和永久删除统一通过 `preview_mutation` 生成只读 v1 plan；
+plan 展示规范化 request、实际影响 Skill/client、步骤、conflict/blocker、预期写入、
+backup/recovery 和 freshness。preview 不 fetch、不 commit、不 push、不创建锁或写入文件，
+正式 action 复用同一 resolver/preflight，并在执行前重新规划而非信任 plan 作为授权凭证。
+
+当前下一 commit 是 `6.10 add web mutation confirmation flows`：前端使用统一
+plan → confirm → running → result 交互替换原生 confirm，并为多项永久删除增加加强确认；
+不提前加入 Variant、Edit Session UI 或 Deployment Matrix。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

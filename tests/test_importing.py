@@ -107,6 +107,8 @@ class ImportAgentSkillsTest(unittest.TestCase):
     def test_import_rollback_restores_original_when_migration_fails(self):
         source = self.write_skill(self.agent_root, "alpha", "# original\n")
         with mock.patch("skill_sync.core.detect_agents", return_value=[self.agent]), mock.patch(
+            "skill_sync.core.detect_clients", return_value=[self.client]
+        ), mock.patch(
             "skill_sync.core.deploy_migrate", side_effect=SkillSyncError("failed")
         ):
             with self.assertRaisesRegex(SkillSyncError, "failed"):
@@ -123,6 +125,8 @@ class ImportAgentSkillsTest(unittest.TestCase):
             raise SkillSyncError("failed")
 
         with mock.patch("skill_sync.core.detect_agents", return_value=[self.agent]), mock.patch(
+            "skill_sync.core.detect_clients", return_value=[self.client]
+        ), mock.patch(
             "skill_sync.core.deploy_migrate", side_effect=fail_after_real_directory_appears
         ), mock.patch.object(Path, "rmdir") as rmdir:
             with self.assertRaisesRegex(SkillSyncError, "failed"):

@@ -78,8 +78,17 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(length) or b"{}")
-                views = _body_views(body.get("views"))
                 path = urlparse(self.path).path
+                if path == "/api/plan":
+                    self._json(
+                        core.preview_mutation(
+                            body.get("operation"),
+                            body.get("request"),
+                            config_path=config_path,
+                        )
+                    )
+                    return
+                views = _body_views(body.get("views"))
                 kwargs = {"skill_names": body.get("skills"), "config_path": config_path}
                 if path == "/api/init":
                     result = core.init_sync(

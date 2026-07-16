@@ -110,6 +110,24 @@ class GitWrapperTest(unittest.TestCase):
         self.assertEqual(args[0], ["git", "status"])
         self.assertEqual(kwargs["cwd"], Path("/tmp/repo"))
         self.assert_git_subprocess_hardened(kwargs)
+        self.assertNotIn("GIT_OPTIONAL_LOCKS", kwargs["env"])
+
+    def test_read_only_git_disables_only_optional_locks(self):
+        completed = subprocess.CompletedProcess(
+            args=["git", "status"], returncode=0, stdout="ok\n", stderr=""
+        )
+        with mock.patch.object(
+            git_module.shutil, "which", return_value="/usr/bin/git"
+        ), mock.patch.object(
+            git_module.subprocess, "run", return_value=completed
+        ) as run:
+            self.assertEqual(
+                run_git(Path("/tmp/repo"), ["status"], read_only=True), "ok"
+            )
+
+        _, kwargs = run.call_args
+        self.assert_git_subprocess_hardened(kwargs)
+        self.assertEqual(kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
 
     def test_clone_repo_uses_non_interactive_bounded_subprocess(self):
         completed = subprocess.CompletedProcess(
@@ -138,6 +156,7 @@ class GitWrapperTest(unittest.TestCase):
         )
         self.assertEqual(kwargs["cwd"], dest.parent)
         self.assert_git_subprocess_hardened(kwargs)
+        self.assertNotIn("GIT_OPTIONAL_LOCKS", kwargs["env"])
 
     def test_init_repo_creates_main_branch_and_clean_worktree(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -26,11 +26,20 @@ def ensure_git_available() -> None:
         raise GitError("git executable is not available")
 
 
-def _run_git_subprocess(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_git_subprocess(
+    cwd: Path,
+    args: list[str],
+    *,
+    read_only: bool = False,
+) -> subprocess.CompletedProcess[str]:
     ensure_git_available()
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = "true"
+    if read_only:
+        # Status and graph inspection must not refresh the index or create
+        # optional lock files. Mutation commands retain Git's normal locking.
+        env["GIT_OPTIONAL_LOCKS"] = "0"
     command = ["git", *args]
     try:
         return subprocess.run(
@@ -50,8 +59,8 @@ def _run_git_subprocess(cwd: Path, args: list[str]) -> subprocess.CompletedProce
         ) from exc
 
 
-def run_git(repo: Path, args: list[str]) -> str:
-    result = _run_git_subprocess(repo, args)
+def run_git(repo: Path, args: list[str], *, read_only: bool = False) -> str:
+    result = _run_git_subprocess(repo, args, read_only=read_only)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         command = "git " + " ".join(args)
@@ -102,12 +111,12 @@ def clone_or_use_existing(repo_url: str, dest: Path, branch: str = "main") -> No
 
 
 def is_clean(repo: Path) -> bool:
-    return run_git(repo, ["status", "--porcelain"]) == ""
+    return run_git(repo, ["status", "--porcelain"], read_only=True) == ""
 
 
 def _has_origin(repo: Path) -> bool:
     try:
-        run_git(repo, ["remote", "get-url", "origin"])
+        run_git(repo, ["remote", "get-url", "origin"], read_only=True)
     except GitError:
         return False
     return True
@@ -137,7 +146,11 @@ def state(repo: Path, branch: str = "main", *, fetch_remote: bool = True) -> Git
 
     if fetch_remote:
         fetch(repo, branch)
-    counts = run_git(repo, ["rev-list", "--left-right", "--count", f"HEAD...origin/{branch}"])
+    counts = run_git(
+        repo,
+        ["rev-list", "--left-right", "--count", f"HEAD...origin/{branch}"],
+        read_only=True,
+    )
     ahead_text, behind_text = counts.split()
     ahead = int(ahead_text)
     behind = int(behind_text)

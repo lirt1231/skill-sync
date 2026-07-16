@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from skill_sync import git
-from skill_sync.agents import aggregate_agent_targets, detect_agents, detect_clients
+from skill_sync.agents import (
+    aggregate_agent_targets,
+    detect_agents,
+    detect_clients,
+    expand_agent_clients,
+)
 from skill_sync.config import default_config_path, default_data_root, load_config, save_config
 from skill_sync.copying import copy_skill_dir, rename_no_replace
 from skill_sync.deployment import (
@@ -78,6 +83,7 @@ from skill_sync.skill_metadata import read_skill_description
 
 REGISTRY_FILE = "registry.yaml"
 DEFAULT_AGENT_TARGETS = "codex,workbuddy,kimi,claude"
+WEB_MUTATION_ACTIONS = ("sync", "import", "agent", "link-repair", "delete")
 
 
 class _EditTransitionRecoveryRequired(RuntimeError):
@@ -209,6 +215,575 @@ def sync_preview(
         }
     except (git.GitError, ValueError, OSError) as exc:
         raise SkillSyncError(str(exc)) from exc
+
+
+def preview_mutation(
+    operation: str,
+    request: dict[str, Any],
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Build a read-only Web mutation plan from normalized core inputs.
+
+    The plan deliberately contains only names, paths, hashes, states and
+    recovery guidance.  It never reads Skill bodies or credentials, contacts
+    a remote, creates a backup, writes configuration, or changes a link.
+    """
+
+    if operation not in WEB_MUTATION_ACTIONS:
+        raise SkillSyncError(
+            f"unknown mutation preview operation: {operation}",
+            code="invalid_mutation_preview",
+            exit_code=EXIT_SAFETY,
+        )
+    if not isinstance(request, dict):
+        raise SkillSyncError(
+            "mutation preview request must be an object",
+            code="invalid_mutation_preview",
+            exit_code=EXIT_SAFETY,
+        )
+    allowed_fields = {
+        "sync": {"skills"},
+        "import": {"skills", "agent"},
+        "agent": {"agent", "enabled"},
+        "link-repair": {"skills", "agents"},
+        "delete": {"skills"},
+    }[operation]
+    unknown = set(request) - allowed_fields
+    if unknown:
+        raise SkillSyncError(
+            "unknown mutation preview field: " + ", ".join(sorted(unknown)),
+            code="invalid_mutation_preview",
+            exit_code=EXIT_SAFETY,
+        )
+    clients = tuple(detect_clients())
+    try:
+        if operation == "sync":
+            return _sync_mutation_preview(request.get("skills"), config_path, clients)
+        if operation == "import":
+            return _import_mutation_preview(
+                request.get("skills"), request.get("agent"), config_path, clients
+            )
+        if operation == "agent":
+            return _agent_mutation_preview(
+                request.get("agent"), request.get("enabled"), config_path, clients
+            )
+        if operation == "link-repair":
+            return _link_repair_mutation_preview(
+                request.get("skills"), request.get("agents"), config_path, clients
+            )
+        return _delete_mutation_preview(request.get("skills"), config_path, clients)
+    except SkillSyncError:
+        raise
+    except (git.GitError, OSError, ValueError) as exc:
+        raise SkillSyncError(
+            f"could not safely preview {operation}: {exc}",
+            code="mutation_preview_failed",
+            exit_code=EXIT_SAFETY,
+            details={"operation": operation},
+        ) from exc
+
+
+def _mutation_plan(
+    operation: str,
+    normalized_input: dict[str, Any],
+    *,
+    affected_skills: list[dict[str, Any]],
+    affected_clients: list[dict[str, Any]],
+    conflicts: list[dict[str, Any]],
+    blockers: list[dict[str, Any]],
+    backup: dict[str, Any],
+    recovery: dict[str, Any],
+    summary: str,
+    details: dict[str, Any] | None = None,
+    warnings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return the stable, additive schema shared by every Web plan."""
+
+    detail_rows = {} if details is None else details
+    return {
+        "schema_version": 1,
+        "operation": operation,
+        "request": normalized_input,
+        "status": "conflict" if conflicts else "blocked" if blockers else "ready",
+        "can_execute": not conflicts and not blockers,
+        "summary": summary,
+        "targets": {
+            "skills": affected_skills,
+            "clients": affected_clients,
+        },
+        "steps": _mutation_steps(
+            operation, normalized_input, affected_skills, affected_clients
+        ),
+        "conflicts": conflicts,
+        "blockers": blockers,
+        "warnings": [] if warnings is None else warnings,
+        "effects": _mutation_effects(
+            operation,
+            skill_count=len(affected_skills),
+            client_count=len(affected_clients),
+            conflicts=conflicts,
+            details=detail_rows,
+        ),
+        "backup": {"created": False, **backup},
+        "recovery": recovery,
+        "freshness": {
+            "remote_checked": False,
+            "replan_required": True,
+            "hint": "Rebuild this plan immediately before executing the mutation.",
+        },
+        "details": detail_rows,
+    }
+
+
+def _mutation_steps(
+    operation: str,
+    normalized_input: dict[str, Any],
+    skills: list[dict[str, Any]],
+    clients: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    if operation == "agent":
+        steps.append(
+            {
+                "order": 1,
+                "action": "enable-agent-config"
+                if normalized_input["enabled"]
+                else "disable-agent-config",
+                "skill": None,
+                "family": normalized_input["agent"],
+                "client": None,
+                "path": None,
+                "state": None,
+                "reason": "Update the persisted disabled Agent families.",
+            }
+        )
+    for skill in skills:
+        steps.append(
+            {
+                "order": len(steps) + 1,
+                "action": skill.get("effect", operation),
+                "skill": skill.get("name"),
+                "path": skill.get("canonical_path") or skill.get("source_path"),
+                "state": skill.get("state"),
+                "reason": skill.get("reason"),
+            }
+        )
+    for client in clients:
+        steps.append(
+            {
+                "order": len(steps) + 1,
+                "action": client.get("effect", operation),
+                "skill": client.get("skill"),
+                "family": client.get("agent"),
+                "client": client.get("client"),
+                "path": client.get("destination"),
+                "state": client.get("current_state"),
+                "reason": client.get("reason"),
+            }
+        )
+    return steps
+
+
+def _mutation_effects(
+    operation: str,
+    *,
+    skill_count: int,
+    client_count: int,
+    conflicts: list[dict[str, Any]],
+    details: dict[str, Any],
+) -> dict[str, Any]:
+    sync_action = details.get("sync_action")
+    effects = {
+        "predicted": True,
+        "network": False,
+        "git": {"fetch": False, "commit": False, "push": False},
+        "writes": {
+            "config": False,
+            "registry": False,
+            "canonical": False,
+            "rendered": False,
+            "agent_links": False,
+        },
+        "permanent": False,
+        "skills": skill_count,
+        "clients": client_count,
+        "conflicts": conflicts,
+    }
+    if operation == "sync":
+        effects["network"] = True
+        effects["git"] = {
+            "fetch": True,
+            "commit": sync_action == "push",
+            "push": sync_action == "push",
+        }
+        effects["writes"].update(
+            {
+                "config": sync_action in {"pull", "push"},
+                "registry": sync_action == "pull",
+                "canonical": sync_action == "pull",
+                "rendered": sync_action in {"pull", "repair-links"},
+                "agent_links": sync_action in {"pull", "repair-links"},
+            }
+        )
+    elif operation == "import":
+        if not details.get("noop", False):
+            effects["writes"].update(
+                {
+                    "config": True,
+                    "registry": True,
+                    "canonical": True,
+                    "rendered": True,
+                    "agent_links": True,
+                }
+            )
+    elif operation == "agent":
+        effects["writes"]["config"] = True
+        effects["writes"]["agent_links"] = bool(details.get("link_changes", 0))
+    elif operation == "link-repair":
+        if not details.get("noop", False):
+            effects["writes"]["rendered"] = True
+            effects["writes"]["agent_links"] = True
+    elif operation == "delete":
+        effects["writes"].update(
+            {
+                "config": True,
+                "registry": True,
+                "canonical": True,
+                "agent_links": True,
+            }
+        )
+        effects["permanent"] = True
+    return effects
+
+
+def _sync_mutation_preview(
+    skill_names: Iterable[str] | None,
+    config_path: str | Path | None,
+    clients: tuple[Any, ...],
+) -> dict[str, Any]:
+    normalized = _resolve_sync_input(skill_names, config_path)
+    config = _load_local_config(config_path)
+    safety_blockers = _sync_safety_blockers(config)
+    diagnosis = doctor(config_path=config_path, clients=clients)
+    preview = sync_preview(
+        skill_names=normalized["skills"],
+        config_path=config_path,
+        fetch_remote=False,
+        diagnosis=diagnosis,
+    )
+    conflicts = [
+        {"code": issue.get("type", "sync-issue"), "detail": issue.get("detail", "")}
+        for issue in preview.get("issues", [])
+        if issue.get("type") in {"content-conflict", "dirty-repository"}
+    ]
+    blockers = []
+    if preview["action"] in {"blocked", "conflict", "setup"}:
+        blockers.append(
+            {
+                "code": f"sync-{preview['action']}",
+                "detail": preview["summary"],
+            }
+        )
+    blockers.extend(safety_blockers)
+    affected_skills = [
+        {"name": name, "effect": preview["action"]}
+        for name in normalized["skills"]
+    ]
+    affected_clients = _configured_clients_for_skills(
+        config, normalized["skills"], clients
+    )
+    return _mutation_plan(
+        "sync",
+        normalized,
+        affected_skills=affected_skills,
+        affected_clients=affected_clients,
+        conflicts=conflicts,
+        blockers=blockers,
+        backup={
+            "strategy": "git-history",
+            "automatic": False,
+            "persistent": False,
+            "hint": "The preview creates nothing. A predicted push commits later; pull has no automatic local backup.",
+        },
+        recovery={
+            "strategy": "stop-on-conflict",
+            "hint": "Resolve repository or content conflicts before running sync.",
+            "operations": _deployment_receipt_health(_data_root(config)),
+        },
+        summary=preview["summary"],
+        details={"sync_action": preview["action"], "remote_checked": False},
+    )
+
+
+def _import_mutation_preview(
+    skill_names: Iterable[str] | None,
+    agent_name: str | None,
+    config_path: str | Path | None,
+    clients: tuple[Any, ...],
+) -> dict[str, Any]:
+    resolved = _resolve_import_input(
+        skill_names, agent_name, config_path, clients=clients
+    )
+    conflicts, blockers = _import_safety_findings(resolved)
+    affected_source_clients = [
+        {
+            "skill": row["name"],
+            "agent": target["agent"],
+            "client": target["client"],
+            "destination": str(Path(target["destination_root"]) / row["name"]),
+            "role": (
+                "source-and-deployment"
+                if target["client"] == resolved["source_client"]
+                else "deployment"
+            ),
+            "effect": "replace-source-with-managed-link",
+        }
+        for row in resolved["rows"]
+        if row["state"] != "already-linked"
+        for target in resolved["deployment_clients"]
+    ]
+    normalized = {"skills": resolved["skills"], "agent": resolved["agent"]}
+    return _mutation_plan(
+        "import",
+        normalized,
+        affected_skills=[
+            {
+                "name": row["name"],
+                "source_path": row["source_path"],
+                "canonical_path": row["canonical_path"],
+                "effect": row["state"],
+            }
+            for row in resolved["rows"]
+        ],
+        affected_clients=affected_source_clients,
+        conflicts=conflicts,
+        blockers=blockers,
+        backup={
+            "strategy": "temporary-source-rename",
+            "persistent": False,
+            "hint": "The action keeps a temporary rollback copy until link verification succeeds.",
+        },
+        recovery={
+            "strategy": "restore-source-on-failure",
+            "hint": "A failed rollback reports the preserved backup path and stops further mutations.",
+            "operations": [],
+        },
+        summary=f"Import {len(resolved['skills'])} Skill(s) from {resolved['agent']}.",
+        details={
+            "noop": all(
+                row["state"] == "already-linked" for row in resolved["rows"]
+            )
+        },
+    )
+
+
+def _agent_mutation_preview(
+    agent_name: str | None,
+    enabled: bool | None,
+    config_path: str | Path | None,
+    clients: tuple[Any, ...],
+) -> dict[str, Any]:
+    resolved = _resolve_agent_toggle_input(
+        agent_name, enabled, config_path, clients=clients
+    )
+    config = _load_local_config(config_path)
+    registry = _load_local_registry(config)
+    affected_clients = (
+        []
+        if resolved["enabled"]
+        else _agent_unlink_targets(
+            config, registry, resolved["agent"], clients
+        )
+    )
+    affected_skill_names = sorted(
+        {row["skill"] for row in affected_clients}
+    )
+    blockers = _agent_safety_blockers(config, enabled=resolved["enabled"])
+    return _mutation_plan(
+        "agent",
+        resolved,
+        affected_skills=[
+            {"name": name, "effect": "unlink-and-disable"}
+            for name in affected_skill_names
+        ],
+        affected_clients=affected_clients,
+        conflicts=[],
+        blockers=blockers,
+        backup={
+            "strategy": "previous-config-value",
+            "persistent": False,
+            "hint": "Disabling rolls the config and managed links back if unlinking fails.",
+        },
+        recovery={
+            "strategy": "relink-from-managed-deployments",
+            "hint": "If rollback cannot restore links, the action reports recovery details.",
+            "operations": _deployment_receipt_health(_data_root(config)),
+        },
+        summary=("Enable" if resolved["enabled"] else "Disable")
+        + f" {resolved['agent']} synchronization.",
+        details={**resolved, "link_changes": len(affected_clients)},
+    )
+
+
+def _agent_unlink_targets(
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    agent_name: str,
+    clients: Iterable[Any],
+) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    rendered_root = _rendered_root(config)
+    for client in clients:
+        if client.family_id != agent_name or not client.skills_dir.is_dir():
+            continue
+        for name in sorted(_selected_names(registry)):
+            source = _local_skill_path_or_default(config, registry, name)
+            if not (source / "SKILL.md").is_file():
+                continue
+            entry = registry.get("skills", {}).get(name, {})
+            configured = _configured_client_targets(entry)
+            if configured and not {client.id, client.family_id}.intersection(
+                configured
+            ):
+                continue
+            destination = client.skills_dir / name
+            if _owned_link_target(
+                source, destination, rendered_root, name, client.id
+            ) is None:
+                continue
+            targets.append(
+                {
+                    "skill": name,
+                    "agent": client.family_id,
+                    "client": client.id,
+                    "destination": str(destination),
+                    "current_state": "managed-link",
+                    "effect": "remove-managed-link",
+                }
+            )
+    return targets
+
+
+def _link_repair_mutation_preview(
+    skill_names: Iterable[str] | None,
+    agent_names: Iterable[str] | None,
+    config_path: str | Path | None,
+    clients: tuple[Any, ...],
+) -> dict[str, Any]:
+    resolved = _resolve_link_input(
+        skill_names, agent_names, config_path, clients=clients
+    )
+    config = _load_local_config(config_path)
+    registry = _load_local_registry(config)
+    plan = _deployment_plan(
+        config,
+        registry,
+        resolved["skills"],
+        resolved["agents"],
+        clients=clients,
+    )
+    conflicts, blockers = _link_safety_findings(
+        config, resolved, plan, clients
+    )
+    affected_clients = [
+        {
+            "skill": skill["name"],
+            "agent": client["agent"],
+            "client": client["client"],
+            "destination": client["destination"],
+            "current_state": client["current_state"],
+            "effect": client["action"],
+        }
+        for skill in plan
+        for client in skill["clients"]
+    ]
+    return _mutation_plan(
+        "link-repair",
+        resolved,
+        affected_skills=[
+            {
+                "name": skill["name"],
+                "source_path": skill["source_path"],
+                "effect": (
+                    "noop"
+                    if all(
+                        client["action"] == "noop"
+                        for client in skill["clients"]
+                    )
+                    else "repair-links"
+                ),
+            }
+            for skill in plan
+        ],
+        affected_clients=affected_clients,
+        conflicts=conflicts,
+        blockers=blockers,
+        backup={
+            "strategy": "transactional-link-swap",
+            "persistent": False,
+            "hint": "The action records previous managed targets before swapping links.",
+        },
+        recovery={
+            "strategy": "deployment-receipt",
+            "hint": "Interrupted swaps stop with a receipt that identifies links requiring recovery.",
+            "operations": _deployment_receipt_health(_data_root(config)),
+        },
+        summary=f"Repair managed links for {len(plan)} Skill(s).",
+        details={
+            "noop": all(
+                client["action"] == "noop"
+                for skill in plan
+                for client in skill["clients"]
+            )
+        },
+    )
+
+
+def _delete_mutation_preview(
+    skill_names: Iterable[str] | None,
+    config_path: str | Path | None,
+    clients: tuple[Any, ...],
+) -> dict[str, Any]:
+    resolved = _resolve_delete_input(skill_names, config_path, clients=clients)
+    config = _load_local_config(config_path)
+    blockers = _delete_safety_blockers(config, resolved["skills"])
+    return _mutation_plan(
+        "delete",
+        {"skills": resolved["skills"]},
+        affected_skills=[
+            {
+                "name": row["name"],
+                "canonical_path": row["canonical_path"],
+                "effect": "permanent-delete",
+            }
+            for row in resolved["rows"]
+        ],
+        affected_clients=[
+            {
+                "skill": row["name"],
+                "agent": client["agent"],
+                "client": client["client"],
+                "destination": client["destination"],
+                "effect": "remove-managed-link",
+            }
+            for row in resolved["rows"]
+            for client in row["clients"]
+        ],
+        conflicts=[],
+        blockers=blockers,
+        backup={
+            "strategy": "temporary-canonical-rename",
+            "persistent": False,
+            "hint": "No persistent backup remains after success; create an explicit backup first if needed.",
+        },
+        recovery={
+            "strategy": "restore-before-commit",
+            "hint": "The action restores canonical paths and managed links if registry/config updates fail.",
+            "operations": _deployment_receipt_health(_data_root(config)),
+        },
+        summary=f"Permanently delete {len(resolved['skills'])} global Skill(s).",
+        warnings=resolved["warnings"],
+    )
 
 
 def init_sync(
@@ -390,12 +965,14 @@ def edit_begin(
         source = _local_skill_path_or_default(config, registry, skill_name).absolute()
         _validate_skill_path(source)
         baseline_hash = hash_skill_dir(source)
-        metadata, paths = EditSessionStore(_data_root(config)).begin(
-            logical_skill=skill_name,
-            source=source,
-            baseline_hash=baseline_hash,
-            actor=actor,
-        )
+        store = EditSessionStore(_data_root(config))
+        with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
+            metadata, paths = store.begin(
+                logical_skill=skill_name,
+                source=source,
+                baseline_hash=baseline_hash,
+                actor=actor,
+            )
         return {
             "session_id": metadata.session_id,
             "skill": metadata.logical_skill,
@@ -2271,7 +2848,15 @@ def sync(
     """Run the safe default synchronization workflow."""
 
     try:
-        preview = sync_preview(skill_names=skill_names, config_path=config_path, fetch_remote=True)
+        normalized = _resolve_sync_input(skill_names, config_path)
+        config = _load_local_config(config_path)
+        _raise_preflight_findings(
+            "sync", blockers=_sync_safety_blockers(config)
+        )
+        targets = None if normalized["all_selected"] else normalized["skills"]
+        preview = sync_preview(
+            skill_names=targets, config_path=config_path, fetch_remote=True
+        )
         action = preview["action"]
         if action == "setup":
             raise SkillSyncError("skill-sync is not initialized; run init first")
@@ -2280,17 +2865,17 @@ def sync(
         if action == "conflict":
             raise SkillSyncError("both remote and local selected Skills changed; resolve manually")
         if action == "pull":
-            result = pull(skill_names=skill_names, config_path=config_path)
+            result = pull(skill_names=targets, config_path=config_path)
             if "platform" not in _load_local_config(config_path):
-                result["links"] = link_skills(skill_names=skill_names, config_path=config_path)["links"]
+                result["links"] = link_skills(skill_names=targets, config_path=config_path)["links"]
             return result
         if action == "push":
-            return push(skill_names=skill_names, config_path=config_path)
+            return push(skill_names=targets, config_path=config_path)
         if action == "repair-links":
-            return {"synced": [], "links": link_skills(skill_names=skill_names, config_path=config_path)["links"]}
+            return {"synced": [], "links": link_skills(skill_names=targets, config_path=config_path)["links"]}
         result: dict[str, Any] = {"synced": [], "noop": True}
         if "platform" not in _load_local_config(config_path):
-            result["links"] = link_skills(skill_names=skill_names, config_path=config_path)["links"]
+            result["links"] = link_skills(skill_names=targets, config_path=config_path)["links"]
         return result
     except SkillSyncError:
         raise
@@ -2397,6 +2982,485 @@ def _target_names(registry: dict[str, Any], skill_names: Iterable[str] | None) -
     return targets
 
 
+def _normalize_skill_names(
+    skill_names: Iterable[str] | None,
+    *,
+    required: bool,
+) -> list[str] | None:
+    if skill_names is None:
+        if required:
+            raise SkillSyncError("at least one Skill name is required")
+        return None
+    if isinstance(skill_names, (str, bytes)):
+        raise SkillSyncError("skills must be a list of Skill names")
+    try:
+        names = list(skill_names)
+    except TypeError as exc:
+        raise SkillSyncError("skills must be a list of Skill names") from exc
+    if not all(isinstance(name, str) for name in names):
+        raise SkillSyncError("skills must contain only Skill names")
+    names = list(dict.fromkeys(names))
+    if required and not names:
+        raise SkillSyncError("at least one Skill name is required")
+    for name in names:
+        if not name or Path(name).name != name or name in {".", ".."}:
+            raise SkillSyncError(f"invalid Skill name: {name}")
+    return names
+
+
+def _normalize_agent_names(
+    agent_names: Iterable[str] | None,
+) -> list[str]:
+    if agent_names is None:
+        return []
+    if isinstance(agent_names, (str, bytes)):
+        raise SkillSyncError("agents must be a list of Agent or client names")
+    try:
+        names = list(agent_names)
+    except TypeError as exc:
+        raise SkillSyncError("agents must be a list of Agent or client names") from exc
+    if not all(isinstance(name, str) and name for name in names):
+        raise SkillSyncError("agents must contain only non-empty names")
+    return list(dict.fromkeys(names))
+
+
+def _resolve_sync_input(
+    skill_names: Iterable[str] | None,
+    config_path: str | Path | None,
+) -> dict[str, Any]:
+    config = _load_local_config(config_path)
+    registry = _load_local_registry(config)
+    requested = _normalize_skill_names(skill_names, required=False)
+    return {
+        "skills": _target_names(registry, requested),
+        "all_selected": requested is None,
+    }
+
+
+def _resolve_link_input(
+    skill_names: Iterable[str] | None,
+    agent_names: Iterable[str] | None,
+    config_path: str | Path | None,
+    *,
+    clients: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    config = _load_local_config(config_path)
+    registry = _load_local_registry(config)
+    requested_skills = _normalize_skill_names(skill_names, required=False)
+    requested_agents = _normalize_agent_names(agent_names)
+    client_snapshot = tuple(detect_clients() if clients is None else clients)
+    known = {client.id for client in client_snapshot} | {
+        client.family_id for client in client_snapshot
+    }
+    unknown = set(requested_agents) - known
+    if unknown:
+        raise SkillSyncError(
+            "unknown Agent or client: " + ", ".join(sorted(unknown))
+        )
+    return {
+        "skills": _target_names(registry, requested_skills),
+        "agents": requested_agents,
+    }
+
+
+def _resolve_agent_toggle_input(
+    agent_name: str | None,
+    enabled: bool | None,
+    config_path: str | Path | None,
+    *,
+    clients: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    # Load and validate local config so preview and action fail the same way on
+    # malformed machine state, even though target resolution itself is local.
+    _load_local_config(config_path)
+    if not isinstance(agent_name, str) or not agent_name:
+        raise SkillSyncError("agent must be a non-empty Agent family name")
+    if not isinstance(enabled, bool):
+        raise SkillSyncError("enabled must be a boolean")
+    normalized = _normalize_agent_name(agent_name)
+    client_snapshot = tuple(detect_clients() if clients is None else clients)
+    known = {client.family_id for client in client_snapshot}
+    if normalized not in known:
+        raise SkillSyncError(f"unknown Agent: {agent_name}")
+    return {"agent": normalized, "enabled": enabled}
+
+
+def _resolve_import_input(
+    skill_names: Iterable[str] | None,
+    agent_name: str | None,
+    config_path: str | Path | None,
+    *,
+    clients: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    names = _normalize_skill_names(skill_names, required=True)
+    assert names is not None
+    if not isinstance(agent_name, str) or not agent_name:
+        raise SkillSyncError("agent must be a non-empty Agent family name")
+    config = _load_local_config(config_path)
+    client_snapshot = tuple(detect_clients() if clients is None else clients)
+    known_families = {client.family_id for client in client_snapshot}
+    if agent_name not in known_families:
+        raise SkillSyncError(f"unknown Agent: {agent_name}")
+    global_root = _global_skill_root(config)
+    try:
+        deployment_clients = expand_agent_clients(
+            agent_name, clients=client_snapshot, detected_only=True
+        )
+    except ValueError as exc:
+        raise SkillSyncError(str(exc)) from exc
+    if not deployment_clients:
+        raise SkillSyncError(f"Agent is not detected: {agent_name}")
+    blockers: list[dict[str, Any]] = []
+    if len(deployment_clients) != 1:
+        blockers.append(
+            {
+                "code": "ambiguous-import-source-client",
+                "agent": agent_name,
+                "detail": "Import requires exactly one detected concrete source client.",
+            }
+        )
+    source_client = deployment_clients[0] if len(deployment_clients) == 1 else None
+    source_root = deployment_clients[0].skills_dir
+    expected_clients = sorted(
+        _import_client_ids(
+            agent_name,
+            source_root,
+            clients=client_snapshot,
+        )
+    )
+    rows: list[dict[str, Any]] = []
+    for name in names:
+        source = source_root / name
+        destination = global_root / name
+        installed = _imported_deployment_target(
+            source,
+            _rendered_root(config),
+            name,
+            set(expected_clients),
+        )
+        if installed is not None:
+            state = "already-linked"
+            reason = "Agent path already points to a verified managed deployment."
+        elif is_link_or_reparse(source):
+            state = "blocked"
+            reason = (
+                f"{name} link is not a verified deployment for {agent_name}"
+            )
+        else:
+            try:
+                _validate_skill_path(source)
+            except SkillSyncError as exc:
+                state = "blocked"
+                reason = str(exc)
+            else:
+                if destination.exists() or is_link_or_reparse(destination):
+                    try:
+                        _validate_skill_path(destination)
+                        same = hash_skill_dir(source) == hash_skill_dir(destination)
+                    except (SkillSyncError, OSError, ValueError) as exc:
+                        state = "blocked"
+                        reason = str(exc)
+                    else:
+                        state = "same" if same else "conflict"
+                        reason = (
+                            "Canonical content already matches the Agent Skill."
+                            if same
+                            else "Canonical Skill has different content."
+                        )
+                else:
+                    state = "importable"
+                    reason = "Agent Skill can be moved into the global library."
+        rows.append(
+            {
+                "name": name,
+                "source_path": str(source),
+                "canonical_path": str(destination),
+                "state": state,
+                "reason": reason,
+            }
+        )
+    return {
+        "skills": names,
+        "agent": agent_name,
+        "source_client": None if source_client is None else source_client.id,
+        "deployment_clients": [
+            {
+                "agent": client.family_id,
+                "client": client.id,
+                "destination_root": str(client.skills_dir),
+            }
+            for client in deployment_clients
+        ],
+        "blockers": blockers,
+        "rows": rows,
+    }
+
+
+def _resolve_delete_input(
+    skill_names: Iterable[str] | None,
+    config_path: str | Path | None,
+    *,
+    clients: Iterable[Any] | None = None,
+    config: dict[str, Any] | None = None,
+    registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    requested = _normalize_skill_names(skill_names, required=True)
+    assert requested is not None
+    config = _load_local_config(config_path) if config is None else config
+    registry = _load_local_registry(config) if registry is None else registry
+    global_root = _global_skill_root(config)
+    names = _resolve_delete_names(
+        requested,
+        global_root=global_root,
+        config=config,
+        registry=registry,
+    )
+    rendered_root = _rendered_root(config)
+    client_snapshot = tuple(detect_clients() if clients is None else clients)
+    rows: list[dict[str, Any]] = []
+    skipped_clients: list[dict[str, Any]] = []
+    for name in names:
+        source = global_root / name
+        _validate_skill_path(source)
+        affected_clients: list[dict[str, str]] = []
+        for client in client_snapshot:
+            destination = client.skills_dir / name
+            owned_target = _owned_link_target(
+                source, destination, rendered_root, name, client.id
+            )
+            if owned_target is not None:
+                affected_clients.append(
+                    {
+                        "agent": client.family_id,
+                        "client": client.id,
+                        "destination": str(destination),
+                    }
+                )
+            elif (
+                destination.exists()
+                or destination.is_symlink()
+                or is_link_or_reparse(destination)
+            ):
+                skipped_clients.append(
+                    {
+                        "code": "unowned-agent-path-skipped",
+                        "skill": name,
+                        "agent": client.family_id,
+                        "client": client.id,
+                        "path": str(destination),
+                        "detail": "The existing Agent path is not owned and will not be deleted.",
+                    }
+                )
+        rows.append(
+            {
+                "name": name,
+                "canonical_path": str(source),
+                "clients": affected_clients,
+            }
+        )
+    return {"skills": names, "rows": rows, "warnings": skipped_clients}
+
+
+def _configured_clients_for_skills(
+    config: dict[str, Any],
+    skill_names: Iterable[str],
+    clients: Iterable[Any],
+) -> list[dict[str, Any]]:
+    registry = _load_local_registry(config)
+    disabled = _disabled_agents(config)
+    rows: list[dict[str, Any]] = []
+    for name in skill_names:
+        entry = registry.get("skills", {}).get(name, {})
+        configured = _configured_client_targets(entry)
+        for client in clients:
+            if configured and not {client.id, client.family_id}.intersection(
+                configured
+            ):
+                continue
+            if not client.detected or client.family_id in disabled:
+                continue
+            rows.append(
+                {
+                    "skill": name,
+                    "agent": client.family_id,
+                    "client": client.id,
+                    "destination": str(client.skills_dir / name),
+                    "detected": client.detected,
+                    "enabled": client.family_id not in disabled,
+                    "effect": "sync-and-reconcile",
+                }
+            )
+    return rows
+
+
+def _sync_safety_blockers(config: dict[str, Any]) -> list[dict[str, Any]]:
+    if not _deployment_receipt_health(_data_root(config)):
+        return []
+    return [
+        {
+            "code": "deployment-recovery-required",
+            "detail": "An incomplete deployment operation must be recovered before sync.",
+        }
+    ]
+
+
+def _import_safety_findings(
+    resolved: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    conflicts = [
+        {
+            "code": "import-conflict",
+            "skill": row["name"],
+            "detail": row["reason"],
+        }
+        for row in resolved["rows"]
+        if row["state"] == "conflict"
+    ]
+    blockers = [
+        {
+            "code": "import-blocked",
+            "skill": row["name"],
+            "detail": row["reason"],
+        }
+        for row in resolved["rows"]
+        if row["state"] == "blocked"
+    ]
+    blockers.extend(resolved["blockers"])
+    return conflicts, blockers
+
+
+def _agent_safety_blockers(
+    config: dict[str, Any], *, enabled: bool
+) -> list[dict[str, Any]]:
+    if enabled or not _deployment_receipt_health(_data_root(config)):
+        return []
+    return [
+        {
+            "code": "deployment-recovery-required",
+            "detail": "An incomplete deployment operation must be recovered first.",
+        }
+    ]
+
+
+def _link_safety_findings(
+    config: dict[str, Any],
+    resolved: dict[str, Any],
+    plan: list[dict[str, Any]],
+    clients: Iterable[Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    blockers = [
+        {
+            "code": "unsafe-agent-path",
+            "skill": skill["name"],
+            "client": client["client"],
+            "detail": client.get("reason") or client["current_state"],
+        }
+        for skill in plan
+        for client in skill["clients"]
+        if client["action"] == "blocked"
+    ]
+    conflicts = [
+        {
+            "code": client["current_state"],
+            "skill": skill["name"],
+            "client": client["client"],
+            "detail": client.get("reason")
+            or "Agent path is not safely replaceable.",
+        }
+        for skill in plan
+        for client in skill["clients"]
+        if client["current_state"]
+        in {
+            "conflict",
+            "wrong-link",
+            "broken-link",
+            "tampered-render",
+            "missing-render",
+        }
+    ]
+    disabled = _disabled_agents(config)
+    client_map = {client.id: client.family_id for client in clients}
+    requested_families = {
+        client_map.get(name, _normalize_agent_name(name))
+        for name in resolved["agents"]
+    }
+    for family in sorted(requested_families & disabled):
+        blockers.append(
+            {
+                "code": "agent-disabled",
+                "agent": family,
+                "detail": "Agent synchronization is disabled; enable it before repairing links.",
+            }
+        )
+    if _deployment_receipt_health(_data_root(config)):
+        blockers.append(
+            {
+                "code": "deployment-recovery-required",
+                "detail": "An incomplete deployment operation must be recovered before repairing links.",
+            }
+        )
+    return conflicts, blockers
+
+
+def _delete_safety_blockers(
+    config: dict[str, Any], skill_names: Iterable[str]
+) -> list[dict[str, Any]]:
+    blockers: list[dict[str, Any]] = []
+    if _deployment_receipt_health(_data_root(config)):
+        blockers.append(
+            {
+                "code": "deployment-recovery-required",
+                "detail": "An incomplete deployment operation must be recovered first.",
+            }
+        )
+    selected = {name.casefold() for name in skill_names}
+    store = EditSessionStore(_data_root(config))
+    active_statuses = {
+        EditSessionStatus.ACTIVE,
+        EditSessionStatus.APPLYING,
+        EditSessionStatus.NEEDS_RECOVERY,
+    }
+    for session in store.list_metadata():
+        if (
+            session.logical_skill.casefold() in selected
+            and session.status in active_statuses
+        ):
+            blockers.append(
+                {
+                    "code": "active-edit-session",
+                    "skill": session.logical_skill,
+                    "detail": f"Edit session {session.session_id} is {session.status.value}.",
+                }
+            )
+    return blockers
+
+
+def _raise_preflight_findings(
+    operation: str,
+    *,
+    conflicts: Iterable[dict[str, Any]] = (),
+    blockers: Iterable[dict[str, Any]] = (),
+) -> None:
+    conflict_rows = list(conflicts)
+    blocker_rows = list(blockers)
+    if conflict_rows:
+        detail = conflict_rows[0].get("detail") or "conflicts require a decision"
+        raise SkillSyncError(
+            f"{operation} is blocked: {detail}",
+            code=f"{operation}_conflict",
+            exit_code=EXIT_CONFLICT,
+            details={"conflicts": conflict_rows, "blockers": blocker_rows},
+        )
+    if blocker_rows:
+        detail = blocker_rows[0].get("detail") or "a safety preflight failed"
+        raise SkillSyncError(
+            f"{operation} is blocked: {detail}",
+            code=f"{operation}_blocked",
+            exit_code=EXIT_SAFETY,
+            details={"blockers": blocker_rows},
+        )
+
+
 def _skill_root(platform: str, skill_dir: str | Path | None) -> Path:
     if skill_dir is not None:
         return Path(skill_dir).expanduser().absolute()
@@ -2458,7 +3522,9 @@ def _local_skill_path(config: dict[str, Any], name: str) -> Path:
 def _local_skill_path_or_default(
     config: dict[str, Any], registry: dict[str, Any], name: str
 ) -> Path:
-    skills = config.setdefault("skills", {})
+    skills = config.get("skills", {})
+    if not isinstance(skills, dict):
+        raise SkillSyncError("config skills must be a mapping")
     entry = skills.get(name)
     if isinstance(entry, dict):
         local_path = entry.get("local_path")
@@ -2565,7 +3631,7 @@ def _ensure_only_expected_registry_dirty(repo: Path) -> None:
 
 
 def _unexpected_dirty_paths(repo: Path) -> list[str]:
-    porcelain = git.run_git(repo, ["status", "--porcelain"])
+    porcelain = git.run_git(repo, ["status", "--porcelain"], read_only=True)
     unexpected: list[str] = []
     for line in porcelain.splitlines():
         path_text = line[2:].strip() if len(line) > 2 else ""
@@ -2644,6 +3710,7 @@ def deploy_migrate(
     *,
     skill_names: Iterable[str] | None = None,
     agent_names: Iterable[str] | None = None,
+    _clients: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     config = _load_local_config(config_path)
     try:
@@ -2653,6 +3720,7 @@ def deploy_migrate(
                 skill_names=skill_names,
                 agent_names=agent_names,
                 _config=config,
+                _clients=_clients,
             )
     except TimeoutError as exc:
         raise SkillSyncError(
@@ -2668,13 +3736,17 @@ def _deploy_migrate_unlocked(
     skill_names: Iterable[str] | None = None,
     agent_names: Iterable[str] | None = None,
     _config: dict[str, Any] | None = None,
+    _clients: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     """Build deployments, then transactionally swap owned Agent links."""
 
     config = _load_local_config(config_path) if _config is None else _config
     _assert_no_incomplete_deployment_receipts(_data_root(config))
     registry = _load_local_registry(config)
-    initial = _deployment_plan(config, registry, skill_names, agent_names)
+    clients = tuple(detect_clients() if _clients is None else _clients)
+    initial = _deployment_plan(
+        config, registry, skill_names, agent_names, clients=clients
+    )
     blockers = [
         {"skill": skill["name"], **client}
         for skill in initial
@@ -2711,7 +3783,9 @@ def _deploy_migrate_unlocked(
                 }
             )
 
-    prepared = _deployment_plan(config, registry, skill_names, agent_names)
+    prepared = _deployment_plan(
+        config, registry, skill_names, agent_names, clients=clients
+    )
     initial_hashes = {skill["name"]: skill["source_hash"] for skill in initial}
     changed_sources = [
         skill["name"]
@@ -3311,18 +4385,22 @@ def _deployment_plan(
     registry: dict[str, Any],
     skill_names: Iterable[str] | None,
     agent_names: Iterable[str] | None,
+    *,
+    clients: Iterable[Any] | None = None,
 ) -> list[dict[str, Any]]:
     targets = _target_names(registry, skill_names)
     requested = set(agent_names or ())
-    clients = detect_clients()
-    known = {client.id for client in clients} | {client.family_id for client in clients}
+    client_snapshot = tuple(detect_clients() if clients is None else clients)
+    known = {client.id for client in client_snapshot} | {
+        client.family_id for client in client_snapshot
+    }
     unknown = requested - known
     if unknown:
         raise SkillSyncError("unknown Agent or client: " + ", ".join(sorted(unknown)))
     disabled = _disabled_agents(config)
     available = [
         client
-        for client in clients
+        for client in client_snapshot
         if client.detected
         and client.family_id not in disabled
         and (not requested or client.id in requested or client.family_id in requested)
@@ -3478,20 +4556,31 @@ def link_skills(
 ) -> dict[str, Any]:
     """Render selected Skills and link detected Agent clients to deployments."""
     config = _load_local_config(config_path)
-    requested_agents = set(agent_names or ())
-    disabled_agents = _disabled_agents(config)
-    if requested_agents & disabled_agents:
-        raise SkillSyncError(
-            "Agent synchronization is disabled: "
-            + ", ".join(sorted(requested_agents & disabled_agents))
-        )
+    clients = tuple(detect_clients())
+    normalized = _resolve_link_input(
+        skill_names, agent_names, config_path, clients=clients
+    )
+    targets = normalized["skills"]
+    agents = normalized["agents"]
+    registry = _load_local_registry(config)
+    initial_plan = _deployment_plan(
+        config, registry, targets, agents, clients=clients
+    )
+    conflicts, blockers = _link_safety_findings(
+        config, normalized, initial_plan, clients
+    )
+    _raise_preflight_findings(
+        "link-repair", conflicts=conflicts, blockers=blockers
+    )
     deploy_migrate(
         config_path=config_path,
-        skill_names=skill_names,
-        agent_names=agent_names,
+        skill_names=targets,
+        agent_names=agents,
+        _clients=clients,
     )
-    registry = _load_local_registry(config)
-    plan = _deployment_plan(config, registry, skill_names, agent_names)
+    plan = _deployment_plan(
+        config, registry, targets, agents, clients=clients
+    )
     results: list[dict[str, str]] = []
     for skill in plan:
         for client in skill["clients"]:
@@ -3531,13 +4620,14 @@ def _unlink_skills_unlocked(
     config_path: str | Path | None = None,
     *,
     _config: dict[str, Any] | None = None,
+    _clients: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     config = _load_local_config(config_path) if _config is None else _config
     _assert_no_incomplete_deployment_receipts(_data_root(config))
     registry = _load_local_registry(config)
     targets = _target_names(registry, skill_names)
     requested = set(agent_names or ())
-    clients = detect_clients()
+    clients = tuple(detect_clients() if _clients is None else _clients)
     known = {client.id for client in clients} | {client.family_id for client in clients}
     unknown = requested - known
     if unknown:
@@ -3625,10 +4715,16 @@ def _imported_deployment_target(
     return target
 
 
-def _import_client_ids(agent_name: str, skills_dir: Path) -> set[str]:
+def _import_client_ids(
+    agent_name: str,
+    skills_dir: Path,
+    *,
+    clients: Iterable[Any] | None = None,
+) -> set[str]:
+    client_snapshot = tuple(detect_clients() if clients is None else clients)
     client_ids = {
         client.id
-        for client in detect_clients()
+        for client in client_snapshot
         if client.family_id == agent_name
         and _same_path_location(client.skills_dir, skills_dir)
     }
@@ -3690,11 +4786,15 @@ def _quarantine_and_remove_owned_directory(
         return False
 
 
-def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
+def doctor(
+    config_path: str | Path | None = None,
+    *,
+    clients: Iterable[Any] | None = None,
+) -> dict[str, Any]:
     config = _load_local_config(config_path)
     registry = _load_local_registry(config)
-    clients = detect_clients()
-    agents = aggregate_agent_targets(clients)
+    client_snapshot = tuple(detect_clients() if clients is None else clients)
+    agents = aggregate_agent_targets(client_snapshot)
     disabled_agents = _disabled_agents(config)
     issues: list[dict[str, str]] = []
     deployment_operations = _deployment_receipt_health(_data_root(config))
@@ -3718,7 +4818,7 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
         if not (selected_source / "SKILL.md").is_file():
             continue
         for planned_skill in _deployment_plan(
-            config, registry, [selected_name], None
+            config, registry, [selected_name], None, clients=client_snapshot
         ):
             for row in planned_skill["clients"]:
                 deployment_rows[(selected_name, row["client"])] = row
@@ -3728,7 +4828,7 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
             issues.append({"type": "missing-skill", "skill": name, "path": str(source)})
             continue
         client_states: dict[str, str] = {}
-        for client in clients:
+        for client in client_snapshot:
             if not client.detected:
                 continue
             row = deployment_rows.get((name, client.id))
@@ -3755,7 +4855,7 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
                 continue
             states = [
                 client_states[client.id]
-                for client in clients
+                for client in client_snapshot
                 if client.detected
                 and client.family_id == agent.name
                 and client.id in client_states
@@ -3783,7 +4883,7 @@ def doctor(config_path: str | Path | None = None) -> dict[str, Any]:
                     else "not-detected"
                 ),
             }
-            for client in clients
+            for client in client_snapshot
         ],
         "matrix": matrix,
         "client_matrix": client_matrix,
@@ -3798,14 +4898,20 @@ def disable_agent_sync(
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Persistently disable an Agent target and remove its managed links."""
+    clients = tuple(detect_clients())
+    resolved = _resolve_agent_toggle_input(
+        agent_name, False, config_path, clients=clients
+    )
+    agent_name = resolved["agent"]
     config_file = _config_path(config_path)
     config = load_config(config_file)
+    _raise_preflight_findings(
+        "agent-disable",
+        blockers=_agent_safety_blockers(config, enabled=False),
+    )
     try:
         with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
             _assert_no_incomplete_deployment_receipts(_data_root(config))
-            known_agents = {agent.name for agent in detect_agents()}
-            if agent_name not in known_agents:
-                raise SkillSyncError(f"unknown Agent: {agent_name}")
             previous_disabled = list(config.get("disabled_agents", []))
             disabled_agents = _disabled_agents(config)
             disabled_agents.add(agent_name)
@@ -3816,6 +4922,7 @@ def disable_agent_sync(
                     agent_names=[agent_name],
                     config_path=config_file,
                     _config=config,
+                    _clients=clients,
                 )
             except Exception as exc:
                 config["disabled_agents"] = previous_disabled
@@ -3824,6 +4931,7 @@ def disable_agent_sync(
                     deploy_migrate(
                         config_path=config_file,
                         agent_names=[agent_name],
+                        _clients=clients,
                     )
                 except Exception as rollback_exc:
                     raise SkillSyncError(
@@ -3848,11 +4956,13 @@ def enable_agent_sync(
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Re-enable an Agent target without creating links automatically."""
+    clients = tuple(detect_clients())
+    resolved = _resolve_agent_toggle_input(
+        agent_name, True, config_path, clients=clients
+    )
+    agent_name = resolved["agent"]
     config_file = _config_path(config_path)
     config = load_config(config_file)
-    known_agents = {agent.name for agent in detect_agents()}
-    if agent_name not in known_agents:
-        raise SkillSyncError(f"unknown Agent: {agent_name}")
     config["disabled_agents"] = sorted(_disabled_agents(config) - {agent_name})
     save_config(config_file, config)
     return {"enabled": agent_name}
@@ -3941,11 +5051,25 @@ def import_agent_skills(
     agent_name: str,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    clients = tuple(detect_clients())
+    resolved = _resolve_import_input(
+        names, agent_name, config_path, clients=clients
+    )
+    conflicts, blockers = _import_safety_findings(resolved)
+    _raise_preflight_findings(
+        "import", conflicts=conflicts, blockers=blockers
+    )
+    names = resolved["skills"]
+    agent_name = resolved["agent"]
     config = _load_local_config(config_path)
     try:
         with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
             return _import_agent_skills_unlocked(
-                names, agent_name, config_path, _config=config
+                names,
+                agent_name,
+                config_path,
+                _config=config,
+                _clients=clients,
             )
     except TimeoutError as exc:
         raise SkillSyncError(
@@ -3959,6 +5083,7 @@ def _import_agent_skills_unlocked(
     config_path: str | Path | None = None,
     *,
     _config: dict[str, Any] | None = None,
+    _clients: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     """Move Agent-local Skills into the global root and link a deployment."""
     name_list = list(names)
@@ -3966,21 +5091,32 @@ def _import_agent_skills_unlocked(
         raise SkillSyncError("import requires at least one Skill name")
     config = _load_local_config(config_path) if _config is None else _config
     _assert_no_incomplete_deployment_receipts(_data_root(config))
-    agents = {agent.name: agent for agent in detect_agents()}
-    agent = agents.get(agent_name)
-    if agent is None:
+    clients = tuple(detect_clients() if _clients is None else _clients)
+    matching_clients = tuple(
+        client
+        for client in clients
+        if client.family_id == agent_name and client.detected
+    )
+    if not any(client.family_id == agent_name for client in clients):
         raise SkillSyncError(f"unknown Agent: {agent_name}")
-    if not agent.detected:
+    if not matching_clients:
         raise SkillSyncError(f"Agent is not detected: {agent_name}")
+    if len(matching_clients) != 1:
+        raise SkillSyncError(
+            f"import requires one concrete source client: {agent_name}"
+        )
+    source_client = matching_clients[0]
     global_root = _global_skill_root(config)
-    expected_client_ids = _import_client_ids(agent_name, agent.skills_dir)
+    expected_client_ids = _import_client_ids(
+        agent_name, source_client.skills_dir, clients=clients
+    )
     registry = _load_local_registry(config)
     initially_selected = _selected_names(registry)
     imported: list[dict[str, str]] = []
     for name in name_list:
         if Path(name).name != name or name in {".", ".."}:
             raise SkillSyncError(f"invalid Skill name: {name}")
-        source = agent.skills_dir / name
+        source = source_client.skills_dir / name
         destination = global_root / name
         installed_target = _imported_deployment_target(
             source,
@@ -4014,6 +5150,7 @@ def _import_agent_skills_unlocked(
                 config_path=config_path,
                 skill_names=[name],
                 agent_names=[agent_name],
+                _clients=clients,
             )
             if _imported_deployment_target(
                 source, _rendered_root(config), name, expected_client_ids
@@ -4210,6 +5347,16 @@ def delete_global_skills(
                 config=config,
                 registry=registry,
             )
+            _assert_no_incomplete_deployment_receipts(locked_data_root)
+            clients = tuple(detect_clients())
+            resolved = _resolve_delete_input(
+                name_list,
+                config_path,
+                clients=clients,
+                config=config,
+                registry=registry,
+            )
+            name_list = resolved["skills"]
             store = EditSessionStore(locked_data_root)
             with ExitStack() as skill_locks:
                 lock_names: dict[str, str] = {}
@@ -4219,8 +5366,15 @@ def delete_global_skills(
                 for _, name in sorted(lock_names.items()):
                     skill_locks.enter_context(store.skill_lock(name))
                 _assert_delete_has_no_active_edits(store, name_list)
+                _raise_preflight_findings(
+                    "delete",
+                    blockers=_delete_safety_blockers(config, name_list),
+                )
                 return _delete_global_skills_unlocked(
-                    name_list, config_path, _config=config
+                    name_list,
+                    config_path,
+                    _config=config,
+                    _clients=clients,
                 )
     except TimeoutError as exc:
         raise SkillSyncError(
@@ -4337,6 +5491,7 @@ def _delete_global_skills_unlocked(
     config_path: str | Path | None = None,
     *,
     _config: dict[str, Any] | None = None,
+    _clients: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     """Permanently delete canonical Skills and their managed Agent links."""
     name_list = list(dict.fromkeys(names))
@@ -4349,7 +5504,7 @@ def _delete_global_skills_unlocked(
     registry_path = repo / REGISTRY_FILE
     registry = _read_or_empty_registry(registry_path)
     global_root = _global_skill_root(config)
-    clients = detect_clients()
+    clients = tuple(detect_clients() if _clients is None else _clients)
     moved: list[tuple[str, Path, Path]] = []
     removed_links: list[tuple[Path, Path]] = []
     try:
