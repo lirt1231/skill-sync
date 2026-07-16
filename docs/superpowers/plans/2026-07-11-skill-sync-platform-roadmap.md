@@ -128,6 +128,16 @@ mode: overlay
 delete: references/claude-tools.md
 ```
 
+The dependency-free v1 parser also accepts multiple delete paths as a
+mapping-only YAML subset, keeping the portable format deterministic without a
+general YAML dependency:
+
+```yaml
+delete:
+  references/claude-tools.md: true
+  scripts/legacy.sh: true
+```
+
 Variant behavior:
 
 - Files present in the variant replace same-path base files.
@@ -135,6 +145,9 @@ Variant behavior:
 - Files listed in `delete` are removed from the resolved output.
 - `SKILL.md` may be overridden like any other file.
 - Paths must be relative, normalized, and confined to the Skill root.
+- Paths use portable POSIX separators; Windows absolute/drive/UNC paths,
+  reserved names, traversal, non-normalized paths, and case-insensitive
+  duplicates fail closed.
 - Symlinks inside base or variant sources remain rejected.
 - Unknown manifest keys fail validation instead of being ignored silently.
 

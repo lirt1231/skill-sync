@@ -1188,9 +1188,17 @@ result 状态机；确认前零 mutation，确认时若影响范围变化必须�
 永久删除必须输入动态确认短语，失败结果保留重新规划或刷新核验入口，键盘支持
 Tab/Shift+Tab、Escape 和焦点恢复。原生 `confirm()` 已移除。
 
-Step 6B 至此完成。当前下一 serialized commit 是 `7.1 add strict variant manifest
-parser`：只实现 `variant.yaml` 的严格 stdlib parser、路径和 schema 校验，不提前实现
-overlay resolver、Web Variant UI 或 deployment cache。
+Step 6B 至此完成。
+
+commit `7.1 add strict variant manifest parser` 已完成。`variant.yaml` 使用现有
+mapping-only stdlib YAML 子集，严格要求 `version: 1`、已注册 family/client target、
+目录 target 一致和 `mode: overlay`。`delete` 支持单路径或 `path: true` mapping，并规范化
+为确定性 tuple；绝对路径、Windows drive/UNC、traversal、非规范 POSIX 路径、大小写重复、
+保留名称、unknown field 及 variant tree 中的 symlink/reparse point 全部 fail closed。
+parser 只读取 manifest 和验证 source tree，不解析或生成 resolved Skill 内容。
+
+当前可按并行表启动 `7.2 add deterministic variant overlay engine` 与 `7.4 add variant
+source management commands`；合并时必须先进入 `7.2`，再将 `7.4` rebase 到最新集成点。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 
