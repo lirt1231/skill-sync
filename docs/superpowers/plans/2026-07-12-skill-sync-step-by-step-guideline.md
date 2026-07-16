@@ -1162,10 +1162,16 @@ commit `6.7 fix web detail drawer navigation` 已完成，对应 `3182c6d`。详
 Skill/trigger identity 恢复焦点，以及通过 `?detail=` 在刷新和浏览器前进/后退时恢复
 详情；失效目标会安全清理。本 commit 没有混入 filters、preview model 或新详情字段。
 
+commit `6.8 add inventory filters and agent labels` 已完成。技能库搜索保持常驻，支持
+同步状态、来源和当前已检测 Agent 的组合筛选；Agent 覆盖使用包含客户端名和状态文字的
+可见标签，全选/取消全选只改变当前可见 Skill。active view、搜索、筛选和选择集通过
+版本化 session context 跨页面刷新恢复，详情仍沿用 `?detail=`；失效 view、来源、Agent
+和选择项会在对应数据加载完成后安全清理。本 commit 没有新增 Variant badge，也没有
+修改 core API、mutation preview 或确认流程。
+
 当前并行中的 commit 是 `6.9 add web mutation preview models`；它必须通过共享
-preflight 保证 preview 与正式 action 的 blocker 一致，并保持完全只读。下一 serialized
-commit 是 `6.8 add inventory filters and agent labels`，完成后再将 `6.8` 与 `6.9`
-汇合进入 `6.10 add web mutation confirmation flows`。
+preflight 保证 preview 与正式 action 的 blocker 一致，并保持完全只读。`6.8` 与
+`6.9` 汇合并统一验收后，再进入 `6.10 add web mutation confirmation flows`。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

@@ -43,8 +43,14 @@
         <div id="issue-list" class="issue-list hidden"></div>
         <section class="library-surface">
           <div class="table-tools">
-            <label id="search-wrap" class="search-wrap collapsed"><i class="ri-search-line"></i><input id="search" type="search" placeholder="搜索 Skill" aria-label="搜索 Skill"></label>
-            <button id="search-toggle" class="icon-button" aria-label="搜索"><i class="ri-search-line"></i></button>
+            <label id="search-wrap" class="search-wrap"><i class="ri-search-line"></i><input id="search" type="search" placeholder="搜索名称或 description" aria-label="搜索 Skill"></label>
+            <div class="inventory-filters" role="group" aria-label="筛选 Skill">
+              <label class="filter-control"><span>同步状态</span><select id="sync-filter" aria-label="按同步状态筛选"></select></label>
+              <label class="filter-control"><span>来源</span><select id="source-filter" aria-label="按来源筛选"></select></label>
+              <label class="filter-control"><span>Agent</span><select id="agent-filter" aria-label="按 Agent 筛选"></select></label>
+              <button id="clear-filters" type="button">清除筛选</button>
+            </div>
+            <span id="visible-count" class="visible-count" aria-live="polite"></span>
           </div>
           <div class="skill-table-head"><input id="select-all-checkbox" type="checkbox" aria-label="全选可见项"><span>技能名称</span><span>Agent 覆盖</span><span>状态</span><span></span></div>
           <div id="skill-list" class="skill-list"></div>

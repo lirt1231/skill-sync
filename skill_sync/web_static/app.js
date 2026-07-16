@@ -1,12 +1,15 @@
 let token = "";
 let state = null;
-let activeView = "skills";
+const WEB_CONTEXT_STORAGE_KEY = "skill-sync:web-context:v1";
+const restoredUiContext = readUiContext();
+let activeView = restoredUiContext.activeView;
 let activeImportAgent = "codex";
 const DETAIL_QUERY_PARAM = "detail";
 let detailSkill = detailTargetFromLocation();
 let detailNeedsFocus = Boolean(detailSkill);
 let detailReturnTarget = null;
-const selected = new Set();
+const inventoryFilters = {...restoredUiContext.filters};
+const selected = new Set(restoredUiContext.selected);
 const selectedImports = new Set();
 const loadedViews = new Set();
 const inFlightOperations = new Map();
@@ -253,7 +256,7 @@ function showView(view) {
 
 function switchView(view) {
   if (mutationInFlight) { toast("请等待当前操作完成"); return; }
-  activeView = view; showView(view);
+  activeView = view; persistUiContext(); showView(view);
   loadActiveView().catch(error => toast(error.message, true));
 }
 
@@ -262,19 +265,57 @@ function renderIssues(issues) {
   box.innerHTML = issues.map(issue => `<div><i class="ri-error-warning-line"></i><strong>${escapeHtml(issueTitle(issue))}</strong><span>${escapeHtml(issue.detail || issue.skill || "需要检查")}</span></div>`).join("");
 }
 
-function visibleSkills(skills) { const query=$("#search").value.trim().toLowerCase(); return skills.filter(skill => skill.name.toLowerCase().includes(query)); }
+function skillSyncState(skill){return skill.changed_local?"changed":skill.selected?"synced":"local";}
+function skillSource(skill){return String(skill.platform||"global");}
+function sourceLabel(source){return ({global:"全局库",codex:"Codex 导入",claude:"Claude Code 导入","claude-code":"Claude Code 导入",workbuddy:"WorkBuddy 导入",kimi:"Kimi 导入","kimi-code":"Kimi 导入","kimi-desktop":"Kimi 导入"})[source]||source;}
+function inventoryAgents(){return (state?.doctor?.agents||[]).filter(agent=>agent.detected);}
+function agentCoversSkill(skill,agent){return ["linked","copied"].includes(skill.agents?.[agent]);}
+function renderInventoryControls(skills){
+  const statuses=new Set(["all","synced","changed","local"]);
+  const sources=[...new Set(skills.map(skillSource))].sort((a,b)=>sourceLabel(a).localeCompare(sourceLabel(b)));
+  const agents=inventoryAgents();
+  const readyInventory=inventoryDataReady(),readyAgents=agentDataReady();
+  const previous=JSON.stringify(inventoryFilters);
+  if(!statuses.has(inventoryFilters.status))inventoryFilters.status="all";
+  if(readyInventory&&inventoryFilters.source!=="all"&&!sources.includes(inventoryFilters.source))inventoryFilters.source="all";
+  if(readyAgents&&inventoryFilters.agent!=="all"&&!agents.some(agent=>agent.name===inventoryFilters.agent))inventoryFilters.agent="all";
+  const agentOptions=[...agents];
+  if(!readyAgents&&inventoryFilters.agent!=="all"&&!agentOptions.some(agent=>agent.name===inventoryFilters.agent))agentOptions.push({name:inventoryFilters.agent,display_name:`${inventoryFilters.agent}（加载中）`});
+  $("#sync-filter").innerHTML='<option value="all">全部状态</option><option value="synced">已同步</option><option value="changed">本地待推送</option><option value="local">未加入同步</option>';
+  $("#source-filter").innerHTML='<option value="all">全部来源</option>'+sources.map(source=>`<option value="${escapeHtml(source)}">${escapeHtml(sourceLabel(source))}</option>`).join("");
+  $("#agent-filter").innerHTML='<option value="all">全部 Agent</option>'+agentOptions.map(agent=>`<option value="${escapeHtml(agent.name)}">${escapeHtml(agent.display_name)}</option>`).join("");
+  $("#sync-filter").value=inventoryFilters.status;$("#source-filter").value=inventoryFilters.source;$("#agent-filter").value=inventoryFilters.agent;
+  $("#clear-filters").disabled=!$("#search").value&&Object.values(inventoryFilters).every(value=>value==="all");
+  if(previous!==JSON.stringify(inventoryFilters))persistUiContext();
+}
+function visibleSkills(skills) {
+  const query=$("#search").value.trim().toLowerCase();
+  return skills.filter(skill => {
+    const matchesQuery=!query||[skill.name,skill.description].some(value=>String(value||"").toLowerCase().includes(query));
+    const matchesStatus=inventoryFilters.status==="all"||skillSyncState(skill)===inventoryFilters.status;
+    const matchesSource=inventoryFilters.source==="all"||skillSource(skill)===inventoryFilters.source;
+    const matchesAgent=inventoryFilters.agent==="all"||!agentDataReady()||agentCoversSkill(skill,inventoryFilters.agent);
+    return matchesQuery&&matchesStatus&&matchesSource&&matchesAgent;
+  });
+}
 
 function renderSkills(skills) {
-  for (const name of [...selected]) if (!skills.some(skill => skill.name === name)) selected.delete(name);
+  let selectionChanged=false;
+  if(inventoryDataReady())for (const name of [...selected]) if (!skills.some(skill => skill.name === name)){selected.delete(name);selectionChanged=true;}
+  if(selectionChanged)persistUiContext();
+  renderInventoryControls(skills);
   const shown = visibleSkills(skills);
+  const agents = inventoryAgents();
   $("#skill-list").innerHTML = shown.map(skill => {
-    const agents = state.doctor?.agents || [];
-    const coverage = agents.map(agent => `<i class="agent-dot ${agentStateClass(skill.agents?.[agent.name])}" title="${escapeHtml(agent.display_name)}: ${escapeHtml(skill.agents?.[agent.name] || "未知")}"></i>`).join("");
+    const coverage = agents.length?agents.map(agent=>{const agentState=skill.agents?.[agent.name];return `<span class="agent-coverage ${agentStateClass(agentState)}" aria-label="${escapeHtml(agent.display_name)}：${escapeHtml(agentStateLabel(agentState))}"><i aria-hidden="true"></i><span>${escapeHtml(agent.display_name)}</span><small>${escapeHtml(agentStateLabel(agentState))}</small></span>`;}).join(""):'<span class="coverage-empty">暂无已检测 Agent</span>';
     return `<article class="skill-row ${detailSkill === skill.name ? "focused" : ""}" role="button" tabindex="0" data-skill-name="${escapeHtml(skill.name)}" data-detail-trigger="row" aria-label="查看 ${escapeHtml(skill.name)} 详情" onclick="openDetail('${escapeJs(skill.name)}',this)" onkeydown="handleSkillRowKeydown(event,'${escapeJs(skill.name)}')"><input type="checkbox" aria-label="选择 ${escapeHtml(skill.name)}" ${selected.has(skill.name)?"checked":""} ${hasBusyOperation()?"disabled":""} onclick="event.stopPropagation()" onchange="toggle('${escapeJs(skill.name)}',this.checked)"><span class="file-icon"><i class="ri-file-text-line"></i></span><strong>${escapeHtml(skill.name)}</strong><span class="coverage">${coverage}</span><span class="row-status ${skill.changed_local ? "pending" : ""}">${skill.changed_local ? "本地待推送" : (skill.selected ? "已同步" : "未加入同步")}</span><button class="icon-button" data-skill-name="${escapeHtml(skill.name)}" data-detail-trigger="button" aria-label="查看详情" onclick="event.stopPropagation();openDetail('${escapeJs(skill.name)}',this)"><i class="ri-more-2-fill"></i></button></article>`;
   }).join("") || `<p class="empty">没有符合条件的 Skill</p>`;
   const allSelected = shown.length > 0 && shown.every(skill => selected.has(skill.name));
+  const someSelected = shown.some(skill => selected.has(skill.name));
   $("#select-all-checkbox").checked = allSelected;
+  $("#select-all-checkbox").indeterminate = someSelected&&!allSelected;
   $("#select-all").textContent = allSelected ? "取消选择可见项" : "全选可见项";
+  $("#visible-count").textContent=`显示 ${shown.length} / ${skills.length}`;
   const picked=skills.filter(skill=>selected.has(skill.name));
   const pickedAllSynced=picked.length>0&&picked.every(skill=>skill.selected);
   $("#select-selected").innerHTML=pickedAllSynced?'<i class="ri-subtract-line"></i><span>取消同步</span>':'<i class="ri-add-circle-line"></i><span>加入同步</span>';
@@ -303,6 +344,7 @@ function renderImports(items) {
 function renderDetail() {
   const skill=(state.status.skills||[]).find(item=>item.name===detailSkill);
   if (!skill) {
+    if(detailSkill&&!inventoryDataReady()){$("#detail-drawer").classList.add("hidden");return;}
     if (detailSkill) updateDetailLocation(null, "replace");
     detailSkill=null; detailNeedsFocus=false;
     $("#detail-drawer").classList.add("hidden");
@@ -321,9 +363,9 @@ function renderDetail() {
   }
 }
 
-function toggle(name,checked){checked?selected.add(name):selected.delete(name);renderSkills(state.status.skills||[]);}
-function toggleVisibleSkills(){const shown=visibleSkills(state.status.skills||[]);const allSelected=shown.length>0&&shown.every(skill=>selected.has(skill.name));shown.forEach(skill=>allSelected ? selected.delete(skill.name) : selected.add(skill.name));renderSkills(state.status.skills||[]);}
-function clearSelection(){selected.clear();renderSkills(state.status.skills||[]);}
+function toggle(name,checked){checked?selected.add(name):selected.delete(name);persistUiContext();renderSkills(state.status.skills||[]);}
+function toggleVisibleSkills(){const shown=visibleSkills(state.status.skills||[]);const allSelected=shown.length>0&&shown.every(skill=>selected.has(skill.name));shown.forEach(skill=>allSelected ? selected.delete(skill.name) : selected.add(skill.name));persistUiContext();renderSkills(state.status.skills||[]);}
+function clearSelection(){selected.clear();persistUiContext();renderSkills(state.status.skills||[]);}
 function updateSelectionBar(){$("#selection-count").textContent=selected.size;$("#selection-bar").classList.toggle("hidden",!selected.size);}
 function selectedNames(){if(!selected.size){toast("请先选择至少一个 Skill",true);return null;}return [...selected];}
 function bulk(path){const skills=selectedNames();return skills&&action(path,{skills});}
@@ -348,7 +390,7 @@ function closeDetail(updateHistory=true,restoreFocus=true){
 }
 function focusDetailReturnTarget(){
   const target=detailReturnTarget&&[...document.querySelectorAll("[data-skill-name]")].find(item=>item.dataset.skillName===detailReturnTarget.skill&&item.dataset.detailTrigger===detailReturnTarget.trigger);
-  (target||$("#search-toggle")).focus();
+  (target||$("#search")).focus();
 }
 function detailFocusableElements(){
   return [...$("#detail-drawer").querySelectorAll('button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')];
@@ -386,7 +428,29 @@ function restoreDetailFromLocation(){
   if(state?.initialized)renderSkills(state.status?.skills||[]);
   if(previous)focusDetailReturnTarget();
 }
+function inventoryDataReady(){return loadedViews.has("inventory")||Boolean(state?.status?.skills?.length);}
+function agentDataReady(){return loadedViews.has("agents")||Boolean(state?.doctor?.agents?.length);}
+function readUiContext(){
+  const fallback={activeView:"skills",search:"",filters:{status:"all",source:"all",agent:"all"},selected:[]};
+  try{
+    const parsed=JSON.parse(globalThis.sessionStorage?.getItem(WEB_CONTEXT_STORAGE_KEY)||"null");
+    if(!parsed||typeof parsed!=="object")return fallback;
+    const filters=parsed.filters&&typeof parsed.filters==="object"?parsed.filters:{};
+    return {
+      activeView:["skills","agents","imports"].includes(parsed.activeView)?parsed.activeView:"skills",
+      search:typeof parsed.search==="string"?parsed.search:"",
+      filters:{status:typeof filters.status==="string"?filters.status:"all",source:typeof filters.source==="string"?filters.source:"all",agent:typeof filters.agent==="string"?filters.agent:"all"},
+      selected:Array.isArray(parsed.selected)?[...new Set(parsed.selected.filter(name=>typeof name==="string"&&name))]:[],
+    };
+  }catch(_){return fallback;}
+}
+function persistUiContext(){
+  try{globalThis.sessionStorage?.setItem(WEB_CONTEXT_STORAGE_KEY,JSON.stringify({activeView,search:$("#search")?.value||"",filters:inventoryFilters,selected:[...selected]}));}
+  catch(_){}
+}
 function setImportAgent(agent){activeImportAgent=agent;renderImports(state.import_candidates||[]);}
+function setInventoryFilter(key,value){inventoryFilters[key]=value;persistUiContext();renderSkills(state.status.skills||[]);}
+function clearInventoryFilters(){inventoryFilters.status="all";inventoryFilters.source="all";inventoryFilters.agent="all";$("#search").value="";persistUiContext();renderSkills(state.status.skills||[]);$("#search").focus();}
 function importKey(item){return `${item.agent}\u0000${item.name}`;}
 function toggleImport(agent,name,checked){const key=`${agent}\u0000${name}`;checked?selectedImports.add(key):selectedImports.delete(key);renderImports(state.import_candidates||[]);}
 function toggleAllImports(){const group=(state.import_candidates||[]).filter(item=>item.agent===activeImportAgent&&item.state!=="conflict");const all=group.length>0&&group.every(item=>selectedImports.has(importKey(item)));group.forEach(item=>all?selectedImports.delete(importKey(item)):selectedImports.add(importKey(item)));renderImports(state.import_candidates||[]);}
@@ -406,11 +470,16 @@ function escapeHtml(value){return String(value??"").replace(/[&<>"']/g,c=>({"&":
 function escapeJs(value){return String(value).replace(/['\\]/g,"\\$&");}
 
 document.querySelectorAll(".nav-item[data-view]").forEach(button=>button.onclick=()=>switchView(button.dataset.view));
+$("#search").value=restoredUiContext.search;
+showView(activeView);
 $("#setup-form").onsubmit=async event=>{event.preventDefault();await action("/api/init",Object.fromEntries(new FormData(event.currentTarget)));};
 $("#sync").onclick=()=>action("/api/sync");$("#refresh").onclick=()=>getState(true);
 $("#retry-load").onclick=()=>getState(true);
-$("#search-toggle").onclick=()=>{$("#search-wrap").classList.toggle("collapsed");if(!$("#search-wrap").classList.contains("collapsed"))$("#search").focus();};
-$("#search").oninput=()=>renderSkills(state.status.skills||[]);
+$("#search").oninput=()=>{persistUiContext();renderSkills(state.status.skills||[]);};
+$("#sync-filter").onchange=event=>setInventoryFilter("status",event.currentTarget.value);
+$("#source-filter").onchange=event=>setInventoryFilter("source",event.currentTarget.value);
+$("#agent-filter").onchange=event=>setInventoryFilter("agent",event.currentTarget.value);
+$("#clear-filters").onclick=clearInventoryFilters;
 $("#select-all-checkbox").onchange=toggleVisibleSkills;$("#select-all").onclick=toggleVisibleSkills;$("#clear-selection").onclick=clearSelection;
 $("#select-selected").onclick=toggleSelectedSync;$("#deselect-selected").onclick=()=>bulk("/api/deselect");$("#link-selected").onclick=()=>bulk("/api/link");
 $("#copy-selected").onclick=()=>{const skills=selectedNames();return skills&&action("/api/copy",{skills,agents:[$("#copy-agent").value]});};$("#delete-selected").onclick=deleteSelected;

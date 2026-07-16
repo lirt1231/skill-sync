@@ -65,7 +65,7 @@ function boot(initialHref = "http://skill-sync.test/") {
 
   const ids = [
     "setup","app","setup-form","setup-submit","refresh","sync","sync-label","sync-summary",
-    "issue-list","skill-list","search","search-wrap","search-toggle","select-all-checkbox",
+    "issue-list","skill-list","search","search-wrap","search-toggle","sync-filter","source-filter","agent-filter","clear-filters","visible-count","select-all-checkbox",
     "select-all","select-selected","deselect-selected","link-selected","copy-selected","copy-agent",
     "delete-selected","clear-selection","selection-count","selection-bar","agent-list","import-tabs",
     "imports","select-all-imports","clear-imports","import-selected","import-count","import-bar",
