@@ -1181,9 +1181,16 @@ plan 展示规范化 request、实际影响 Skill/client、步骤、conflict/blo
 backup/recovery 和 freshness。preview 不 fetch、不 commit、不 push、不创建锁或写入文件，
 正式 action 复用同一 resolver/preflight，并在执行前重新规划而非信任 plan 作为授权凭证。
 
-当前下一 commit 是 `6.10 add web mutation confirmation flows`：前端使用统一
-plan → confirm → running → result 交互替换原生 confirm，并为多项永久删除增加加强确认；
-不提前加入 Variant、Edit Session UI 或 Deployment Matrix。
+commit `6.10 add web mutation confirmation flows` 已完成。sync、import、Agent
+enable/disable、link repair 和永久删除统一使用 plan → confirm → replan → running →
+result 状态机；确认前零 mutation，确认时若影响范围变化必须再次确认，正式 action 仍会
+执行 core preflight。对话框展示 Skill/client、步骤、预期写入和 backup/recovery；多项
+永久删除必须输入动态确认短语，失败结果保留重新规划或刷新核验入口，键盘支持
+Tab/Shift+Tab、Escape 和焦点恢复。原生 `confirm()` 已移除。
+
+Step 6B 至此完成。当前下一 serialized commit 是 `7.1 add strict variant manifest
+parser`：只实现 `variant.yaml` 的严格 stdlib parser、路径和 schema 校验，不提前实现
+overlay resolver、Web Variant UI 或 deployment cache。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

@@ -93,6 +93,26 @@
       <button id="detail-backup">创建本地备份</button>
     </aside>
   </div>
+  <section id="mutation-layer" class="mutation-layer hidden" aria-hidden="true">
+    <div class="mutation-backdrop"></div>
+    <article id="mutation-dialog" class="mutation-dialog" role="dialog" aria-modal="true" aria-labelledby="mutation-title" tabindex="-1">
+      <button id="mutation-close" class="icon-button mutation-close" type="button" aria-label="关闭操作确认"><i class="ri-close-line"></i></button>
+      <p id="mutation-status" class="mutation-status"></p>
+      <h2 id="mutation-title">确认操作</h2>
+      <p id="mutation-summary" class="mutation-summary"></p>
+      <div id="mutation-findings" class="mutation-findings"></div>
+      <section><h3>受影响范围</h3><div id="mutation-targets" class="mutation-targets"></div></section>
+      <section><h3>执行步骤</h3><ol id="mutation-steps" class="mutation-steps"></ol></section>
+      <section class="mutation-safety-grid"><div><h3>预期影响</h3><div id="mutation-effects"></div></div><div><h3>备份与恢复</h3><div id="mutation-recovery"></div></div></section>
+      <label id="mutation-delete-confirmation" class="mutation-delete-confirmation hidden">这是不可撤销的批量删除。请输入 <strong id="mutation-delete-phrase"></strong><input id="mutation-delete-input" type="text" autocomplete="off" spellcheck="false"></label>
+      <section id="mutation-result" class="mutation-result hidden" aria-live="polite"></section>
+      <footer class="mutation-actions">
+        <button id="mutation-cancel" type="button">取消</button>
+        <button id="mutation-retry" type="button" class="hidden">重新规划</button>
+        <button id="mutation-confirm" type="button" class="primary">确认执行</button>
+      </footer>
+    </article>
+  </section>
   <section id="load-failure" class="load-failure hidden" role="alert"><strong>无法加载 Skill Sync 状态</strong><button id="retry-load">重新加载</button></section>
   <div id="toast" role="status" aria-live="polite"></div>
   <script src="/app.js"></script>

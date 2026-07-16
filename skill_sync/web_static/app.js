@@ -16,6 +16,7 @@ const inFlightOperations = new Map();
 let mutationInFlight = null;
 let stateGeneration = 0;
 let toastTimer = null;
+let pendingMutation = null;
 const $ = selector => document.querySelector(selector);
 
 function viewsFor(view) {
@@ -75,6 +76,15 @@ async function loadView(view, force = false, generation = stateGeneration) {
 
 async function loadActiveView(force = false) {
   await loadView(activeView, force);
+}
+
+async function ensureToken() {
+  if (token) return token;
+  const response = await fetch("/api/token");
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "无法获取请求令牌");
+  token = data.token;
+  return token;
 }
 
 function operationInfo(path, body) {
@@ -140,12 +150,7 @@ async function getState(announce = true) {
     const generation = ++stateGeneration;
     if (announce) toast(`正在刷新${viewName(view)}…`);
     try {
-      if (!token) {
-        const response = await fetch("/api/token");
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "无法获取请求令牌");
-        token = data.token;
-      }
+      await ensureToken();
       await loadView(view, true, generation);
       if (announce) toast(`${viewName(view)}状态已刷新`);
       return true;
@@ -157,7 +162,7 @@ async function getState(announce = true) {
   });
 }
 
-async function action(path, body = {}) {
+async function action(path, body = {}, options = {}) {
   const operation = operationInfo(path, body);
   const requestView = activeView;
   return runOperation(operation.key, async () => {
@@ -182,13 +187,225 @@ async function action(path, body = {}) {
       try { mergeState(data.state); render(); }
       catch (_) { throw new Error("操作已执行，但界面更新失败，请刷新核验"); }
       const success = data.result?.backup_path ? `${operation.success}：${data.result.backup_path}` : operation.success;
+      const outcome={ok:true,message:success,result:data.result||{},unknown:false};
+      if(typeof options.captureResult==="function")options.captureResult(outcome);
       toast(success); return true;
     } catch (error) {
       const unknown = error.message.includes("刷新核验") ? error.message : `${operation.failure}：${error.message}`;
+      if(typeof options.captureResult==="function")options.captureResult({ok:false,message:unknown,error:error.message,unknown:error.message.includes("刷新核验")});
       toast(unknown, true);
       return false;
     }
   }, true);
+}
+
+function mutationPlanRequest(operation, body) {
+  if (operation === "sync") return body.skills ? {skills:[...body.skills]} : {};
+  if (operation === "import") return {skills:[...(body.skills||[])],agent:body.agent};
+  if (operation === "agent") return {agent:body.agent,enabled:body.enabled};
+  if (operation === "link-repair") return {skills:[...(body.skills||[])],...(body.agents?{agents:[...body.agents]}:{})};
+  if (operation === "delete") return {skills:[...(body.skills||[])]};
+  throw new Error(`不支持的计划操作：${operation}`);
+}
+
+async function fetchMutationPlan(operation, request) {
+  await ensureToken();
+  let response;
+  try {
+    response=await fetch("/api/plan",{method:"POST",headers:{"Content-Type":"application/json","X-Skill-Sync-Token":token},body:JSON.stringify({operation,request})});
+  } catch (_) {
+    throw new Error("无法连接 Skill Sync，请稍后重新规划");
+  }
+  let data;
+  try { data=await response.json(); }
+  catch (_) { throw new Error("规划结果无法解析，请稍后重试"); }
+  if(!response.ok)throw new Error(data.error||"无法安全规划此操作");
+  if(data?.schema_version!==1||data.operation!==operation||typeof data.can_execute!=="boolean"||!data.request||typeof data.request!=="object")throw new Error("规划结果格式不兼容，请升级 Skill Sync");
+  return data;
+}
+
+function mutationOrigin(origin,operation,body){
+  if(origin?.id)return {kind:"id",value:origin.id};
+  if(origin?.dataset?.agentAction)return {kind:"agent",value:origin.dataset.agentAction};
+  if(operation==="agent"&&body.agent)return {kind:"agent",value:body.agent};
+  return {kind:"fallback",value:"search"};
+}
+
+function restoreMutationFocus(origin){
+  let target=null;
+  if(origin?.kind==="id")target=$(`#${origin.value}`);
+  if(origin?.kind==="agent")target=[...document.querySelectorAll("[data-agent-action]")].find(item=>item.dataset.agentAction===origin.value)||null;
+  (target||$(activeView==="imports"?"#import-selected":"#search")||$("#refresh"))?.focus();
+}
+
+function setMutationLayer(open){
+  const layer=$("#mutation-layer");if(!layer)return;
+  layer.classList.toggle("hidden",!open);layer.setAttribute("aria-hidden",String(!open));
+  if($("#app"))$("#app").inert=open;
+  if($("#setup"))$("#setup").inert=open;
+}
+
+function mutationFingerprint(plan){
+  const keys=["schema_version","operation","request","status","can_execute","summary","targets","steps","conflicts","blockers","warnings","effects","backup","recovery","details"];
+  return JSON.stringify(Object.fromEntries(keys.map(key=>[key,plan?.[key]])));
+}
+
+function mutationTitle(operation,request){
+  if(operation==="sync")return "确认同步";
+  if(operation==="import")return `确认从 ${request.agent||"Agent"} 导入`;
+  if(operation==="agent")return request.enabled?`启用 ${request.agent}`:`停用 ${request.agent}`;
+  if(operation==="link-repair")return "确认修复 Agent 链接";
+  if(operation==="delete")return "确认永久删除";
+  return "确认操作";
+}
+
+function mutationConfirmLabel(operation,request){
+  if(operation==="sync")return "确认同步";
+  if(operation==="import")return "确认导入";
+  if(operation==="agent")return request.enabled?"确认启用":"确认停用";
+  if(operation==="link-repair")return "确认修复";
+  if(operation==="delete")return "永久删除";
+  return "确认执行";
+}
+
+function mutationStatusLabel(value){return({ready:"可以执行",blocked:"已阻止",conflict:"存在冲突"})[value]||value||"正在规划";}
+
+function planTargetText(plan){
+  const skills=(plan?.targets?.skills||[]).map(item=>item.name).filter(Boolean);
+  const clients=(plan?.targets?.clients||[]).map(item=>`${item.client||item.agent||"Agent"}${item.skill?` / ${item.skill}`:""}`);
+  return `<div class="mutation-target-group"><strong>Skill (${skills.length})</strong><span>${skills.length?skills.map(escapeHtml).join("、"):"无直接 Skill 变更"}</span></div><div class="mutation-target-group"><strong>Client (${clients.length})</strong><span>${clients.length?clients.map(escapeHtml).join("、"):"无 Agent 链接变更"}</span></div>`;
+}
+
+function planStepsHtml(plan){
+  const steps=plan?.steps||[];
+  return steps.length?steps.map(step=>`<li><strong>${escapeHtml(step.action||"执行")}</strong>${step.skill?` · ${escapeHtml(step.skill)}`:""}${step.client?` · ${escapeHtml(step.client)}`:""}${step.reason?` — ${escapeHtml(step.reason)}`:""}</li>`).join(""):'<li>此操作只更新配置，不直接修改 Skill 或 Agent 链接。</li>';
+}
+
+function planFindingsHtml(plan){
+  return [...(plan?.conflicts||[]),...(plan?.blockers||[]),...(plan?.warnings||[]).map(item=>({...item,_warning:true}))].map(item=>`<div class="mutation-finding ${item._warning?"warning":""}"><strong>${escapeHtml(item.code||"提示")}</strong>${item.detail?`：${escapeHtml(item.detail)}`:""}</div>`).join("");
+}
+
+function planEffectsHtml(plan){
+  const effects=plan?.effects||{},writes=effects.writes||{},writeLabels={config:"配置",registry:"Registry",canonical:"全局 Skill",rendered:"Rendered deployment",agent_links:"Agent 链接"};
+  const changed=Object.entries(writes).filter(([,value])=>value).map(([key])=>writeLabels[key]||key);
+  const git=Object.entries(effects.git||{}).filter(([,value])=>value).map(([key])=>`Git ${key}`);
+  return `<p>${changed.length?`将写入：${changed.map(escapeHtml).join("、")}`:"不会写入本地 Skill 状态"}</p><p>${effects.network?"正式执行会访问网络":"正式执行不访问网络"}${git.length?`；${git.map(escapeHtml).join("、")}`:"；无 Git 写操作"}</p>`;
+}
+
+function planRecoveryHtml(plan){
+  const backup=plan?.backup||{},recovery=plan?.recovery||{},operations=recovery.operations||[];
+  return `<p>${escapeHtml(backup.hint||"确认前不会创建备份。")}</p><p>${escapeHtml(recovery.hint||"失败时停止并保留诊断信息。")}</p>${operations.length?`<p>待恢复操作：${operations.map(item=>escapeHtml(item.path||item.status||"unknown")).join("、")}</p>`:""}`;
+}
+
+function deleteConfirmationPhrase(pending=pendingMutation){
+  const count=pending?.plan?.targets?.skills?.length||0;
+  return pending?.operation==="delete"&&count>1?`DELETE ${count}`:"";
+}
+
+function updateMutationConfirmState(){
+  const button=$("#mutation-confirm");if(!button)return;
+  const phrase=deleteConfirmationPhrase();
+  const phraseReady=!phrase||$("#mutation-delete-input").value===phrase;
+  button.disabled=!pendingMutation||pendingMutation.phase!=="confirm"||!pendingMutation.plan?.can_execute||!phraseReady;
+}
+
+function focusMutationDialog(){
+  if(!pendingMutation?.focusRequested)return;
+  pendingMutation.focusRequested=false;
+  const phrase=deleteConfirmationPhrase();
+  (phrase?$("#mutation-delete-input"):pendingMutation.phase==="confirm"?$("#mutation-confirm"):$("#mutation-dialog"))?.focus();
+}
+
+function renderMutationDialog(){
+  if(!$("#mutation-layer"))return;
+  if(!pendingMutation){setMutationLayer(false);return;}
+  setMutationLayer(true);
+  const pending=pendingMutation,plan=pending.plan,phase=pending.phase;
+  $("#mutation-title").textContent=mutationTitle(pending.operation,pending.request);
+  const status=$("#mutation-status");status.className=`mutation-status ${phase==="result"&&!pending.result?.ok?"result-error":phase==="confirm"?(plan?.status||"ready"):phase}`;
+  status.textContent=phase==="planning"?"正在生成只读计划…":phase==="revalidating"?"正在重新规划…":phase==="running"?"正在执行…":phase==="result"?(pending.result?.ok?"操作已完成":"操作未完成"):mutationStatusLabel(plan?.status);
+  $("#mutation-summary").textContent=plan?.summary||"Skill Sync 会先计算影响范围，确认前不会写入任何内容。";
+  $("#mutation-findings").innerHTML=planFindingsHtml(plan);
+  $("#mutation-targets").innerHTML=planTargetText(plan);
+  $("#mutation-steps").innerHTML=planStepsHtml(plan);
+  $("#mutation-effects").innerHTML=planEffectsHtml(plan);
+  $("#mutation-recovery").innerHTML=planRecoveryHtml(plan);
+  const phrase=deleteConfirmationPhrase(pending),deleteBox=$("#mutation-delete-confirmation");
+  deleteBox.classList.toggle("hidden",!phrase||phase!=="confirm");$("#mutation-delete-phrase").textContent=phrase;
+  const result=$("#mutation-result");result.className=`mutation-result ${phase==="result"?(pending.result?.ok?"success":"error"):"hidden"}`;result.textContent=phase==="result"?(pending.result?.message||"操作结果未知"):"";
+  const working=["planning","revalidating","running"].includes(phase),mutating=phase==="running";
+  $("#mutation-close").disabled=mutating;$("#mutation-cancel").disabled=mutating;$("#mutation-cancel").textContent=phase==="result"?"关闭":"取消";
+  $("#mutation-retry").classList.toggle("hidden",phase!=="result"||pending.result?.ok);$("#mutation-retry").textContent=pending.result?.unknown?"关闭并刷新":"重新规划";
+  $("#mutation-confirm").classList.toggle("hidden",phase==="result");$("#mutation-confirm").setAttribute("aria-busy",String(working));$("#mutation-confirm").textContent=working?(phase==="running"?"正在执行…":"正在重新规划…"):mutationConfirmLabel(pending.operation,pending.request);
+  updateMutationConfirmState();focusMutationDialog();
+}
+
+async function refreshPendingPlan({requireUnchanged=false}={}){
+  const pending=pendingMutation;if(!pending)return false;
+  const previous=mutationFingerprint(pending.plan);pending.phase=requireUnchanged?"revalidating":"planning";pending.focusRequested=true;if(!requireUnchanged)$("#mutation-delete-input").value="";renderMutationDialog();
+  try{
+    const fresh=await fetchMutationPlan(pending.operation,pending.request);
+    if(pendingMutation!==pending)return false;
+    pending.plan=fresh;
+    if(requireUnchanged&&previous!==mutationFingerprint(fresh)){
+      pending.phase="confirm";pending.result=null;$("#mutation-delete-input").value="";toast("影响范围已变化，请检查后再次确认");renderMutationDialog();return false;
+    }
+    pending.phase="confirm";pending.result=null;renderMutationDialog();return true;
+  }catch(error){
+    if(pendingMutation!==pending)return false;
+    pending.phase="result";pending.result={ok:false,message:`规划失败：${error.message}`,unknown:false};renderMutationDialog();return false;
+  }
+}
+
+async function requestPlannedMutation(operation,path,body={},origin=null,onSuccess=null){
+  if(pendingMutation||hasBusyOperation()){toast("请等待当前操作完成");return false;}
+  let request;
+  try{request=mutationPlanRequest(operation,body);}catch(error){toast(error.message,true);return false;}
+  pendingMutation={operation,path,body:{...body},request,origin:mutationOrigin(origin,operation,body),onSuccess,phase:"planning",plan:null,result:null,focusRequested:true};
+  $("#mutation-delete-input").value="";
+  renderMutationDialog();
+  return refreshPendingPlan();
+}
+
+async function confirmPendingMutation(){
+  const pending=pendingMutation;
+  if(!pending||pending.phase!=="confirm"||!pending.plan?.can_execute){return false;}
+  updateMutationConfirmState();if($("#mutation-confirm").disabled)return false;
+  if(!await refreshPendingPlan({requireUnchanged:true}))return false;
+  if(pendingMutation!==pending||pending.phase!=="confirm")return false;
+  pending.phase="running";pending.focusRequested=true;renderMutationDialog();
+  let result=null;
+  const ok=await action(pending.path,pending.body,{captureResult:value=>{result=value;}});
+  if(pendingMutation!==pending)return ok;
+  if(ok&&typeof pending.onSuccess==="function")pending.onSuccess();
+  pending.phase="result";pending.result=result||{ok,message:ok?"操作已完成":"操作未完成",unknown:!ok};pending.focusRequested=true;renderMutationDialog();
+  return ok;
+}
+
+function cancelPendingMutation(){
+  if(!pendingMutation||pendingMutation.phase==="running")return false;
+  let origin=pendingMutation.origin;
+  if(pendingMutation.result?.ok&&pendingMutation.operation==="delete")origin={kind:"id",value:"search"};
+  if(pendingMutation.result?.ok&&pendingMutation.operation==="import")origin={kind:"id",value:"select-all-imports"};
+  pendingMutation=null;setMutationLayer(false);restoreMutationFocus(origin);return true;
+}
+
+async function retryPendingMutation(){
+  if(!pendingMutation||pendingMutation.phase!=="result"||pendingMutation.result?.ok)return false;
+  if(pendingMutation.result?.unknown){const origin=pendingMutation.origin;pendingMutation=null;setMutationLayer(false);restoreMutationFocus(origin);return getState(true);}
+  return refreshPendingPlan();
+}
+
+function mutationFocusableElements(){return $("#mutation-dialog")?[...$("#mutation-dialog").querySelectorAll('button:not([disabled]),input:not([disabled]),[tabindex]:not([tabindex="-1"])')].filter(item=>!item.closest?.(".hidden")):[];}
+function handleMutationKeydown(event){
+  if(!pendingMutation)return false;
+  if(event.key==="Escape"){event.preventDefault();event.stopPropagation();cancelPendingMutation();return true;}
+  if(event.key!=="Tab")return false;
+  const focusable=mutationFocusableElements();if(!focusable.length){event.preventDefault();$("#mutation-dialog").focus();return true;}
+  const first=focusable[0],last=focusable[focusable.length-1],active=document.activeElement;
+  if(event.shiftKey&&(active===first||!$("#mutation-dialog").contains(active))){event.preventDefault();last.focus();}
+  else if(!event.shiftKey&&(active===last||!$("#mutation-dialog").contains(active))){event.preventDefault();first.focus();}
+  return true;
 }
 
 function render() {
@@ -222,8 +439,7 @@ function renderOperationStates() {
   const refreshBusy = isBusy("refresh");
   setButtonState($("#refresh"), refreshBusy, '<i class="ri-refresh-line"></i><span>正在刷新…</span>', '<i class="ri-refresh-line"></i><span>刷新状态</span>', locked && !refreshBusy);
   setButtonState($("#retry-load"), refreshBusy, "正在重新加载…", "重新加载", locked && !refreshBusy);
-  const syncBlocked = ["blocked","conflict"].includes(state?.preview?.action);
-  setButtonState($("#sync"), isBusy("sync"), '<i class="ri-loop-right-line"></i><span>正在同步…</span>', '<i class="ri-loop-right-line"></i><span>立即同步</span>', syncBlocked || (locked && !isBusy("sync")));
+  setButtonState($("#sync"), isBusy("sync"), '<i class="ri-loop-right-line"></i><span>正在同步…</span>', '<i class="ri-loop-right-line"></i><span>立即同步</span>', locked && !isBusy("sync"));
   setButtonState($("#setup-submit"), isBusy("init"), "正在连接…", "连接并开始使用", locked && !isBusy("init"));
   const selectionBusy = selectionOperationBusy();
   ["#select-all-checkbox","#select-selected","#deselect-selected","#link-selected","#copy-selected","#copy-agent","#delete-selected","#clear-selection"].forEach(selector => {
@@ -326,7 +542,8 @@ function renderSkills(skills) {
 function renderAgents(agents) {
   $("#agent-list").innerHTML = agents.map(agent => {
     const busy = isBusy(`agent:${agent.name}`);
-    return `<article class="agent-row"><span class="agent-icon"><i class="${agentIcon(agent.name)}"></i></span><div><strong>${escapeHtml(agent.display_name)}</strong><p>${agent.detected ? escapeHtml(agent.skills_dir) : "未检测到此 Agent"}</p></div><span class="connection-state ${agent.detected && agent.enabled ? "online" : ""}"><i></i>${agent.enabled ? (agent.detected ? "已连接" : "等待检测") : "已停用"}</span><button ${!agent.detected || hasBusyOperation() ? "disabled" : ""} aria-busy="${busy}" onclick="action('/api/agent',{agent:'${escapeJs(agent.name)}',enabled:${!agent.enabled}})">${busy ? (agent.enabled ? "正在停用…" : "正在启用…") : (agent.enabled ? "停用" : "启用")}</button></article>`;
+    const unavailable=(!agent.detected&&agent.enabled)||hasBusyOperation();
+    return `<article class="agent-row"><span class="agent-icon"><i class="${agentIcon(agent.name)}"></i></span><div><strong>${escapeHtml(agent.display_name)}</strong><p>${agent.detected ? escapeHtml(agent.skills_dir) : "未检测到此 Agent"}</p></div><span class="connection-state ${agent.detected && agent.enabled ? "online" : ""}"><i></i>${agent.enabled ? (agent.detected ? "已连接" : "等待检测") : "已停用"}</span><button ${unavailable ? "disabled" : ""} aria-busy="${busy}" data-agent-action="${escapeHtml(agent.name)}" onclick="requestPlannedMutation('agent','/api/agent',{agent:'${escapeJs(agent.name)}',enabled:${!agent.enabled}},this)">${busy ? (agent.enabled ? "正在停用…" : "正在启用…") : (agent.enabled ? "停用" : "启用")}</button></article>`;
   }).join("");
 }
 
@@ -455,9 +672,9 @@ function importKey(item){return `${item.agent}\u0000${item.name}`;}
 function toggleImport(agent,name,checked){const key=`${agent}\u0000${name}`;checked?selectedImports.add(key):selectedImports.delete(key);renderImports(state.import_candidates||[]);}
 function toggleAllImports(){const group=(state.import_candidates||[]).filter(item=>item.agent===activeImportAgent&&item.state!=="conflict");const all=group.length>0&&group.every(item=>selectedImports.has(importKey(item)));group.forEach(item=>all?selectedImports.delete(importKey(item)):selectedImports.add(importKey(item)));renderImports(state.import_candidates||[]);}
 function updateImportBar(){const count=[...selectedImports].filter(key=>key.startsWith(`${activeImportAgent}\u0000`)).length;$("#import-count").textContent=count;$("#import-bar").classList.toggle("hidden",!count);}
-async function importSelected(){const skills=[...selectedImports].filter(key=>key.startsWith(`${activeImportAgent}\u0000`)).map(key=>key.split("\u0000")[1]);if(!skills.length)return; if(confirm(`将 ${skills.length} 个 Skill 从 ${activeImportAgent} 导入全局库？`)){if(await action("/api/import",{skills,agent:activeImportAgent}))selectedImports.clear();}}
+async function importSelected(){const skills=[...selectedImports].filter(key=>key.startsWith(`${activeImportAgent}\u0000`)).map(key=>key.split("\u0000")[1]);if(!skills.length)return false;return requestPlannedMutation("import","/api/import",{skills,agent:activeImportAgent},$("#import-selected"),()=>{selectedImports.clear();renderImports(state.import_candidates||[]);});}
 async function backupSkill(skill){await action("/api/backup", {skill});}
-async function deleteSelected(){const skills=selectedNames();if(skills&&confirm(`永久删除以下全局 Skill？\n\n${skills.join("\n")}`)&&await action("/api/delete",{skills}))selected.clear();}
+async function deleteSelected(){const skills=selectedNames();if(!skills)return false;return requestPlannedMutation("delete","/api/delete",{skills},$("#delete-selected"),()=>{selected.clear();persistUiContext();renderSkills(state.status.skills||[]);});}
 function label(value){return({pull:"需要拉取",push:"需要推送","repair-links":"需要修复链接",conflict:"需要手动合并",blocked:"需要先处理",noop:"所有 Agent 已同步"})[value]||value;}
 function previewSummary(value){return({pull:"远端有新的 Skill 变更可拉取。",push:"本地变更等待推送到远端。","repair-links":"Skill 内容一致，部分 Agent 链接需要修复。",conflict:"本地和远端均有修改，需要手动合并。",blocked:"同步仓库需要先处理。",noop:"所有受管 Skill 状态一致。"})[value]||"当前状态已更新。";}
 function viewName(view){return({skills:"技能库",agents:"连接",imports:"导入"})[view]||"当前页面";}
@@ -473,7 +690,7 @@ document.querySelectorAll(".nav-item[data-view]").forEach(button=>button.onclick
 $("#search").value=restoredUiContext.search;
 showView(activeView);
 $("#setup-form").onsubmit=async event=>{event.preventDefault();await action("/api/init",Object.fromEntries(new FormData(event.currentTarget)));};
-$("#sync").onclick=()=>action("/api/sync");$("#refresh").onclick=()=>getState(true);
+$("#sync").onclick=()=>requestPlannedMutation("sync","/api/sync",{},$("#sync"));$("#refresh").onclick=()=>getState(true);
 $("#retry-load").onclick=()=>getState(true);
 $("#search").oninput=()=>{persistUiContext();renderSkills(state.status.skills||[]);};
 $("#sync-filter").onchange=event=>setInventoryFilter("status",event.currentTarget.value);
@@ -481,13 +698,19 @@ $("#source-filter").onchange=event=>setInventoryFilter("source",event.currentTar
 $("#agent-filter").onchange=event=>setInventoryFilter("agent",event.currentTarget.value);
 $("#clear-filters").onclick=clearInventoryFilters;
 $("#select-all-checkbox").onchange=toggleVisibleSkills;$("#select-all").onclick=toggleVisibleSkills;$("#clear-selection").onclick=clearSelection;
-$("#select-selected").onclick=toggleSelectedSync;$("#deselect-selected").onclick=()=>bulk("/api/deselect");$("#link-selected").onclick=()=>bulk("/api/link");
+$("#select-selected").onclick=toggleSelectedSync;$("#deselect-selected").onclick=()=>bulk("/api/deselect");$("#link-selected").onclick=()=>{const skills=selectedNames();return skills&&requestPlannedMutation("link-repair","/api/link",{skills},$("#link-selected"));};
 $("#copy-selected").onclick=()=>{const skills=selectedNames();return skills&&action("/api/copy",{skills,agents:[$("#copy-agent").value]});};$("#delete-selected").onclick=deleteSelected;
 $("#close-detail").onclick=()=>closeDetail();$("#detail-backup").onclick=()=>detailSkill&&backupSkill(detailSkill);
 $("#detail-drawer").onkeydown=handleDetailKeydown;
 if(globalThis.addEventListener){
   globalThis.addEventListener("popstate",restoreDetailFromLocation);
-  globalThis.addEventListener("keydown",event=>{if(event.key==="Escape"&&detailSkill)handleDetailKeydown(event);});
+  globalThis.addEventListener("keydown",event=>{if(pendingMutation){handleMutationKeydown(event);return;}if(event.key==="Escape"&&detailSkill)handleDetailKeydown(event);});
 }
 $("#select-all-imports").onchange=toggleAllImports;$("#clear-imports").onclick=()=>{selectedImports.clear();renderImports(state.import_candidates||[]);};$("#import-selected").onclick=importSelected;
+if($("#mutation-confirm"))$("#mutation-confirm").onclick=confirmPendingMutation;
+if($("#mutation-cancel"))$("#mutation-cancel").onclick=cancelPendingMutation;
+if($("#mutation-close"))$("#mutation-close").onclick=cancelPendingMutation;
+if($("#mutation-retry"))$("#mutation-retry").onclick=retryPendingMutation;
+if($("#mutation-delete-input"))$("#mutation-delete-input").oninput=updateMutationConfirmState;
+if($("#mutation-dialog"))$("#mutation-dialog").onkeydown=handleMutationKeydown;
 if (!globalThis.SKILL_SYNC_TEST) getState(false).catch(error=>toast(error.message,true));
