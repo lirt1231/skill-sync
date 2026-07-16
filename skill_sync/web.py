@@ -122,7 +122,21 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                 else:
                     self._json({"error": "unknown action"}, HTTPStatus.NOT_FOUND)
                     return
-                self._json({"result": result, "state": _state(config_path, views=views)})
+                try:
+                    next_state = _state(config_path, views=views)
+                except (SkillSyncError, ValueError, OSError) as exc:
+                    self._json(
+                        {
+                            "error": "operation completed but state refresh failed",
+                            "result": result,
+                            "state": None,
+                            "state_error": str(exc),
+                            "mutation_applied": True,
+                        },
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    return
+                self._json({"result": result, "state": next_state})
             except (SkillSyncError, ValueError, OSError) as exc:
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 

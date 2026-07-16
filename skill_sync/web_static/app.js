@@ -6,6 +6,10 @@ let detailSkill = null;
 const selected = new Set();
 const selectedImports = new Set();
 const loadedViews = new Set();
+const inFlightOperations = new Map();
+let mutationInFlight = null;
+let stateGeneration = 0;
+let toastTimer = null;
 const $ = selector => document.querySelector(selector);
 
 function viewsFor(view) {
@@ -39,40 +43,150 @@ function hydrateSkillAgents() {
   });
 }
 
-async function loadViews(views, force = false) {
+async function loadViews(views, force = false, generation = stateGeneration) {
+  if (mutationInFlight) return false;
   const requested = force ? views : views.filter(view => !loadedViews.has(view));
-  if (!requested.length) return;
+  if (!requested.length) return true;
   const response = await fetch(stateUrl(requested));
+  if (generation !== stateGeneration) return false;
   const partial = await response.json();
+  if (generation !== stateGeneration) return false;
   if (!response.ok) throw new Error(partial.error || "状态加载失败");
   mergeState(partial); render();
+  return true;
+}
+
+async function loadView(view, force = false, generation = stateGeneration) {
+  if (view === "skills") {
+    // Inventory is intentionally independent so a large Agent diagnosis does
+    // not delay the first useful list paint.
+    await loadViews(["inventory"], force, generation);
+    if (generation === stateGeneration && state?.initialized) await loadViews(["summary", "agents"], force, generation);
+    return;
+  }
+  await loadViews(viewsFor(view), force, generation);
 }
 
 async function loadActiveView(force = false) {
-  if (activeView === "skills") {
-    // Inventory is intentionally independent so a large Agent diagnosis does
-    // not delay the first useful list paint.
-    await loadViews(["inventory"], force);
-    if (state?.initialized) await loadViews(["summary", "agents"], force);
-    return;
-  }
-  await loadViews(viewsFor(activeView), force);
+  await loadView(activeView, force);
 }
 
-async function getState() {
-  if (!token) token = (await fetch("/api/token").then(r => r.json())).token;
-  await loadActiveView(true);
+function operationInfo(path, body) {
+  const count = body.skills?.length || 0;
+  const info = {
+    "/api/init": ["init", "正在连接…", "同步仓库已连接", "连接同步仓库失败"],
+    "/api/sync": ["sync", "正在同步…", "同步已完成", "同步失败"],
+    "/api/select": ["select", "正在加入同步…", `已将 ${count} 个 Skill 加入同步`, "加入同步失败"],
+    "/api/deselect": ["deselect", "正在取消同步…", `已将 ${count} 个 Skill 取消同步`, "取消同步失败"],
+    "/api/link": ["link", "正在修复链接…", `已修复 ${count} 个 Skill 的链接`, "修复链接失败"],
+    "/api/copy": ["copy", "正在复制…", `已复制 ${count} 个 Skill`, "复制 Skill 失败"],
+    "/api/delete": ["delete", "正在删除…", `已删除 ${count} 个全局 Skill`, "删除全局 Skill 失败"],
+    "/api/import": [`import:${body.agent}`, "正在导入…", `已从 ${body.agent} 导入 ${count} 个 Skill`, `从 ${body.agent} 导入失败`],
+    "/api/agent": [`agent:${body.agent}`, body.enabled ? "正在启用…" : "正在停用…", `${body.agent} 已${body.enabled ? "启用" : "停用"}`, `${body.enabled ? "启用" : "停用"} ${body.agent} 失败`],
+    "/api/backup": [`backup:${body.skill}`, "正在备份…", `${body.skill} 的本地备份已创建`, `备份 ${body.skill} 失败`],
+  }[path];
+  if (!info) return {key:path, running:"正在处理…", success:"操作已完成", failure:"操作失败"};
+  return {key:info[0], running:info[1], success:info[2], failure:info[3]};
+}
+
+function runOperation(key, task, mutation = false) {
+  if (inFlightOperations.has(key)) return inFlightOperations.get(key);
+  if (mutation && hasBusyOperation()) { toast("请等待当前操作完成"); return Promise.resolve(false); }
+  inFlightOperations.set(key, null);
+  setOperationBusy(key, true);
+  const promise = (async () => {
+    try { return await task(); }
+    finally {
+      if (mutationInFlight === promise) mutationInFlight = null;
+      inFlightOperations.delete(key);
+      setOperationBusy(key, false);
+    }
+  })();
+  inFlightOperations.set(key, promise);
+  if (mutation) mutationInFlight = promise;
+  return promise;
+}
+
+function setOperationBusy(key, busy) {
+  if (!busy) inFlightOperations.delete(key);
+  try {
+    if (state?.initialized) {
+      renderSkills(state.status?.skills || []);
+      renderAgents(state.doctor?.agents || []);
+      renderImports(state.import_candidates || []);
+      renderDetail();
+    }
+  } catch (_) {
+    // A stale or malformed response must never leave the operation lock set.
+  }
+  try { renderOperationStates(); } catch (_) {}
+}
+
+function isBusy(key) { return inFlightOperations.has(key); }
+function hasBusyOperation() { return inFlightOperations.size > 0; }
+function selectionOperationBusy() { return ["select","deselect","link","copy","delete"].some(isBusy); }
+function importOperationBusy() { return isBusy(`import:${activeImportAgent}`); }
+
+async function getState(announce = true) {
+  if (mutationInFlight) return false;
+  const view = activeView;
+  return runOperation("refresh", async () => {
+    const generation = ++stateGeneration;
+    if (announce) toast(`正在刷新${viewName(view)}…`);
+    try {
+      if (!token) {
+        const response = await fetch("/api/token");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "无法获取请求令牌");
+        token = data.token;
+      }
+      await loadView(view, true, generation);
+      if (announce) toast(`${viewName(view)}状态已刷新`);
+      return true;
+    } catch (error) {
+      if (!state) $("#load-failure").classList.remove("hidden");
+      toast(`刷新${viewName(view)}失败：${error.message}`, true);
+      return false;
+    }
+  });
 }
 
 async function action(path, body = {}) {
-  toast("正在处理…");
-  const response = await fetch(path, {method:"POST",headers:{"Content-Type":"application/json","X-Skill-Sync-Token":token},body:JSON.stringify({...body, views: viewsFor(activeView)})});
-  const data = await response.json();
-  if (!response.ok) { toast(data.error || "操作失败", true); return false; }
-  loadedViews.clear(); mergeState(data.state); render(); toast(data.result?.backup_path ? `已备份到 ${data.result.backup_path}` : "操作完成"); return true;
+  const operation = operationInfo(path, body);
+  const requestView = activeView;
+  return runOperation(operation.key, async () => {
+    stateGeneration += 1;
+    toast(operation.running);
+    try {
+      let response;
+      try {
+        response = await fetch(path, {method:"POST",headers:{"Content-Type":"application/json","X-Skill-Sync-Token":token},body:JSON.stringify({...body, views: viewsFor(requestView)})});
+      } catch (_) {
+        throw new Error("操作结果未知，请刷新核验");
+      }
+      let data;
+      try { data = await response.json(); }
+      catch (_) { throw new Error("操作结果未知，请刷新核验"); }
+      if (!response.ok) {
+        if (data.mutation_applied) throw new Error(`${operation.success}，但状态刷新失败，请刷新核验`);
+        if (response.status >= 500) throw new Error("操作结果未知，请刷新核验");
+        throw new Error(data.error || operation.failure);
+      }
+      loadedViews.clear();
+      try { mergeState(data.state); render(); }
+      catch (_) { throw new Error("操作已执行，但界面更新失败，请刷新核验"); }
+      const success = data.result?.backup_path ? `${operation.success}：${data.result.backup_path}` : operation.success;
+      toast(success); return true;
+    } catch (error) {
+      const unknown = error.message.includes("刷新核验") ? error.message : `${operation.failure}：${error.message}`;
+      toast(unknown, true);
+      return false;
+    }
+  }, true);
 }
 
 function render() {
+  $("#load-failure").classList.add("hidden");
   $("#setup").classList.toggle("hidden", state.initialized); $("#app").classList.toggle("hidden", !state.initialized);
   if (!state.initialized) return;
   const preview = state.preview;
@@ -87,6 +201,45 @@ function render() {
   renderImports(state.import_candidates || []);
   renderDetail();
   showView(activeView);
+  renderOperationStates();
+}
+
+function setButtonState(button, running, runningHtml, idleHtml, disabled = false) {
+  if (!button) return;
+  button.disabled = running || disabled;
+  button.setAttribute("aria-busy", String(running));
+  button.innerHTML = running ? runningHtml : idleHtml;
+}
+
+function renderOperationStates() {
+  const locked = hasBusyOperation();
+  const refreshBusy = isBusy("refresh");
+  setButtonState($("#refresh"), refreshBusy, '<i class="ri-refresh-line"></i><span>正在刷新…</span>', '<i class="ri-refresh-line"></i><span>刷新状态</span>', locked && !refreshBusy);
+  setButtonState($("#retry-load"), refreshBusy, "正在重新加载…", "重新加载", locked && !refreshBusy);
+  const syncBlocked = ["blocked","conflict"].includes(state?.preview?.action);
+  setButtonState($("#sync"), isBusy("sync"), '<i class="ri-loop-right-line"></i><span>正在同步…</span>', '<i class="ri-loop-right-line"></i><span>立即同步</span>', syncBlocked || (locked && !isBusy("sync")));
+  setButtonState($("#setup-submit"), isBusy("init"), "正在连接…", "连接并开始使用", locked && !isBusy("init"));
+  const selectionBusy = selectionOperationBusy();
+  ["#select-all-checkbox","#select-selected","#deselect-selected","#link-selected","#copy-selected","#copy-agent","#delete-selected","#clear-selection"].forEach(selector => {
+    const control = $(selector); if (control) control.disabled = selectionBusy || (locked && !selectionBusy);
+  });
+  if (isBusy("select")) $("#select-selected").innerHTML = '<i class="ri-add-circle-line"></i><span>正在加入…</span>';
+  if (isBusy("deselect")) $("#select-selected").innerHTML = '<i class="ri-subtract-line"></i><span>正在取消…</span>';
+  $("#link-selected").textContent = isBusy("link") ? "正在修复…" : "修复链接";
+  $("#copy-selected").innerHTML = isBusy("copy") ? '<i class="ri-file-copy-line"></i>正在复制…' : '<i class="ri-file-copy-line"></i>复制到';
+  $("#delete-selected").textContent = isBusy("delete") ? "正在删除…" : "删除所选";
+  const importBusy = importOperationBusy();
+  ["#select-all-imports","#clear-imports","#import-selected"].forEach(selector => {
+    const control = $(selector); if (control) control.disabled = importBusy || (locked && !importBusy);
+  });
+  if ($("#import-selected")) {
+    $("#import-selected").setAttribute("aria-busy", String(importBusy));
+    $("#import-selected").textContent = importBusy ? "正在导入…" : "导入到全局";
+  }
+  const backupBusy = detailSkill ? isBusy(`backup:${detailSkill}`) : false;
+  setButtonState($("#detail-backup"), backupBusy, "正在备份…", "创建本地备份", locked && !backupBusy);
+  if ($("#app")) $("#app").setAttribute("aria-busy", String(locked));
+  if ($("#setup-form")) $("#setup-form").setAttribute("aria-busy", String(isBusy("init")));
 }
 
 function showView(view) {
@@ -96,6 +249,7 @@ function showView(view) {
 }
 
 function switchView(view) {
+  if (mutationInFlight) { toast("请等待当前操作完成"); return; }
   activeView = view; showView(view);
   loadActiveView().catch(error => toast(error.message, true));
 }
@@ -113,7 +267,7 @@ function renderSkills(skills) {
   $("#skill-list").innerHTML = shown.map(skill => {
     const agents = state.doctor?.agents || [];
     const coverage = agents.map(agent => `<i class="agent-dot ${agentStateClass(skill.agents?.[agent.name])}" title="${escapeHtml(agent.display_name)}: ${escapeHtml(skill.agents?.[agent.name] || "未知")}"></i>`).join("");
-    return `<article class="skill-row ${detailSkill === skill.name ? "focused" : ""}" onclick="openDetail('${escapeJs(skill.name)}')"><input type="checkbox" aria-label="选择 ${escapeHtml(skill.name)}" ${selected.has(skill.name)?"checked":""} onclick="event.stopPropagation()" onchange="toggle('${escapeJs(skill.name)}',this.checked)"><span class="file-icon"><i class="ri-file-text-line"></i></span><strong>${escapeHtml(skill.name)}</strong><span class="coverage">${coverage}</span><span class="row-status ${skill.changed_local ? "pending" : ""}">${skill.changed_local ? "本地待推送" : (skill.selected ? "已同步" : "未加入同步")}</span><button class="icon-button" aria-label="查看详情" onclick="event.stopPropagation();openDetail('${escapeJs(skill.name)}')"><i class="ri-more-2-fill"></i></button></article>`;
+    return `<article class="skill-row ${detailSkill === skill.name ? "focused" : ""}" onclick="openDetail('${escapeJs(skill.name)}')"><input type="checkbox" aria-label="选择 ${escapeHtml(skill.name)}" ${selected.has(skill.name)?"checked":""} ${hasBusyOperation()?"disabled":""} onclick="event.stopPropagation()" onchange="toggle('${escapeJs(skill.name)}',this.checked)"><span class="file-icon"><i class="ri-file-text-line"></i></span><strong>${escapeHtml(skill.name)}</strong><span class="coverage">${coverage}</span><span class="row-status ${skill.changed_local ? "pending" : ""}">${skill.changed_local ? "本地待推送" : (skill.selected ? "已同步" : "未加入同步")}</span><button class="icon-button" aria-label="查看详情" onclick="event.stopPropagation();openDetail('${escapeJs(skill.name)}')"><i class="ri-more-2-fill"></i></button></article>`;
   }).join("") || `<p class="empty">没有符合条件的 Skill</p>`;
   const allSelected = shown.length > 0 && shown.every(skill => selected.has(skill.name));
   $("#select-all-checkbox").checked = allSelected;
@@ -126,15 +280,18 @@ function renderSkills(skills) {
 }
 
 function renderAgents(agents) {
-  $("#agent-list").innerHTML = agents.map(agent => `<article class="agent-row"><span class="agent-icon"><i class="${agentIcon(agent.name)}"></i></span><div><strong>${escapeHtml(agent.display_name)}</strong><p>${agent.detected ? escapeHtml(agent.skills_dir) : "未检测到此 Agent"}</p></div><span class="connection-state ${agent.detected && agent.enabled ? "online" : ""}"><i></i>${agent.enabled ? (agent.detected ? "已连接" : "等待检测") : "已停用"}</span><button ${!agent.detected ? "disabled" : ""} onclick="action('/api/agent',{agent:'${escapeJs(agent.name)}',enabled:${!agent.enabled}})">${agent.enabled ? "停用" : "启用"}</button></article>`).join("");
+  $("#agent-list").innerHTML = agents.map(agent => {
+    const busy = isBusy(`agent:${agent.name}`);
+    return `<article class="agent-row"><span class="agent-icon"><i class="${agentIcon(agent.name)}"></i></span><div><strong>${escapeHtml(agent.display_name)}</strong><p>${agent.detected ? escapeHtml(agent.skills_dir) : "未检测到此 Agent"}</p></div><span class="connection-state ${agent.detected && agent.enabled ? "online" : ""}"><i></i>${agent.enabled ? (agent.detected ? "已连接" : "等待检测") : "已停用"}</span><button ${!agent.detected || hasBusyOperation() ? "disabled" : ""} aria-busy="${busy}" onclick="action('/api/agent',{agent:'${escapeJs(agent.name)}',enabled:${!agent.enabled}})">${busy ? (agent.enabled ? "正在停用…" : "正在启用…") : (agent.enabled ? "停用" : "启用")}</button></article>`;
+  }).join("");
 }
 
 function renderImports(items) {
   const sources=["codex","claude","workbuddy"], titles={codex:"Codex",claude:"Claude Code",workbuddy:"WorkBuddy"};
   for (const key of [...selectedImports]) if (!items.some(item => importKey(item) === key)) selectedImports.delete(key);
-  $("#import-tabs").innerHTML = sources.map(agent => `<button class="source-tab ${activeImportAgent===agent?"active":""}" onclick="setImportAgent('${agent}')"><i class="${agentIcon(agent)}"></i><span>${titles[agent]}</span><b>${items.filter(item=>item.agent===agent).length}</b></button>`).join("");
+  $("#import-tabs").innerHTML = sources.map(agent => `<button class="source-tab ${activeImportAgent===agent?"active":""}" ${hasBusyOperation()?"disabled":""} onclick="setImportAgent('${agent}')"><i class="${agentIcon(agent)}"></i><span>${titles[agent]}</span><b>${items.filter(item=>item.agent===agent).length}</b></button>`).join("");
   const group=items.filter(item=>item.agent===activeImportAgent);
-  $("#imports").innerHTML = group.map(item => `<article class="import-row"><input type="checkbox" aria-label="选择 ${escapeHtml(item.name)}" ${selectedImports.has(importKey(item))?"checked":""} ${item.state==="conflict"?"disabled":""} onchange="toggleImport('${escapeJs(item.agent)}','${escapeJs(item.name)}',this.checked)"><span class="file-icon"><i class="ri-file-text-line"></i></span><strong>${escapeHtml(item.name)}</strong><code title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</code>${item.state==="conflict"?'<span class="conflict-label"><i class="ri-error-warning-line"></i>名称冲突</span>':""}</article>`).join("") || `<p class="empty">这个 Agent 中没有可导入的 Skill</p>`;
+  $("#imports").innerHTML = group.map(item => `<article class="import-row"><input type="checkbox" aria-label="选择 ${escapeHtml(item.name)}" ${selectedImports.has(importKey(item))?"checked":""} ${item.state==="conflict" || hasBusyOperation()?"disabled":""} onchange="toggleImport('${escapeJs(item.agent)}','${escapeJs(item.name)}',this.checked)"><span class="file-icon"><i class="ri-file-text-line"></i></span><strong>${escapeHtml(item.name)}</strong><code title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</code>${item.state==="conflict"?'<span class="conflict-label"><i class="ri-error-warning-line"></i>名称冲突</span>':""}</article>`).join("") || `<p class="empty">这个 Agent 中没有可导入的 Skill</p>`;
   const selectable=group.filter(item=>item.state!=="conflict");
   $("#select-all-imports").checked=selectable.length>0 && selectable.every(item=>selectedImports.has(importKey(item)));
   updateImportBar();
@@ -171,17 +328,19 @@ async function backupSkill(skill){await action("/api/backup", {skill});}
 async function deleteSelected(){const skills=selectedNames();if(skills&&confirm(`永久删除以下全局 Skill？\n\n${skills.join("\n")}`)&&await action("/api/delete",{skills}))selected.clear();}
 function label(value){return({pull:"需要拉取",push:"需要推送","repair-links":"需要修复链接",conflict:"需要手动合并",blocked:"需要先处理",noop:"所有 Agent 已同步"})[value]||value;}
 function previewSummary(value){return({pull:"远端有新的 Skill 变更可拉取。",push:"本地变更等待推送到远端。","repair-links":"Skill 内容一致，部分 Agent 链接需要修复。",conflict:"本地和远端均有修改，需要手动合并。",blocked:"同步仓库需要先处理。",noop:"所有受管 Skill 状态一致。"})[value]||"当前状态已更新。";}
+function viewName(view){return({skills:"技能库",agents:"连接",imports:"导入"})[view]||"当前页面";}
 function issueTitle(issue){return({"content-conflict":"本地与远端同时有修改","dirty-repository":"同步仓库存在额外改动",missing:"链接缺失",conflict:"链接冲突",partial:"链接不完整"})[issue.type]||issue.type;}
 function agentStateClass(value){return["linked","copied"].includes(value)?"ok":value==="disabled"?"disabled":value==="missing"?"missing":"warn";}
 function agentStateLabel(value){return value==="linked"?"已同步":value==="copied"?"本地副本":value==="disabled"?"已停用":value==="missing"?"未连接":"需检查";}
 function agentIcon(name){return({codex:"ri-code-box-line",claude:"ri-command-line",workbuddy:"ri-robot-2-line",kimi:"ri-sparkling-line"})[name]||"ri-apps-line";}
-function toast(message,error=false){const el=$("#toast");el.textContent=message;el.className=`show ${error?"error":""}`;setTimeout(()=>el.className="",3500);}
+function toast(message,error=false){const el=$("#toast");if(toastTimer!==null)clearTimeout(toastTimer);el.textContent=message;el.className=`show ${error?"error":""}`;el.setAttribute("role",error?"alert":"status");el.setAttribute("aria-live",error?"assertive":"polite");toastTimer=setTimeout(()=>{el.className="";toastTimer=null;},3500);}
 function escapeHtml(value){return String(value??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);}
 function escapeJs(value){return String(value).replace(/['\\]/g,"\\$&");}
 
 document.querySelectorAll(".nav-item[data-view]").forEach(button=>button.onclick=()=>switchView(button.dataset.view));
 $("#setup-form").onsubmit=async event=>{event.preventDefault();await action("/api/init",Object.fromEntries(new FormData(event.currentTarget)));};
-$("#sync").onclick=()=>action("/api/sync");$("#refresh").onclick=getState;
+$("#sync").onclick=()=>action("/api/sync");$("#refresh").onclick=()=>getState(true);
+$("#retry-load").onclick=()=>getState(true);
 $("#search-toggle").onclick=()=>{$("#search-wrap").classList.toggle("collapsed");if(!$("#search-wrap").classList.contains("collapsed"))$("#search").focus();};
 $("#search").oninput=()=>renderSkills(state.status.skills||[]);
 $("#select-all-checkbox").onchange=toggleVisibleSkills;$("#select-all").onclick=toggleVisibleSkills;$("#clear-selection").onclick=clearSelection;
@@ -189,4 +348,4 @@ $("#select-selected").onclick=toggleSelectedSync;$("#deselect-selected").onclick
 $("#copy-selected").onclick=()=>{const skills=selectedNames();return skills&&action("/api/copy",{skills,agents:[$("#copy-agent").value]});};$("#delete-selected").onclick=deleteSelected;
 $("#close-detail").onclick=closeDetail;$("#detail-backup").onclick=()=>detailSkill&&backupSkill(detailSkill);
 $("#select-all-imports").onchange=toggleAllImports;$("#clear-imports").onclick=()=>{selectedImports.clear();renderImports(state.import_candidates||[]);};$("#import-selected").onclick=importSelected;
-getState().catch(error=>toast(error.message,true));
+if (!globalThis.SKILL_SYNC_TEST) getState(false).catch(error=>toast(error.message,true));

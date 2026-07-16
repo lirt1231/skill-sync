@@ -16,7 +16,7 @@
       <label>Git 仓库地址<input name="repo" required placeholder="git@github.com:you/agent-skills.git"></label>
       <label>分支<input name="branch" value="main"></label>
       <details><summary>高级设置</summary><label>全局 Skill 目录<input name="skills_root" placeholder="~/.agents/skills"></label><label>本地仓库目录<input name="sync_dir" placeholder="默认本地数据目录"></label></details>
-      <button class="primary" type="submit">连接并开始使用</button>
+      <button id="setup-submit" class="primary" type="submit">连接并开始使用</button>
     </form>
     <small>不会保存 Git 密码或令牌，认证由系统 Git 凭据处理。</small>
   </section>
@@ -86,8 +86,9 @@
       <section><h3>位置</h3><code id="detail-path"></code></section>
       <button id="detail-backup">创建本地备份</button>
     </aside>
-    <div id="toast" role="status" aria-live="polite"></div>
   </div>
+  <section id="load-failure" class="load-failure hidden" role="alert"><strong>无法加载 Skill Sync 状态</strong><button id="retry-load">重新加载</button></section>
+  <div id="toast" role="status" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>
 </html>

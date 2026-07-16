@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 from http.server import ThreadingHTTPServer
 
 from skill_sync.config import save_config
+from skill_sync.errors import SkillSyncError
 from skill_sync.git import GitState
 from skill_sync.registry import save_registry
 from skill_sync.web import STATIC_DIR, _handler_factory, _state
@@ -23,10 +24,11 @@ class WebUiTest(unittest.TestCase):
         self.assertIn('id="sync"', (STATIC_DIR / "index.html").read_text(encoding="utf-8"))
         self.assertIn('id="copy-selected"', (STATIC_DIR / "index.html").read_text(encoding="utf-8"))
         self.assertIn('id="detail-description"', (STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+        self.assertIn('id="retry-load"', (STATIC_DIR / "index.html").read_text(encoding="utf-8"))
         self.assertIn('action("/api/backup", {skill})', (STATIC_DIR / "app.js").read_text(encoding="utf-8"))
         self.assertIn('skill.description||"暂无 description"', (STATIC_DIR / "app.js").read_text(encoding="utf-8"))
         self.assertIn('allSelected ? selected.delete', (STATIC_DIR / "app.js").read_text(encoding="utf-8"))
-        self.assertIn('await loadViews(["inventory"], force)', (STATIC_DIR / "app.js").read_text(encoding="utf-8"))
+        self.assertIn('await loadViews(["inventory"], force, generation)', (STATIC_DIR / "app.js").read_text(encoding="utf-8"))
         self.assertIn('return ["import-candidates"]', (STATIC_DIR / "app.js").read_text(encoding="utf-8"))
 
     def test_state_combines_status_and_link_matrix(self):
@@ -230,4 +232,50 @@ class WebHttpViewTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 400)
         sync.assert_not_called()
+        state.assert_not_called()
+
+    def test_http_post_distinguishes_applied_mutation_from_state_read_failure(self):
+        request = Request(
+            self.url("/api/sync"),
+            data=json.dumps({"views": ["inventory"]}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Skill-Sync-Token": "test-token",
+            },
+            method="POST",
+        )
+        with mock.patch("skill_sync.web.core.sync", return_value={"action": "push"}) as sync, mock.patch(
+            "skill_sync.web._state", side_effect=SkillSyncError("diagnosis failed")
+        ):
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(request)
+
+        self.assertEqual(raised.exception.code, 500)
+        body = json.loads(raised.exception.read())
+        self.assertTrue(body["mutation_applied"])
+        self.assertIn("state refresh failed", body["error"])
+        self.assertEqual(body["result"], {"action": "push"})
+        self.assertIsNone(body["state"])
+        self.assertEqual(body["state_error"], "diagnosis failed")
+        sync.assert_called_once_with(skill_names=None, config_path="/tmp/config.json")
+
+    def test_http_post_core_failure_is_not_marked_as_applied(self):
+        request = Request(
+            self.url("/api/sync"),
+            data=json.dumps({"views": ["inventory"]}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Skill-Sync-Token": "test-token",
+            },
+            method="POST",
+        )
+        with mock.patch(
+            "skill_sync.web.core.sync", side_effect=SkillSyncError("repository blocked")
+        ), mock.patch("skill_sync.web._state") as state:
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(request)
+
+        self.assertEqual(raised.exception.code, 400)
+        body = json.loads(raised.exception.read())
+        self.assertNotIn("mutation_applied", body)
         state.assert_not_called()
