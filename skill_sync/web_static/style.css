@@ -5,3 +5,5 @@
 .detail-description{margin:18px 0 0;color:var(--muted);font-size:13px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}
 button[aria-busy="true"] i{animation:operation-spin .8s linear infinite}button:disabled,select:disabled,input:disabled{cursor:not-allowed;opacity:.55}@keyframes operation-spin{to{transform:rotate(360deg)}}
 .load-failure{position:fixed;inset:50% auto auto 50%;transform:translate(-50%,-50%);display:flex;align-items:center;gap:16px;background:#fff;border:1px solid var(--line-strong);border-radius:12px;padding:18px 20px;box-shadow:0 18px 50px #26332918}.load-failure button{height:38px;border:1px solid var(--line-strong);border-radius:8px;background:#fff;padding:0 12px;font-weight:600;cursor:pointer}
+.detail-drawer{position:fixed;inset:0 0 0 auto;z-index:10;width:360px;height:100vh;min-height:0;overflow-y:auto;overscroll-behavior:contain;box-shadow:-14px 0 34px #26332918}
+@media(max-width:720px){.detail-drawer{width:100%;padding:24px}}

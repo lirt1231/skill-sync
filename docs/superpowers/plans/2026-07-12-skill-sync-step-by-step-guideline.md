@@ -1152,9 +1152,20 @@ commit `6.5 lazy load web view data` 已完成并在 `6.2`–`6.4` 后 rebase �
 inventory 实测约 `0.100s`–`0.126s`，自动测试使用稳定 work-count 边界而非脆弱的
 wall-clock 断言。
 
-当前下一 commit 是 `6.6 add web operation progress states`：只为 refresh 和现有
-mutation 增加操作级 loading、重复提交保护和明确结果，不提前混入 drawer、筛选或
-preview model。随后 `6.7` 和 `6.9` 可以独立并行开发，再按依赖进入 `6.8`、`6.10`。
+commit `6.6 add web operation progress states` 已完成，对应 `9bec6e5`。refresh 和
+现有 mutation 现在具备操作级 loading/result、重复请求去重、全局 mutation 互斥和
+stale GET 丢弃；所有退出路径都会解锁，初始加载失败可独立重试。本 commit 没有改动
+core action 或提前引入 mutation preview。
+
+commit `6.7 fix web detail drawer navigation` 已完成，对应 `3182c6d`。详情抽屉固定在
+视口右侧并独立滚动，支持行 Enter/Space、Escape、Tab/Shift+Tab 焦点循环、关闭后按
+Skill/trigger identity 恢复焦点，以及通过 `?detail=` 在刷新和浏览器前进/后退时恢复
+详情；失效目标会安全清理。本 commit 没有混入 filters、preview model 或新详情字段。
+
+当前并行中的 commit 是 `6.9 add web mutation preview models`；它必须通过共享
+preflight 保证 preview 与正式 action 的 blocker 一致，并保持完全只读。下一 serialized
+commit 是 `6.8 add inventory filters and agent labels`，完成后再将 `6.8` 与 `6.9`
+汇合进入 `6.10 add web mutation confirmation flows`。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

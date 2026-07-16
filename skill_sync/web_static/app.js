@@ -2,7 +2,10 @@ let token = "";
 let state = null;
 let activeView = "skills";
 let activeImportAgent = "codex";
-let detailSkill = null;
+const DETAIL_QUERY_PARAM = "detail";
+let detailSkill = detailTargetFromLocation();
+let detailNeedsFocus = Boolean(detailSkill);
+let detailReturnTarget = null;
 const selected = new Set();
 const selectedImports = new Set();
 const loadedViews = new Set();
@@ -267,7 +270,7 @@ function renderSkills(skills) {
   $("#skill-list").innerHTML = shown.map(skill => {
     const agents = state.doctor?.agents || [];
     const coverage = agents.map(agent => `<i class="agent-dot ${agentStateClass(skill.agents?.[agent.name])}" title="${escapeHtml(agent.display_name)}: ${escapeHtml(skill.agents?.[agent.name] || "未知")}"></i>`).join("");
-    return `<article class="skill-row ${detailSkill === skill.name ? "focused" : ""}" onclick="openDetail('${escapeJs(skill.name)}')"><input type="checkbox" aria-label="选择 ${escapeHtml(skill.name)}" ${selected.has(skill.name)?"checked":""} ${hasBusyOperation()?"disabled":""} onclick="event.stopPropagation()" onchange="toggle('${escapeJs(skill.name)}',this.checked)"><span class="file-icon"><i class="ri-file-text-line"></i></span><strong>${escapeHtml(skill.name)}</strong><span class="coverage">${coverage}</span><span class="row-status ${skill.changed_local ? "pending" : ""}">${skill.changed_local ? "本地待推送" : (skill.selected ? "已同步" : "未加入同步")}</span><button class="icon-button" aria-label="查看详情" onclick="event.stopPropagation();openDetail('${escapeJs(skill.name)}')"><i class="ri-more-2-fill"></i></button></article>`;
+    return `<article class="skill-row ${detailSkill === skill.name ? "focused" : ""}" role="button" tabindex="0" data-skill-name="${escapeHtml(skill.name)}" data-detail-trigger="row" aria-label="查看 ${escapeHtml(skill.name)} 详情" onclick="openDetail('${escapeJs(skill.name)}',this)" onkeydown="handleSkillRowKeydown(event,'${escapeJs(skill.name)}')"><input type="checkbox" aria-label="选择 ${escapeHtml(skill.name)}" ${selected.has(skill.name)?"checked":""} ${hasBusyOperation()?"disabled":""} onclick="event.stopPropagation()" onchange="toggle('${escapeJs(skill.name)}',this.checked)"><span class="file-icon"><i class="ri-file-text-line"></i></span><strong>${escapeHtml(skill.name)}</strong><span class="coverage">${coverage}</span><span class="row-status ${skill.changed_local ? "pending" : ""}">${skill.changed_local ? "本地待推送" : (skill.selected ? "已同步" : "未加入同步")}</span><button class="icon-button" data-skill-name="${escapeHtml(skill.name)}" data-detail-trigger="button" aria-label="查看详情" onclick="event.stopPropagation();openDetail('${escapeJs(skill.name)}',this)"><i class="ri-more-2-fill"></i></button></article>`;
   }).join("") || `<p class="empty">没有符合条件的 Skill</p>`;
   const allSelected = shown.length > 0 && shown.every(skill => selected.has(skill.name));
   $("#select-all-checkbox").checked = allSelected;
@@ -299,7 +302,12 @@ function renderImports(items) {
 
 function renderDetail() {
   const skill=(state.status.skills||[]).find(item=>item.name===detailSkill);
-  if (!skill) { detailSkill=null; $("#detail-drawer").classList.add("hidden"); return; }
+  if (!skill) {
+    if (detailSkill) updateDetailLocation(null, "replace");
+    detailSkill=null; detailNeedsFocus=false;
+    $("#detail-drawer").classList.add("hidden");
+    return;
+  }
   $("#detail-drawer").classList.toggle("hidden", activeView!=="skills");
   $("#detail-name").textContent=skill.name;
   $("#detail-status").innerHTML=`<i></i>${skill.changed_local?"本地有修改":skill.selected?"已同步到 Agent":"未加入同步"}`;
@@ -307,6 +315,10 @@ function renderDetail() {
   $("#detail-sync").textContent=skill.selected?"已加入同步":"仅保存在本地";
   $("#detail-path").textContent=skill.local_path;
   $("#detail-agents").innerHTML=(state.doctor?.agents||[]).map(agent=>`<div><span><i class="agent-dot ${agentStateClass(skill.agents?.[agent.name])}"></i>${escapeHtml(agent.display_name)}</span><b>${agentStateLabel(skill.agents?.[agent.name])}</b></div>`).join("");
+  if (detailNeedsFocus && activeView==="skills") {
+    detailNeedsFocus=false;
+    $("#close-detail").focus();
+  }
 }
 
 function toggle(name,checked){checked?selected.add(name):selected.delete(name);renderSkills(state.status.skills||[]);}
@@ -316,8 +328,64 @@ function updateSelectionBar(){$("#selection-count").textContent=selected.size;$(
 function selectedNames(){if(!selected.size){toast("请先选择至少一个 Skill",true);return null;}return [...selected];}
 function bulk(path){const skills=selectedNames();return skills&&action(path,{skills});}
 function toggleSelectedSync(){return bulk($("#select-selected").dataset.mode==="deselect"?"/api/deselect":"/api/select");}
-function openDetail(name){detailSkill=name;renderSkills(state.status.skills||[]);renderDetail();}
-function closeDetail(){detailSkill=null;$("#detail-drawer").classList.add("hidden");renderSkills(state.status.skills||[]);}
+function handleSkillRowKeydown(event,name){
+  if(event.target!==event.currentTarget||!["Enter"," "].includes(event.key))return;
+  event.preventDefault();openDetail(name,event.currentTarget);
+}
+function openDetail(name,origin=null,updateHistory=true){
+  if(!(state?.status?.skills||[]).some(skill=>skill.name===name))return;
+  if(origin?.dataset?.skillName===name)detailReturnTarget={skill:name,trigger:origin.dataset.detailTrigger||"row"};
+  detailSkill=name;detailNeedsFocus=true;
+  if(updateHistory)updateDetailLocation(name,"push");
+  renderSkills(state.status.skills||[]);renderDetail();showView(activeView);
+}
+function closeDetail(updateHistory=true,restoreFocus=true){
+  if(!detailSkill)return;
+  detailSkill=null;detailNeedsFocus=false;
+  if(updateHistory)updateDetailLocation(null,"push");
+  $("#detail-drawer").classList.add("hidden");renderSkills(state.status.skills||[]);
+  if(restoreFocus)focusDetailReturnTarget();
+}
+function focusDetailReturnTarget(){
+  const target=detailReturnTarget&&[...document.querySelectorAll("[data-skill-name]")].find(item=>item.dataset.skillName===detailReturnTarget.skill&&item.dataset.detailTrigger===detailReturnTarget.trigger);
+  (target||$("#search-toggle")).focus();
+}
+function detailFocusableElements(){
+  return [...$("#detail-drawer").querySelectorAll('button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')];
+}
+function handleDetailKeydown(event){
+  if(!detailSkill)return;
+  if(event.key==="Escape"){
+    event.preventDefault();event.stopPropagation();closeDetail();return;
+  }
+  if(event.key!=="Tab")return;
+  const focusable=detailFocusableElements();
+  if(!focusable.length){event.preventDefault();$("#detail-drawer").focus();return;}
+  const first=focusable[0],last=focusable[focusable.length-1],active=document.activeElement;
+  if(event.shiftKey&&(active===first||!$("#detail-drawer").contains(active))){event.preventDefault();last.focus();}
+  else if(!event.shiftKey&&(active===last||!$("#detail-drawer").contains(active))){event.preventDefault();first.focus();}
+}
+function detailTargetFromLocation(){
+  try{return new URL(globalThis.location?.href||"http://skill-sync.local/").searchParams.get(DETAIL_QUERY_PARAM)||null;}
+  catch(_){return null;}
+}
+function updateDetailLocation(target,mode){
+  if(!globalThis.history?.[`${mode}State`]||!globalThis.location?.href)return;
+  const url=new URL(globalThis.location.href);
+  target?url.searchParams.set(DETAIL_QUERY_PARAM,target):url.searchParams.delete(DETAIL_QUERY_PARAM);
+  const previous=globalThis.history.state&&typeof globalThis.history.state==="object"?globalThis.history.state:{};
+  globalThis.history[`${mode}State`]({...previous,detail:target||null},"",`${url.pathname}${url.search}${url.hash}`);
+}
+function restoreDetailFromLocation(){
+  const previous=detailSkill,target=detailTargetFromLocation();
+  if(target&&(state?.status?.skills||[]).some(skill=>skill.name===target)){
+    detailSkill=target;detailNeedsFocus=true;renderSkills(state.status.skills||[]);renderDetail();showView(activeView);return;
+  }
+  if(target)updateDetailLocation(null,"replace");
+  detailSkill=null;detailNeedsFocus=false;$("#detail-drawer").classList.add("hidden");
+  if(state?.initialized)renderSkills(state.status?.skills||[]);
+  if(previous)focusDetailReturnTarget();
+}
 function setImportAgent(agent){activeImportAgent=agent;renderImports(state.import_candidates||[]);}
 function importKey(item){return `${item.agent}\u0000${item.name}`;}
 function toggleImport(agent,name,checked){const key=`${agent}\u0000${name}`;checked?selectedImports.add(key):selectedImports.delete(key);renderImports(state.import_candidates||[]);}
@@ -346,6 +414,11 @@ $("#search").oninput=()=>renderSkills(state.status.skills||[]);
 $("#select-all-checkbox").onchange=toggleVisibleSkills;$("#select-all").onclick=toggleVisibleSkills;$("#clear-selection").onclick=clearSelection;
 $("#select-selected").onclick=toggleSelectedSync;$("#deselect-selected").onclick=()=>bulk("/api/deselect");$("#link-selected").onclick=()=>bulk("/api/link");
 $("#copy-selected").onclick=()=>{const skills=selectedNames();return skills&&action("/api/copy",{skills,agents:[$("#copy-agent").value]});};$("#delete-selected").onclick=deleteSelected;
-$("#close-detail").onclick=closeDetail;$("#detail-backup").onclick=()=>detailSkill&&backupSkill(detailSkill);
+$("#close-detail").onclick=()=>closeDetail();$("#detail-backup").onclick=()=>detailSkill&&backupSkill(detailSkill);
+$("#detail-drawer").onkeydown=handleDetailKeydown;
+if(globalThis.addEventListener){
+  globalThis.addEventListener("popstate",restoreDetailFromLocation);
+  globalThis.addEventListener("keydown",event=>{if(event.key==="Escape"&&detailSkill)handleDetailKeydown(event);});
+}
 $("#select-all-imports").onchange=toggleAllImports;$("#clear-imports").onclick=()=>{selectedImports.clear();renderImports(state.import_candidates||[]);};$("#import-selected").onclick=importSelected;
 if (!globalThis.SKILL_SYNC_TEST) getState(false).catch(error=>toast(error.message,true));
