@@ -30,9 +30,9 @@ copies of the same Skill.
 
 Resolution order:
 
-1. exact client variant, such as `kimi-desktop`;
-2. Agent-family variant, such as `kimi`;
-3. common base Skill.
+1. common Base Skill;
+2. Agent-family Variant, such as `kimi`, overrides Base paths;
+3. the exact-client Variant, such as `kimi-desktop`, overrides both.
 
 ### 2.2 Source files and generated files must be distinguishable
 
@@ -101,8 +101,10 @@ on the two concrete clients. A grouped state is derived from its client states.
 └── variants/
     └── meeting-note/
         ├── kimi/
+        │   ├── variant.yaml
         │   └── SKILL.md
         ├── kimi-desktop/
+        │   ├── variant.yaml
         │   ├── SKILL.md
         │   └── references/desktop.md
         └── codex/
@@ -296,23 +298,22 @@ as safely unmanaged.
 ```bash
 skill-sync variant create meeting-note --client kimi-desktop
 skill-sync variant validate meeting-note
-skill-sync preview
-skill-sync link --skill meeting-note
+skill-sync resolve meeting-note --client kimi-desktop --dry-run
+skill-sync diff meeting-note --base --client kimi-desktop
 ```
 
-The create command should scaffold the smallest possible overlay and explain
-the resolution order.
+Through 7.6, create/validate/resolve/diff are local source and inspection
+commands. `preview`, `sync`, and `link` are not yet Variant-aware.
 
 ### 4.2 Inspect a resolved Skill
 
 ```bash
 skill-sync resolve meeting-note --client codex --dry-run
-skill-sync resolve meeting-note --client codex --output /tmp/meeting-note
 skill-sync diff meeting-note --base --client codex
 ```
 
-The default inspection is read-only. Writing to an arbitrary output path must
-never change Agent links or registry state.
+Inspection is read-only. Arbitrary output materialization is a later roadmap
+capability and is deliberately absent from the current CLI.
 
 ### 4.3 Sync on a second machine
 
@@ -324,9 +325,9 @@ skill-sync sync
 skill-sync doctor
 ```
 
-`sync` installs base and variant sources under `~/.agents`, resolves only the
-variants needed by clients detected on that machine, and repairs safe missing
-links.
+This is the target-state second-machine flow. Through 7.6, `sync` installs Base
+sources but does not package or reconstruct `variants/`; Phase 2 must land
+before this workflow is Variant-aware.
 
 ### 4.4 Resolve a Git conflict
 
@@ -418,12 +419,18 @@ restart behavior.
 
 ### 5.1 Variant commands
 
+Implemented through 7.6:
+
 - `variant list [--skill name] [--json]`
 - `variant create <skill> --family|--client <id>`
+- `variant validate <skill> [--json]`
+- `resolve <skill> --client <id> --dry-run [--json]`
+- `diff <skill> --base --client <id> [--json]`
+
+Planned, not implemented:
+
 - `variant delete <skill> --family|--client <id>`
-- `variant validate [skill] [--json]`
-- `resolve <skill> --client <id> [--dry-run] [--output path]`
-- `diff <skill> --base --client <id>`
+- `resolve <skill> --client <id> --output <path>`
 
 ### 5.2 Agent adapter commands
 
@@ -620,19 +627,20 @@ Deliverables:
   requires `managed check` before every Skill modification.
 - Hashing, path traversal, symlink, atomic build, and cleanup tests.
 
-Implementation checkpoint: commits 7.1 through 7.5 now provide the strict
+Implementation checkpoint: commits 7.1 through 7.6 now provide the strict
 `variant.yaml` parser, registry-independent file overlay core, read-only
 layered resolution provenance, Variant source list/create/validate commands,
-and read-only resolve/Base-to-client diff commands. The resolver derives the
-registered family from an exact client ID, selects Base → family → exact-client sources, applies a
-shared family/client target only once when the IDs coincide, and records
-immutable ordered layer metadata. Every source layer has a deterministic
-mode-aware hash over the exact immutable bytes and normalized file modes used
-by the overlay plan. Modes use host-independent content semantics: immutable
-bytes beginning with a `#!` shebang become `0755`; every other regular file
-becomes `0644`. Host `st_mode` is never a resolution input, so chmod-only
-differences across macOS and Windows do not change output identity. The same
-planned mode is materialized, with exact staged-mode verification on POSIX and
+read-only resolve/Base-to-client diff commands, and a current-state architecture
+contract with explicit migration limits. The resolver derives the
+registered family from an exact client ID, selects Base → family → exact-client
+sources, applies a shared family/client target only once when the IDs coincide,
+and records immutable ordered layer metadata. Every source layer has a
+deterministic mode-aware hash over the exact immutable bytes and normalized
+file modes used by the overlay plan. Modes use host-independent content
+semantics: immutable bytes beginning with a `#!` shebang become `0755`; every
+other regular file becomes `0644`. Host `st_mode` is never a resolution input,
+so chmod-only differences across macOS and Windows do not change output
+identity. The same planned mode is materialized, with exact staged-mode verification on POSIX and
 content-semantic verification on Windows. Variant manifest semantics are parsed
 directly from the captured `variant.yaml` bytes stored in that layer, so the
 hashed input and applied delete behavior cannot diverge during a race. The
@@ -651,6 +659,11 @@ The commands do not materialize output, invoke Git, fetch, update the registry,
 or mutate a source. Registry integration, rendered provenance files,
 deployment/cache mutation, and scoped edit sessions remain later commits and
 must not be inferred from these read-only APIs.
+
+The implemented model and its non-goals are maintained in
+[`docs/architecture/variant-resolution.md`](../../architecture/variant-resolution.md).
+Through 7.6 the CLI does not provide `resolve --output` or `variant delete`, and
+normal sync/link/deployment/edit/Web flows are not yet Variant-aware.
 
 Acceptance criteria:
 

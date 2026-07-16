@@ -175,6 +175,38 @@ class InstalledEditCliTest(unittest.TestCase):
                 self.assertEqual(detail.returncode, 0, detail.stderr)
                 self.assertIn(f"skill-sync edit {command}", detail.stdout)
 
+    def test_installed_wheel_exposes_documented_variant_resolution_help(self) -> None:
+        resolve = self.run_cli("resolve", "--help")
+        self.assertEqual(resolve.returncode, 0, resolve.stderr)
+        for option in ("--client", "--dry-run", "--json"):
+            self.assertIn(option, resolve.stdout)
+        self.assertNotIn("--output", resolve.stdout)
+
+        diff = self.run_cli("diff", "--help")
+        self.assertEqual(diff.returncode, 0, diff.stderr)
+        for option in ("--base", "--client", "--json"):
+            self.assertIn(option, diff.stdout)
+
+        variant = self.run_cli("variant", "--help")
+        self.assertEqual(variant.returncode, 0, variant.stderr)
+        for action in ("list", "create", "validate"):
+            self.assertIn(action, variant.stdout)
+        self.assertNotIn("delete", variant.stdout)
+
+        variant_list = self.run_cli("variant", "list", "--help")
+        self.assertEqual(variant_list.returncode, 0, variant_list.stderr)
+        for option in ("--skill", "--json"):
+            self.assertIn(option, variant_list.stdout)
+
+        variant_create = self.run_cli("variant", "create", "--help")
+        self.assertEqual(variant_create.returncode, 0, variant_create.stderr)
+        for option in ("--family", "--client", "--json"):
+            self.assertIn(option, variant_create.stdout)
+
+        variant_validate = self.run_cli("variant", "validate", "--help")
+        self.assertEqual(variant_validate.returncode, 0, variant_validate.stderr)
+        self.assertIn("--json", variant_validate.stdout)
+
     def test_installed_json_workflow_covers_every_edit_command(self) -> None:
         empty = self.run_json("edit", "list")
         self.assertEqual(empty["command"], "edit list")

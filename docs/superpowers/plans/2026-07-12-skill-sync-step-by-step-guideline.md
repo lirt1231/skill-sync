@@ -938,7 +938,7 @@ Batch B 完成后，产品具备“多设备同步 + 多 Agent Client 适配管�
 | 7.5 | `add variant resolve and diff commands` | `resolve --dry-run`、Base/client diff 和 JSON 输出 | Kimi family/client 优先级、binary metadata diff |
 | 7.6 | `document variant resolution model` | README、architecture、迁移限制；不新增行为 | wheel CLI help 与文档命令逐项核对 |
 
-当前检查点：7.1–7.5 已完成；下一小提交是 7.6。7.5 的 Base/client
+当前检查点：7.1–7.6 已完成；下一小提交是 8.1。7.5 的 Base/client
 两侧必须来自同一个 immutable `LayeredVariantResolution.overlay_plan`，只对安全且
 单项合计不超过 64 KiB 的 UTF-8 文本生成 unified diff；单次命令的 text
 unified-diff input 总预算为 256 KiB，按 path 顺序耗尽后返回
@@ -946,6 +946,29 @@ unified-diff input 总预算为 256 KiB，按 path 顺序耗尽后返回
 portable mode。Configured roots 在初检前绑定 identity，并在 immutable plan
 完成后复验。`resolve` 必须显式传 `--dry-run`，两个命令均不得 materialize、
 修改 source/config/registry、调用 Git 或触发 fetch/commit/push。
+
+7.6 不新增业务行为，只把当前 Variant 模型、命令契约和迁移限制固化到 README 与
+`docs/architecture/variant-resolution.md`。文档逐项区分 authored Base/Family/Client
+source、immutable resolved view 和尚未 Variant-aware 的 deployment；同时明确当前
+不存在 `resolve --output`、`variant delete`、Variant 多设备 sync、scoped edit、Web
+editor 和 persisted provenance。文档契约测试以 `python -m skill_sync.cli ... --help`
+核对真实 parser，避免 roadmap 目标命令被误写成已实现能力。
+
+7.6 wheel help 验收使用隔离临时目录执行：
+
+```bash
+python -m pip wheel --no-deps --no-build-isolation --wheel-dir <wheels> .
+python -m venv <venv>
+<venv-python> -m pip install --no-index --no-deps <wheel>
+<installed-skill-sync> resolve --help
+<installed-skill-sync> diff --help
+<installed-skill-sync> variant --help
+```
+
+三个 installed console help 均 exit 0；`resolve` 只暴露 `--client`、`--dry-run`、
+`--json`，没有 `--output`；`diff` 暴露 `--base`、`--client`、`--json`；`variant`
+只列出 `list/create/validate`，没有 `delete`。现有 installed-wheel e2e harness 复用
+同一次 wheel build 锁定这些 help contract，没有新增第二套日常 wheel build。
 
 ### Step 8：Family/Client Edit Session
 
@@ -1254,8 +1277,17 @@ missing→present、remove/replace 和 case ambiguity 全部 fail closed。该 c
 provenance 文件，不接 registry/CLI/Web，不 materialize cache，也不修改真实 Agent link。
 
 7.2 → 7.4 → 7.3 的既定并行集成顺序至此完成，且 7.4 source commands 与 7.3
-read-only resolver 保持独立边界。主 resolver 链下一项为 7.5；registry、rendered
-provenance 持久化和 deployment mutation 仍留在后续独立 commit。
+read-only resolver 保持独立边界。7.5 已增加严格只读的 `resolve --dry-run` 和
+Base/client `diff`，其 Base/client 两侧绑定同一个 immutable plan；每项 unified-diff
+input 上限为 64 KiB，单命令总预算为 256 KiB，binary/large/超预算项只输出 metadata。
+configured root、missing state、logical Skill parent 和 layer identity 在事务前后复验，
+ancestor real-directory/symlink/reparse replacement 与 ABA 均以
+`variant_source_changed` fail closed。
+
+7.6 已将 current-state resolution model、source/resolved 边界、TOCTOU threat model、
+真实 CLI help 和 migration limits 固化到 README 与 architecture 文档，不新增 CLI/core
+行为。Step 7 至此完成；registry、Variant 多设备同步、rendered provenance 持久化、
+Variant-aware deployment/Web 和 Family/Client edit session 仍留在后续独立 commit。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

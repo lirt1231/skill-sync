@@ -68,10 +68,11 @@ skill-sync preview --json
 
 ### Machine-readable CLI output
 
-`version`, `scan`, `status`, `preview`, `doctor`, `managed check`, all current
-`variant` and `edit` subcommands, `deploy status`, and `deploy gc` support
-`--json`. During the pre-1.0 releases, their machine-readable contract uses
-schema version 1 and always returns the same top-level envelope:
+`version`, `scan`, `status`, `preview`, `doctor`, `managed check`, `resolve`,
+`diff`, all current `variant` and `edit` subcommands, `deploy status`, and
+`deploy gc` support `--json`. During the pre-1.0 releases, their
+machine-readable contract uses schema version 1 and always returns the same
+top-level envelope:
 
 ```json
 {
@@ -101,6 +102,9 @@ to stderr and the command returns its structured exit code:
 Text mode remains intended for interactive use and keeps its concise output.
 
 ### Create and inspect Variant sources
+
+The complete current model, safety invariants, and migration limits are in
+[Variant Resolution Architecture](docs/architecture/variant-resolution.md).
 
 Portable client differences live beside the canonical Skill root. With the
 default `~/.agents/skills` root, Variant sources are stored under
@@ -156,8 +160,15 @@ and files whose combined comparison input exceeds 64 KiB are metadata-only
 (hash, size, and portable mode). Text unified-diff input is also capped at
 256 KiB across one command, in deterministic path order; later changes become
 metadata-only when that budget is exhausted.
-Neither command materializes a deployment, changes
-source/config/registry state, invokes Git, fetches, commits, or pushes.
+Neither command materializes a deployment, changes source/config/registry
+state, invokes Git, fetches, commits, or pushes.
+
+Through roadmap 7.6, Variant support is limited to local source management and
+read-only inspection. Normal `sync`, `pull`, `push`, `link`, deployment, Web,
+and Base edit-session flows do not yet synchronize, deploy, or edit Variant
+sources. There is no `resolve --output` or `variant delete` command. Treat these
+as explicit migration limits until the later registry, multi-device,
+deployment, and scoped-edit commits land.
 
 Before migrating existing Agent links away from editable canonical sources,
 preview every affected Skill/client pair, perform the migration, and inspect
