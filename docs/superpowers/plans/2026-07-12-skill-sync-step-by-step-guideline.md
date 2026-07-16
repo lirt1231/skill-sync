@@ -1020,17 +1020,18 @@ edit apply 直接影响用户源数据或托管部署，不能通过并行开发
 
 ## 20. 现在应该从哪里开始
 
-Step 0–4 和 commit `5.1`–`5.5` 已完成并验收。当前所有托管客户端都使用只读
+Step 0–4 和 commit `5.1`–`5.6` 已完成并验收。当前所有托管客户端都使用只读
 rendered deployment；edit session 已具备严格 metadata、只读
-`list/status/diff/validate/impact`、Base baseline snapshot、writable workspace 和
-`begin/abort`。同一 Skill 的 begin 由每 Skill 锁串行，不同 Skill 可以并行；abort
-不修改 canonical source。impact 会列出 family/client deployment 影响，并在
-canonical baseline 过期时 fail closed。
+`list/status/diff/validate/impact`、Base baseline snapshot、writable workspace、
+`begin/abort` 和 transactional `apply`。apply 使用 `deployment.lock → per-Skill
+lock`，检查 baseline conflict 和 workspace validation，持久化私有 backup/receipt，
+再通过同父目录 no-replace rename 替换 canonical；外部 winner 永不覆盖。apply
+中断会留下可判定的 receipt phase、session 状态和恢复 artifact，但本阶段不重建
+deployment，也不执行 Git 操作。
 
-下一 commit 是 `5.6 add transactional base edit apply`：实现 baseline conflict、
-backup、receipt 和 canonical 原子替换，但暂不自动重建 deployment。它位于
-transaction apply、deployment rebuild、recovery 的串行关键链上，必须单独开发和
-验收，不与 `5.7` 或后续 commit 并行。完成 `5.6` 前不得修改真实托管 Skill。
+下一 commit 是 `5.7 rebuild deployments after edit apply`：只针对 apply 影响的
+clients 构建、验证并切换新的 rendered deployment；任何失败都必须恢复 canonical
+和原链接。它仍位于串行关键链上，不与 `5.8 recovery` 并行开发。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

@@ -457,9 +457,24 @@ class EditSessionStore:
 
         initial = self.load(session_id)
         with self.skill_lock(initial.logical_skill):
-            current = self.load(session_id)
-            updated = current.transitioned(status, now=now)
-            _write_json_atomic(self.paths(session_id).metadata, updated.to_dict())
+            return self.transition_locked(session_id, status, now=now)
+
+    def transition_locked(
+        self,
+        session_id: str,
+        status: EditSessionStatus,
+        *,
+        now: datetime | None = None,
+    ) -> EditSessionMetadata:
+        """Persist a transition while the caller holds this Skill's lock.
+
+        Transactional workflows use this form to keep one uninterrupted lock
+        across metadata, receipt, and canonical filesystem changes.
+        """
+
+        current = self.load(session_id)
+        updated = current.transitioned(status, now=now)
+        _write_json_atomic(self.paths(session_id).metadata, updated.to_dict())
         return updated
 
     def _unfinished_session(

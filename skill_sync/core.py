@@ -26,6 +26,14 @@ from skill_sync.deployment import (
     resolution_hash,
     verify_deployment,
 )
+from skill_sync.edit_apply import (
+    CanonicalSwap,
+    CanonicalSwapRecoveryRequired,
+    PrivateJsonReceipt,
+    ReceiptRecoveryRequired,
+    fsync_tree,
+    prepare_private_directory,
+)
 from skill_sync.edit_session import (
     ActiveEditSessionError,
     CanonicalSkillChangedError,
@@ -59,6 +67,10 @@ from skill_sync.skill_metadata import read_skill_description
 
 REGISTRY_FILE = "registry.yaml"
 DEFAULT_AGENT_TARGETS = "codex,workbuddy,kimi,claude"
+
+
+class _EditTransitionRecoveryRequired(RuntimeError):
+    """A metadata transition may have committed before a durability error."""
 
 
 def list_edit_sessions(
@@ -403,6 +415,13 @@ def edit_begin(
         ) from exc
     except SkillSyncError:
         raise
+    except ReceiptRecoveryRequired as exc:
+        raise SkillSyncError(
+            "edit apply receipt changed and requires recovery",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
     except (OSError, ValueError) as exc:
         raise SkillSyncError(
             f"could not begin edit session: {exc}",
@@ -796,6 +815,463 @@ def edit_impact(
             code="unsafe_edit_session",
             exit_code=EXIT_SAFETY,
             details={"session_id": session_id},
+        ) from exc
+
+
+def edit_apply(
+    session_id: str,
+    *,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Transactionally replace a canonical Base Skill without rebuilding clients."""
+
+    config = _load_local_config(config_path)
+    data_root = _data_root(config)
+    store = EditSessionStore(data_root)
+    try:
+        store.load(session_id)
+    except FileNotFoundError as exc:
+        raise SkillSyncError(
+            f"edit session does not exist: {session_id}",
+            code="edit_session_not_found",
+            details={"session_id": session_id},
+        ) from exc
+    except (EditSessionMetadataError, OSError) as exc:
+        raise SkillSyncError(
+            f"could not safely load edit session: {exc}",
+            code="unsafe_edit_session",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+
+    try:
+        with local_file_lock(data_root / "locks" / "deployment.lock"):
+            lock_metadata = store.load(session_id)
+            with store.skill_lock(lock_metadata.logical_skill):
+                current = store.load(session_id)
+                if current.logical_skill != lock_metadata.logical_skill:
+                    raise SkillSyncError(
+                        "edit session identity changed while acquiring its lock",
+                        code="unsafe_edit_session",
+                        exit_code=EXIT_SAFETY,
+                        details={"session_id": session_id},
+                    )
+                return _edit_apply_locked(
+                    config,
+                    store,
+                    session_id,
+                    expected_skill=lock_metadata.logical_skill,
+                )
+    except SkillSyncError:
+        raise
+    except TimeoutError as exc:
+        raise SkillSyncError(
+            str(exc), code="edit_apply_lock_timeout", exit_code=EXIT_SAFETY
+        ) from exc
+    except (EditSessionMetadataError, OSError, ValueError) as exc:
+        raise SkillSyncError(
+            f"could not safely apply edit session: {exc}",
+            code="edit_apply_failed",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+
+
+def _edit_apply_locked(
+    config: dict[str, Any],
+    store: EditSessionStore,
+    session_id: str,
+    *,
+    expected_skill: str,
+) -> dict[str, Any]:
+    metadata = store.load(session_id)
+    if metadata.logical_skill != expected_skill:
+        raise SkillSyncError(
+            "edit session identity does not match the held Skill lock",
+            code="unsafe_edit_session",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        )
+    if metadata.status is not EditSessionStatus.ACTIVE:
+        raise SkillSyncError(
+            f"edit session is not active: {session_id} ({metadata.status.value})",
+            code="edit_session_not_active",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id, "status": metadata.status.value},
+        )
+
+    registry = _load_local_registry(config)
+    _target_names(registry, [metadata.logical_skill])
+    source = _local_skill_path_or_default(
+        config, registry, metadata.logical_skill
+    ).absolute()
+    _validate_skill_path(source)
+    paths = store.paths(session_id)
+    try:
+        baseline = inspect_tree(paths.baseline)
+        workspace = inspect_tree(paths.workspace)
+    except (EditTreeInspectionError, OSError) as exc:
+        raise SkillSyncError(
+            f"edit session trees are unsafe or incomplete: {exc}",
+            code="edit_session_incomplete",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+    if baseline.issues or baseline.hash != metadata.baseline_hash:
+        raise SkillSyncError(
+            "edit session baseline is damaged or does not match its recorded hash",
+            code="unsafe_edit_baseline",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        )
+    issues = validate_workspace(workspace, logical_skill=metadata.logical_skill)
+    if issues or workspace.hash is None:
+        raise SkillSyncError(
+            "edit workspace failed validation",
+            code="invalid_edit_workspace",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "issues": [issue.to_dict() for issue in issues],
+            },
+        )
+    workspace_hash = workspace.hash
+    if workspace_hash == metadata.baseline_hash:
+        raise SkillSyncError(
+            "edit workspace has no changes to apply",
+            code="edit_workspace_unchanged",
+            exit_code=EXIT_CONFLICT,
+            details={"session_id": session_id},
+        )
+    current_hash = hash_skill_dir(source)
+    if current_hash != metadata.baseline_hash:
+        raise SkillSyncError(
+            "canonical Skill changed since this edit session began",
+            code="edit_baseline_conflict",
+            exit_code=EXIT_CONFLICT,
+            details={
+                "session_id": session_id,
+                "expected_hash": metadata.baseline_hash,
+                "actual_hash": current_hash,
+            },
+        )
+
+    data_root_path = store.data_root
+    receipt_path = data_root_path / "operations" / f"edit-apply-{session_id}.json"
+    if receipt_path.exists() or is_link_or_reparse(receipt_path):
+        raise SkillSyncError(
+            "an edit apply receipt already exists for this session",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id, "receipt_path": str(receipt_path)},
+        )
+    backup_parent = prepare_private_directory(
+        data_root_path / "backups" / "edit-apply" / metadata.logical_skill
+    )
+    backup_path = backup_parent / f"{time.time_ns()}-{session_id}"
+    receipt: dict[str, Any] = {
+        "schema_version": 1,
+        "operation": "edit-apply",
+        "operation_id": session_id,
+        "session_id": session_id,
+        "skill": metadata.logical_skill,
+        "scope": "base",
+        "status": "prepared",
+        "phase": "backup-pending",
+        "created_at": time.time(),
+        "canonical_path": str(source),
+        "backup_path": str(backup_path),
+        "baseline_hash": metadata.baseline_hash,
+        "workspace_hash": workspace_hash,
+        "deployments_rebuilt": False,
+    }
+    receipt_writer = PrivateJsonReceipt.create(receipt_path, receipt)
+    try:
+        backup_hash = copy_skill_dir(source, backup_path)
+        if backup_hash != metadata.baseline_hash:
+            raise OSError("canonical backup does not match the edit baseline")
+        fsync_tree(backup_path)
+        receipt["phase"] = "backup-ready"
+        receipt_writer.update(receipt)
+    except (OSError, ValueError) as exc:
+        receipt["status"] = "rolled-back"
+        receipt["phase"] = "backup-failed"
+        receipt["error_code"] = "edit_backup_failed"
+        receipt["completed_at"] = time.time()
+        receipt_writer.update(receipt)
+        raise SkillSyncError(
+            "could not create a durable canonical backup",
+            code="edit_backup_failed",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "receipt_path": str(receipt_path),
+            },
+        ) from exc
+
+    swap: CanonicalSwap | None = None
+    applying = False
+    applied_metadata = False
+    try:
+        swap = CanonicalSwap.prepare(
+            source,
+            paths.workspace,
+            expected_old_hash=metadata.baseline_hash,
+            expected_new_hash=workspace_hash,
+            token=session_id,
+        )
+        _transition_edit_metadata(
+            store,
+            session_id,
+            expected=EditSessionStatus.ACTIVE,
+            target=EditSessionStatus.APPLYING,
+        )
+        applying = True
+        receipt["status"] = "applying"
+        receipt["phase"] = "canonical-replace"
+        receipt_writer.update(receipt)
+
+        swap.apply()
+        receipt["phase"] = "canonical-applied"
+        receipt_writer.update(receipt)
+        _transition_edit_metadata(
+            store,
+            session_id,
+            expected=EditSessionStatus.APPLYING,
+            target=EditSessionStatus.APPLIED,
+        )
+        applied_metadata = True
+        swap.finalize()
+        receipt["status"] = "completed"
+        receipt["phase"] = "completed"
+        receipt["completed_at"] = time.time()
+        receipt_writer.update(receipt)
+    except ReceiptRecoveryRequired as exc:
+        recovery_path = (
+            swap.previous
+            if swap is not None and swap.previous_moved
+            else backup_path
+        )
+        try:
+            current = store.load(session_id)
+            if current.status is EditSessionStatus.APPLYING:
+                _transition_edit_metadata(
+                    store,
+                    session_id,
+                    expected=EditSessionStatus.APPLYING,
+                    target=EditSessionStatus.NEEDS_RECOVERY,
+                )
+        except (EditSessionMetadataError, OSError, _EditTransitionRecoveryRequired):
+            pass
+        raise SkillSyncError(
+            "edit apply receipt changed and requires recovery",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "receipt_path": str(receipt_path),
+                "recovery_path": str(recovery_path),
+            },
+        ) from exc
+    except CanonicalSwapRecoveryRequired as exc:
+        _mark_edit_apply_recovery(
+            store,
+            session_id,
+            receipt,
+            receipt_path,
+            receipt_writer,
+            recovery_path=exc.recovery_path,
+        )
+        raise SkillSyncError(
+            "edit apply could not safely restore the previous canonical Skill",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "receipt_path": str(receipt_path),
+                "recovery_path": str(exc.recovery_path),
+            },
+        ) from exc
+    except _EditTransitionRecoveryRequired as exc:
+        recovery_path = (
+            swap.previous
+            if swap is not None and swap.previous_moved
+            else backup_path
+        )
+        _mark_edit_apply_recovery(
+            store,
+            session_id,
+            receipt,
+            receipt_path,
+            receipt_writer,
+            recovery_path=recovery_path,
+        )
+        raise SkillSyncError(
+            "edit session metadata durability is ambiguous and requires recovery",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "receipt_path": str(receipt_path),
+                "recovery_path": str(recovery_path),
+            },
+        ) from exc
+    except Exception as exc:
+        if applied_metadata:
+            recovery_path = (
+                swap.previous
+                if swap is not None and swap.previous_moved
+                else backup_path
+            )
+            _mark_edit_apply_recovery(
+                store,
+                session_id,
+                receipt,
+                receipt_path,
+                receipt_writer,
+                recovery_path=recovery_path,
+            )
+            raise SkillSyncError(
+                "canonical Skill was applied but final receipt cleanup needs recovery",
+                code="edit_apply_recovery_required",
+                exit_code=EXIT_SAFETY,
+                details={
+                    "session_id": session_id,
+                    "receipt_path": str(receipt_path),
+                },
+            ) from exc
+        try:
+            rolled_back = swap is None or swap.rollback()
+        except Exception:
+            rolled_back = False
+        if applying and rolled_back:
+            try:
+                _transition_edit_metadata(
+                    store,
+                    session_id,
+                    expected=EditSessionStatus.APPLYING,
+                    target=EditSessionStatus.ACTIVE,
+                )
+            except (
+                EditSessionMetadataError,
+                OSError,
+                _EditTransitionRecoveryRequired,
+            ):
+                rolled_back = False
+        if rolled_back and swap is not None:
+            try:
+                swap.finalize()
+            except Exception:
+                rolled_back = False
+        if not rolled_back:
+            recovery_path = swap.previous if swap is not None else backup_path
+            _mark_edit_apply_recovery(
+                store,
+                session_id,
+                receipt,
+                receipt_path,
+                receipt_writer,
+                recovery_path=recovery_path,
+            )
+            raise SkillSyncError(
+                "edit apply failed and requires recovery",
+                code="edit_apply_recovery_required",
+                exit_code=EXIT_SAFETY,
+                details={
+                    "session_id": session_id,
+                    "receipt_path": str(receipt_path),
+                    "recovery_path": str(recovery_path),
+                },
+            ) from exc
+        receipt["status"] = "rolled-back"
+        receipt["phase"] = "rolled-back"
+        receipt["error_code"] = "edit_apply_failed"
+        receipt["completed_at"] = time.time()
+        receipt_writer.update(receipt)
+        raise SkillSyncError(
+            "edit apply failed; the previous canonical Skill was restored",
+            code="edit_apply_failed",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "receipt_path": str(receipt_path),
+            },
+        ) from exc
+
+    return {
+        "session_id": session_id,
+        "skill": metadata.logical_skill,
+        "scope": "base",
+        "status": "applied",
+        "previous_hash": metadata.baseline_hash,
+        "applied_hash": workspace_hash,
+        "backup_path": str(backup_path),
+        "receipt_path": str(receipt_path),
+        "deployments_rebuilt": False,
+    }
+
+
+def _mark_edit_apply_recovery(
+    store: EditSessionStore,
+    session_id: str,
+    receipt: dict[str, Any],
+    receipt_path: Path,
+    receipt_writer: PrivateJsonReceipt,
+    *,
+    recovery_path: Path,
+) -> None:
+    transition_error: Exception | None = None
+    try:
+        current = store.load(session_id)
+        if current.status is EditSessionStatus.APPLYING:
+            _transition_edit_metadata(
+                store,
+                session_id,
+                expected=EditSessionStatus.APPLYING,
+                target=EditSessionStatus.NEEDS_RECOVERY,
+            )
+    except (
+        EditSessionMetadataError,
+        OSError,
+        _EditTransitionRecoveryRequired,
+    ) as exc:
+        transition_error = exc
+    receipt["status"] = "needs-recovery"
+    receipt["phase"] = "needs-recovery"
+    receipt["error_code"] = "edit_apply_recovery_required"
+    receipt["recovery_path"] = str(recovery_path)
+    if transition_error is not None:
+        receipt["metadata_transition_failed"] = True
+    receipt_writer.update(receipt)
+
+
+def _transition_edit_metadata(
+    store: EditSessionStore,
+    session_id: str,
+    *,
+    expected: EditSessionStatus,
+    target: EditSessionStatus,
+) -> EditSessionMetadata:
+    """Transition metadata or fail closed when the durable result is ambiguous."""
+
+    current = store.load(session_id)
+    if current.status is not expected:
+        raise _EditTransitionRecoveryRequired(
+            f"expected {expected.value}, found {current.status.value}"
+        )
+    try:
+        return store.transition_locked(session_id, target)
+    except (EditSessionMetadataError, OSError) as exc:
+        try:
+            durable = store.load(session_id)
+        except (EditSessionMetadataError, OSError) as load_exc:
+            raise _EditTransitionRecoveryRequired(
+                "could not determine durable edit session status"
+            ) from load_exc
+        if durable.status is expected:
+            raise
+        raise _EditTransitionRecoveryRequired(
+            f"metadata transition durability is ambiguous: {durable.status.value}"
         ) from exc
 
 

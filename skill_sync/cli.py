@@ -211,6 +211,15 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_edit_impact,
         protocol_command="edit impact",
     )
+    edit_apply_parser = edit_subparsers.add_parser(
+        "apply", help="transactionally apply a Base edit workspace"
+    )
+    edit_apply_parser.add_argument("session_id", help="edit session UUID")
+    edit_apply_parser.add_argument("--json", action="store_true", help="print JSON output")
+    edit_apply_parser.set_defaults(
+        handler=_handle_edit_apply,
+        protocol_command="edit apply",
+    )
 
     deploy_parser = subparsers.add_parser(
         "deploy", help="inspect and migrate rendered Skill deployments"
@@ -523,6 +532,21 @@ def _handle_edit_impact(args: argparse.Namespace) -> Any:
             f"-> {client['proposed_deployment_state']}"
         )
     return "\n".join(lines)
+
+
+def _handle_edit_apply(args: argparse.Namespace) -> Any:
+    result = core.edit_apply(args.session_id, config_path=args.config)
+    if args.json:
+        return result
+    return "\n".join(
+        (
+            f"Applied edit session: {result['session_id']} ({result['skill']}, Base)",
+            f"Canonical: {result['previous_hash']} -> {result['applied_hash']}",
+            f"Backup: {result['backup_path']}",
+            f"Receipt: {result['receipt_path']}",
+            "Deployments rebuilt: no (run the later deployment stage)",
+        )
+    )
 
 
 def _handle_deploy_preview(args: argparse.Namespace) -> str:
