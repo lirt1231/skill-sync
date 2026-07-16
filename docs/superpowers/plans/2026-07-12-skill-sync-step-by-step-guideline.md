@@ -1020,7 +1020,7 @@ edit apply 直接影响用户源数据或托管部署，不能通过并行开发
 
 ## 20. 现在应该从哪里开始
 
-Step 0–4 和 commit `5.1`–`5.8` 已完成并验收。当前所有托管客户端都使用只读
+Step 0–5 和 commit `5.1`–`5.9` 已完成并验收。当前所有托管客户端都使用只读
 rendered deployment；edit session 已具备严格 metadata、只读
 `list/status/diff/validate/impact`、Base baseline snapshot、writable workspace、
 `begin/abort` 和 transactional `apply`。apply 使用 `deployment.lock → per-Skill
@@ -1040,8 +1040,14 @@ session，显式 `--discard` 才会 quarantine 原 deployment 并从 canonical �
 winner 一律 fail closed，提交后的清理失败只记录为 `cleanup-pending`。单客户端
 recover 不擅自修复 `edit apply` 留下的多链接 transactional `needs-recovery`。
 
-下一 commit 是 `5.9 document base managed edit workflow`：只更新 README、完整
-`--help` 和 CLI e2e fixture，不新增 core 行为。它必须在 5.8 验收并提交后开始。
+README 和 `edit --help` 已记录完整 Base managed edit/recovery 工作流、状态与 Git
+边界；隔离 wheel e2e 已覆盖 `list/status/begin/abort/diff/validate/impact/apply/recover`
+的帮助和统一 JSON envelope。本 commit 不新增 core 行为。
+
+下一 commit 是 `6.1 require managed checks before skill edits`：只更新
+`skill-sync-manager` 的操作约束和最低 CLI 版本，让 Agent 在任何托管 Skill 修改前
+执行 ownership check，再进入 begin/diff/validate/impact/apply；不在该 commit 夹带
+真实 Codex/WorkBuddy 流程验证。
 
 建议每次只完成 commit map 中的一个编号，并在交付时报告：
 

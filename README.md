@@ -68,9 +68,9 @@ skill-sync preview --json
 
 ### Machine-readable CLI output
 
-`version`, `scan`, `status`, `preview`, `doctor`, `managed check`,
-`deploy status`, and `deploy gc` support `--json`. During the pre-1.0 releases,
-their machine-readable contract uses
+`version`, `scan`, `status`, `preview`, `doctor`, `managed check`, all `edit`
+subcommands, `deploy status`, and `deploy gc` support `--json`. During the
+pre-1.0 releases, their machine-readable contract uses
 schema version 1 and always returns the same top-level envelope:
 
 ```json
@@ -130,6 +130,120 @@ A completed check exits with `0` for both managed and unmanaged paths. Read the
 Agent cannot mistake an inconclusive check for permission to edit. The check is
 fully local: it loads the configured registry and detected client paths but
 does not fetch, write files, or change links.
+
+### Edit a managed Base Skill safely
+
+An Agent must not edit a path reported as managed, even when the path appears
+to be inside that Agent's normal Skills directory. Managed Agent paths point to
+rendered deployments, while `~/.agents/skills` is the canonical source. Use a
+Base edit session whenever a portable change should reach every affected Agent
+client.
+
+First check the exact file or Skill path that the Agent intends to change:
+
+```bash
+skill-sync managed check ~/.codex/skills/my-skill/SKILL.md --client codex --json
+```
+
+Continue only after the command completes conclusively. If `managed` is
+`false`, Skill Sync imposes no managed-edit workflow. If `managed` is `true`
+and `healthy` is `false`, repair the reported state before editing. An
+ambiguous result exits nonzero and must be treated as a stop condition.
+
+For a healthy managed Skill, create a Base session and edit only the absolute
+workspace path printed by `edit begin`:
+
+```bash
+skill-sync edit begin my-skill --base --actor codex
+# Record the printed session ID and edit only the printed Workspace directory.
+
+skill-sync edit diff <session-id>
+skill-sync edit validate <session-id>
+skill-sync edit impact <session-id>
+skill-sync edit apply <session-id>
+```
+
+`diff` shows authored file changes. `validate` rejects unsafe paths, links,
+invalid `SKILL.md` content, and stale or damaged session data. `impact` is a
+read-only preview of the concrete clients whose rendered deployments need to
+change; do not apply when it reports `Blocked: yes`. `apply` rechecks the
+baseline and workspace, replaces the canonical Base transactionally, rebuilds
+only affected enabled and detected client deployments, verifies them, and
+switches their Agent links as one operation.
+
+Use these inspection and cancellation commands when needed:
+
+```bash
+skill-sync edit list
+skill-sync edit status <session-id>
+skill-sync edit abort <session-id>
+```
+
+`abort` is for an active session whose workspace should be discarded. The
+durable session states are:
+
+- `active`: the workspace can be edited and inspected;
+- `applying`: an apply transaction is in progress;
+- `applied`: canonical content and affected deployments committed;
+- `aborted`: the workspace was discarded without applying it;
+- `needs-recovery`: rollback or durable state is uncertain; stop editing and
+  inspect `skill-sync doctor --json`, the session, and the receipt/recovery
+  paths reported by the failed command.
+
+A normal failure before the transaction commits restores the old Agent links
+and canonical content, marks the operation receipt `rolled-back`, and returns
+the session to `active`. After canonical content, links, session metadata, and
+the completed receipt have committed, leftover backup cleanup failures are
+reported in `cleanup_pending`; the edit is still applied and must not simply be
+run again. Preserve every reported backup, receipt, quarantine, and recovery
+path until the state has been reconciled.
+
+`edit apply` is a local content/deployment transaction. It never runs Git,
+creates a Git commit, calls `skill-sync push`, or pushes a remote repository.
+Review the applied result first, then synchronize it only with a separate,
+explicit command authorized by the user, for example:
+
+```bash
+skill-sync push --skill my-skill --message "Update my-skill"
+```
+
+All `managed check` and `edit` commands shown in the workflow accept `--json`.
+In JSON mode, read fields such as `valid`, `blocked`, `status`, `receipt_path`,
+and `cleanup_pending` instead of parsing the human-readable text.
+
+### Recover a tampered rendered deployment
+
+If an Agent or editor wrote through a managed Agent path, the rendered
+deployment may be reported as `tampered-render`. Preview the authored-content
+diff first; this command is read-only and excludes Skill Sync provenance:
+
+```bash
+skill-sync edit recover my-skill --client codex
+skill-sync edit recover my-skill --client codex --json
+```
+
+Then choose exactly one explicit action:
+
+```bash
+# Preserve the authored changes in a new active Base edit session.
+skill-sync edit recover my-skill --client codex --capture
+
+# Discard the authored changes and rebuild the deployment from canonical Base.
+skill-sync edit recover my-skill --client codex --discard
+```
+
+`--capture` does not apply the tampered files directly. It copies safe authored
+content into a new writable workspace; continue with `edit diff`, `validate`,
+`impact`, and `apply` using the returned session ID. `--discard` quarantines
+the tampered deployment, rebuilds it from canonical content, and preserves the
+existing verified Agent link. Both actions write a local recovery receipt but
+perform no Git operation.
+
+Capture and discard fail closed when another unfinished session or ambiguous
+receipt/recovery state exists. They recover one tampered concrete-client
+deployment; they do not automatically reconcile a multi-link transactional
+`needs-recovery` state left by `edit apply`. Cleanup after a committed recovery
+can likewise return `cleanup_pending` without undoing the successful action.
 
 When local and remote content both changed, Skill Sync stops. The UI shows the
 affected state and can create a timestamped local backup, but never chooses a

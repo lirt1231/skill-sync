@@ -138,7 +138,20 @@ def _build_parser() -> argparse.ArgumentParser:
         protocol_command="managed check",
     )
 
-    edit_parser = subparsers.add_parser("edit", help="manage safe Skill edit sessions")
+    edit_parser = subparsers.add_parser(
+        "edit",
+        help="manage safe Skill edit sessions",
+        description=(
+            "Edit managed Base Skills through isolated workspaces. Start with "
+            "managed check, modify only the workspace returned by edit begin, "
+            "then diff, validate, impact, and apply explicitly."
+        ),
+        epilog=(
+            "edit apply updates canonical content and affected deployments but never "
+            "runs Git commit or push. Use edit recover to inspect a tampered rendered "
+            "deployment before explicitly capturing or discarding it."
+        ),
+    )
     edit_subparsers = edit_parser.add_subparsers(dest="edit_action", required=True)
     edit_list_parser = edit_subparsers.add_parser(
         "list", help="list machine-local edit sessions"
@@ -158,7 +171,9 @@ def _build_parser() -> argparse.ArgumentParser:
         protocol_command="edit status",
     )
     edit_begin_parser = edit_subparsers.add_parser(
-        "begin", help="create a Base edit workspace"
+        "begin",
+        help="create a Base edit workspace",
+        epilog="example: skill-sync edit begin my-skill --base --actor codex",
     )
     edit_begin_parser.add_argument("skill", help="selected logical Skill name")
     edit_begin_parser.add_argument(
@@ -212,7 +227,9 @@ def _build_parser() -> argparse.ArgumentParser:
         protocol_command="edit impact",
     )
     edit_apply_parser = edit_subparsers.add_parser(
-        "apply", help="transactionally apply a Base edit workspace"
+        "apply",
+        help="transactionally apply a Base edit workspace",
+        epilog="applies canonical and deployment changes; does not commit or push Git",
     )
     edit_apply_parser.add_argument("session_id", help="edit session UUID")
     edit_apply_parser.add_argument("--json", action="store_true", help="print JSON output")
@@ -221,7 +238,12 @@ def _build_parser() -> argparse.ArgumentParser:
         protocol_command="edit apply",
     )
     edit_recover_parser = edit_subparsers.add_parser(
-        "recover", help="inspect or recover one tampered client deployment"
+        "recover",
+        help="inspect or recover one tampered client deployment",
+        epilog=(
+            "omit --capture/--discard for a read-only diff; either mutation must be "
+            "chosen explicitly"
+        ),
     )
     edit_recover_parser.add_argument("skill", help="selected logical Skill name")
     edit_recover_parser.add_argument(
