@@ -980,6 +980,14 @@ python -m venv <venv>
 | 8.4 | `add transactional scoped edit apply` | 只替换目标 layer并重建受影响 deployments | Codex-only 不改变 WorkBuddy，family 同时影响两个 Kimi |
 | 8.5 | `teach manager skill to choose edit scope` | 管理 Skill scope 规则和真实 Agent 验证 | 有歧义时询问，不自动扩大影响范围 |
 
+当前检查点：8.1 已实现并通过验收；下一小提交是 8.2。新建 session 使用严格
+metadata schema v2；metadata 模型可显式记录 Base/Family/Client target scope，
+以及目标 authored layer 在 begin 时为 present/absent 和对应 hash。既有 schema v1
+Base session 会在
+内存中归一化为 present Base layer，读取和状态转换仍保持 v1 原始字段，不发生静默
+迁移。8.1 没有改变 `edit begin` 的 Base-only CLI 行为，也没有创建 Variant、修改
+workspace、diff、impact 或 apply 逻辑。
+
 ### Step 9：Registry v3 和多设备同步
 
 | Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |

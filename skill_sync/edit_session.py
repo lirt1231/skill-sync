@@ -21,7 +21,8 @@ from skill_sync.hash import is_link_or_reparse
 from skill_sync.local_lock import local_file_lock
 
 
-EDIT_SESSION_SCHEMA_VERSION = 1
+EDIT_SESSION_SCHEMA_VERSION = 2
+LEGACY_EDIT_SESSION_SCHEMA_VERSION = 1
 EDIT_SESSIONS_DIRECTORY = "edit-sessions"
 EDIT_SESSION_METADATA_FILE = "session.json"
 
@@ -67,6 +68,109 @@ class EditSessionStatus(str, Enum):
     NEEDS_RECOVERY = "needs-recovery"
 
 
+class EditSessionScopeKind(str, Enum):
+    """Authored source layer selected by one managed edit session."""
+
+    BASE = "base"
+    FAMILY = "family"
+    CLIENT = "client"
+
+
+class EditLayerBaselineState(str, Enum):
+    """Whether the selected authored layer existed when the session began."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
+
+
+@dataclass(frozen=True)
+class EditSessionScope:
+    """Explicit Base, Agent-family, or concrete-client edit scope."""
+
+    kind: EditSessionScopeKind
+    target: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, EditSessionScopeKind):
+            raise EditSessionMetadataError("invalid edit session scope kind")
+        if self.kind is EditSessionScopeKind.BASE:
+            if self.target is not None:
+                raise EditSessionMetadataError("Base edit scope must not have a target")
+            return
+        if self.target is None:
+            raise EditSessionMetadataError(
+                f"{self.kind.value} edit scope requires a target"
+            )
+        _validate_identifier(self.target, f"{self.kind.value} edit scope target")
+
+    @classmethod
+    def base(cls) -> "EditSessionScope":
+        return cls(EditSessionScopeKind.BASE, None)
+
+    @classmethod
+    def family(cls, target: str) -> "EditSessionScope":
+        return cls(EditSessionScopeKind.FAMILY, target)
+
+    @classmethod
+    def client(cls, target: str) -> "EditSessionScope":
+        return cls(EditSessionScopeKind.CLIENT, target)
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "EditSessionScope":
+        _require_exact_object_fields(value, {"kind", "target"}, "target_scope")
+        try:
+            kind = EditSessionScopeKind(value["kind"])
+        except (TypeError, ValueError) as exc:
+            raise EditSessionMetadataError("invalid edit session scope kind") from exc
+        return cls(kind=kind, target=value["target"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind.value, "target": self.target}
+
+
+@dataclass(frozen=True)
+class EditLayerBaseline:
+    """Original presence and hash of the selected authored source layer."""
+
+    state: EditLayerBaselineState
+    hash: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, EditLayerBaselineState):
+            raise EditSessionMetadataError("invalid edit layer baseline state")
+        if self.state is EditLayerBaselineState.PRESENT:
+            if self.hash is None:
+                raise EditSessionMetadataError(
+                    "present edit layer baseline requires a hash"
+                )
+            _validate_sha256(self.hash, "edit layer baseline hash")
+            return
+        if self.hash is not None:
+            raise EditSessionMetadataError(
+                "absent edit layer baseline must not have a hash"
+            )
+
+    @classmethod
+    def present(cls, content_hash: str) -> "EditLayerBaseline":
+        return cls(EditLayerBaselineState.PRESENT, content_hash)
+
+    @classmethod
+    def absent(cls) -> "EditLayerBaseline":
+        return cls(EditLayerBaselineState.ABSENT, None)
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "EditLayerBaseline":
+        _require_exact_object_fields(value, {"state", "hash"}, "layer_baseline")
+        try:
+            state = EditLayerBaselineState(value["state"])
+        except (TypeError, ValueError) as exc:
+            raise EditSessionMetadataError("invalid edit layer baseline state") from exc
+        return cls(state=state, hash=value["hash"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"state": self.state.value, "hash": self.hash}
+
+
 _ALLOWED_TRANSITIONS = {
     EditSessionStatus.ACTIVE: frozenset(
         {EditSessionStatus.APPLYING, EditSessionStatus.ABORTED}
@@ -89,7 +193,7 @@ _ALLOWED_TRANSITIONS = {
     EditSessionStatus.ABORTED: frozenset(),
 }
 
-_METADATA_FIELDS = frozenset(
+_METADATA_FIELDS_V1 = frozenset(
     {
         "schema_version",
         "session_id",
@@ -101,11 +205,14 @@ _METADATA_FIELDS = frozenset(
         "updated_at",
     }
 )
+_METADATA_FIELDS_V2 = _METADATA_FIELDS_V1 | frozenset(
+    {"target_scope", "layer_baseline"}
+)
 
 
 @dataclass(frozen=True)
 class EditSessionMetadata:
-    """Strict, credential-free metadata for one Base edit session."""
+    """Strict, credential-free metadata for one managed edit session."""
 
     schema_version: int
     session_id: str
@@ -113,6 +220,8 @@ class EditSessionMetadata:
     status: EditSessionStatus
     actor: str | None
     baseline_hash: str
+    target_scope: EditSessionScope
+    layer_baseline: EditLayerBaseline
     created_at: str
     updated_at: str
 
@@ -131,11 +240,25 @@ class EditSessionMetadata:
         logical_skill: str,
         baseline_hash: str,
         actor: str | None = None,
+        target_scope: EditSessionScope | None = None,
+        layer_baseline: EditLayerBaseline | None = None,
         now: datetime | None = None,
     ) -> "EditSessionMetadata":
-        """Create active Base-session metadata without creating a workspace."""
+        """Create active metadata without creating a workspace.
+
+        Omitting the scoped fields preserves the existing Base-only begin
+        behavior.  Scoped begin will pass both fields explicitly in commit 8.2.
+        """
 
         timestamp = _utc_timestamp(now)
+        selected_scope = (
+            EditSessionScope.base() if target_scope is None else target_scope
+        )
+        selected_layer = (
+            EditLayerBaseline.present(baseline_hash)
+            if layer_baseline is None
+            else layer_baseline
+        )
         return cls(
             schema_version=EDIT_SESSION_SCHEMA_VERSION,
             session_id=str(uuid.uuid4()),
@@ -143,6 +266,8 @@ class EditSessionMetadata:
             status=EditSessionStatus.ACTIVE,
             actor=actor,
             baseline_hash=baseline_hash,
+            target_scope=selected_scope,
+            layer_baseline=selected_layer,
             created_at=timestamp,
             updated_at=timestamp,
         )
@@ -153,30 +278,42 @@ class EditSessionMetadata:
 
         if not isinstance(value, dict):
             raise EditSessionMetadataError("edit session metadata must be a JSON object")
-        fields = frozenset(value)
-        if fields != _METADATA_FIELDS:
-            missing = sorted(_METADATA_FIELDS - fields)
-            unknown = sorted(fields - _METADATA_FIELDS)
-            details = []
-            if missing:
-                details.append(f"missing fields: {', '.join(missing)}")
-            if unknown:
-                details.append(f"unknown fields: {', '.join(unknown)}")
+        schema_version = value.get("schema_version")
+        if type(schema_version) is not int:
             raise EditSessionMetadataError(
-                "invalid edit session metadata fields (" + "; ".join(details) + ")"
+                f"unsupported edit session schema version: {schema_version}"
             )
+        if schema_version == LEGACY_EDIT_SESSION_SCHEMA_VERSION:
+            expected_fields = _METADATA_FIELDS_V1
+        elif schema_version == EDIT_SESSION_SCHEMA_VERSION:
+            expected_fields = _METADATA_FIELDS_V2
+        else:
+            raise EditSessionMetadataError(
+                f"unsupported edit session schema version: {schema_version}"
+            )
+        _require_exact_object_fields(value, expected_fields, "edit session metadata")
         try:
             status = EditSessionStatus(value["status"])
         except (TypeError, ValueError) as exc:
             raise EditSessionMetadataError("invalid edit session status") from exc
         try:
             return cls(
-                schema_version=value["schema_version"],
+                schema_version=schema_version,
                 session_id=value["session_id"],
                 logical_skill=value["logical_skill"],
                 status=status,
                 actor=value["actor"],
                 baseline_hash=value["baseline_hash"],
+                target_scope=(
+                    EditSessionScope.base()
+                    if schema_version == LEGACY_EDIT_SESSION_SCHEMA_VERSION
+                    else EditSessionScope.from_dict(value["target_scope"])
+                ),
+                layer_baseline=(
+                    EditLayerBaseline.present(value["baseline_hash"])
+                    if schema_version == LEGACY_EDIT_SESSION_SCHEMA_VERSION
+                    else EditLayerBaseline.from_dict(value["layer_baseline"])
+                ),
                 created_at=value["created_at"],
                 updated_at=value["updated_at"],
             )
@@ -188,7 +325,7 @@ class EditSessionMetadata:
     def to_dict(self) -> dict[str, Any]:
         """Return the canonical JSON representation."""
 
-        return {
+        value = {
             "schema_version": self.schema_version,
             "session_id": self.session_id,
             "logical_skill": self.logical_skill,
@@ -198,6 +335,10 @@ class EditSessionMetadata:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.schema_version == EDIT_SESSION_SCHEMA_VERSION:
+            value["target_scope"] = self.target_scope.to_dict()
+            value["layer_baseline"] = self.layer_baseline.to_dict()
+        return value
 
     def transitioned(
         self,
@@ -599,7 +740,8 @@ class EditSessionStore:
 def _validate_metadata(metadata: EditSessionMetadata) -> None:
     if (
         type(metadata.schema_version) is not int
-        or metadata.schema_version != EDIT_SESSION_SCHEMA_VERSION
+        or metadata.schema_version
+        not in {LEGACY_EDIT_SESSION_SCHEMA_VERSION, EDIT_SESSION_SCHEMA_VERSION}
     ):
         raise EditSessionMetadataError(
             f"unsupported edit session schema version: {metadata.schema_version}"
@@ -611,10 +753,55 @@ def _validate_metadata(metadata: EditSessionMetadata) -> None:
     if metadata.actor is not None:
         _validate_identifier(metadata.actor, "actor")
     _validate_sha256(metadata.baseline_hash, "baseline hash")
+    if not isinstance(metadata.target_scope, EditSessionScope):
+        raise EditSessionMetadataError(
+            "edit session target_scope must be an EditSessionScope"
+        )
+    if not isinstance(metadata.layer_baseline, EditLayerBaseline):
+        raise EditSessionMetadataError(
+            "edit session layer_baseline must be an EditLayerBaseline"
+        )
+    if metadata.target_scope.kind is EditSessionScopeKind.BASE:
+        if metadata.layer_baseline.state is not EditLayerBaselineState.PRESENT:
+            raise EditSessionMetadataError("Base edit layer baseline must be present")
+        if metadata.layer_baseline.hash != metadata.baseline_hash:
+            raise EditSessionMetadataError(
+                "Base edit layer baseline hash must match baseline_hash"
+            )
+    if metadata.schema_version == LEGACY_EDIT_SESSION_SCHEMA_VERSION and (
+        metadata.target_scope != EditSessionScope.base()
+        or metadata.layer_baseline != EditLayerBaseline.present(metadata.baseline_hash)
+    ):
+        raise EditSessionMetadataError(
+            "legacy edit session metadata supports only a present Base layer"
+        )
     created = _parse_utc_timestamp(metadata.created_at, "created_at")
     updated = _parse_utc_timestamp(metadata.updated_at, "updated_at")
     if updated < created:
         raise EditSessionMetadataError("updated_at must not precede created_at")
+
+
+def _require_exact_object_fields(
+    value: Any,
+    expected_fields: set[str] | frozenset[str],
+    label: str,
+) -> None:
+    if not isinstance(value, dict):
+        raise EditSessionMetadataError(f"{label} must be a JSON object")
+    fields = frozenset(value)
+    expected = frozenset(expected_fields)
+    if fields == expected:
+        return
+    missing = sorted(expected - fields)
+    unknown = sorted(fields - expected)
+    details = []
+    if missing:
+        details.append(f"missing fields: {', '.join(missing)}")
+    if unknown:
+        details.append(f"unknown fields: {', '.join(unknown)}")
+    raise EditSessionMetadataError(
+        f"invalid {label} fields (" + "; ".join(details) + ")"
+    )
 
 
 def _validate_session_id(value: str) -> None:

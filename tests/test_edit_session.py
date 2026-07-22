@@ -8,8 +8,11 @@ from pathlib import Path
 
 from skill_sync.edit_session import (
     EDIT_SESSION_SCHEMA_VERSION,
+    EditLayerBaseline,
     EditSessionMetadata,
     EditSessionMetadataError,
+    EditSessionScope,
+    EditSessionScopeKind,
     EditSessionStatus,
     EditSessionStore,
     InvalidEditSessionTransition,
@@ -59,12 +62,152 @@ class EditSessionStoreTest(unittest.TestCase):
                     "baseline_hash": BASELINE_HASH,
                     "created_at": "2026-07-15T08:30:00Z",
                     "logical_skill": "alpha",
+                    "layer_baseline": {
+                        "hash": BASELINE_HASH,
+                        "state": "present",
+                    },
                     "schema_version": EDIT_SESSION_SCHEMA_VERSION,
                     "session_id": metadata.session_id,
                     "status": "active",
+                    "target_scope": {"kind": "base", "target": None},
                     "updated_at": "2026-07-15T08:30:00Z",
                 },
             )
+
+    def test_legacy_base_metadata_reads_and_transitions_without_migration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = EditSessionStore(Path(temp_dir))
+            metadata = self.make_metadata()
+            paths = store.paths(metadata.session_id)
+            paths.root.mkdir(parents=True)
+            legacy = {
+                "actor": "codex",
+                "baseline_hash": BASELINE_HASH,
+                "created_at": "2026-07-15T08:30:00Z",
+                "logical_skill": "alpha",
+                "schema_version": 1,
+                "session_id": metadata.session_id,
+                "status": "active",
+                "updated_at": "2026-07-15T08:30:00Z",
+            }
+            paths.metadata.write_text(json.dumps(legacy), encoding="utf-8")
+
+            loaded = store.load(metadata.session_id)
+
+            self.assertEqual(loaded.schema_version, 1)
+            self.assertEqual(loaded.target_scope, EditSessionScope.base())
+            self.assertEqual(
+                loaded.layer_baseline,
+                EditLayerBaseline.present(BASELINE_HASH),
+            )
+            self.assertEqual(loaded.to_dict(), legacy)
+
+            transitioned = store.transition(
+                metadata.session_id,
+                EditSessionStatus.APPLYING,
+                now=UPDATED_AT,
+            )
+            stored = json.loads(paths.metadata.read_text(encoding="utf-8"))
+            self.assertEqual(transitioned.schema_version, 1)
+            self.assertEqual(set(stored), set(legacy))
+            self.assertNotIn("target_scope", stored)
+            self.assertNotIn("layer_baseline", stored)
+
+    def test_scoped_metadata_round_trips_present_and_absent_layers(self):
+        cases = (
+            (
+                EditSessionScope.base(),
+                EditLayerBaseline.present(BASELINE_HASH),
+            ),
+            (
+                EditSessionScope.family("kimi"),
+                EditLayerBaseline.present(BASELINE_HASH),
+            ),
+            (
+                EditSessionScope.client("kimi-desktop"),
+                EditLayerBaseline.absent(),
+            ),
+        )
+        for scope, layer_baseline in cases:
+            with self.subTest(scope=scope):
+                metadata = EditSessionMetadata.new(
+                    logical_skill="alpha",
+                    baseline_hash=BASELINE_HASH,
+                    actor="codex",
+                    now=CREATED_AT,
+                    target_scope=scope,
+                    layer_baseline=layer_baseline,
+                )
+                self.assertEqual(
+                    EditSessionMetadata.from_dict(metadata.to_dict()),
+                    metadata,
+                )
+
+                transitioned = metadata.transitioned(
+                    EditSessionStatus.APPLYING,
+                    now=UPDATED_AT,
+                )
+                self.assertEqual(transitioned.target_scope, scope)
+                self.assertEqual(transitioned.layer_baseline, layer_baseline)
+
+    def test_scope_and_layer_baseline_fail_closed_on_invalid_combinations(self):
+        invalid_values = (
+            (
+                {"kind": "unknown", "target": None},
+                {"state": "present", "hash": BASELINE_HASH},
+            ),
+            (
+                {"kind": "base", "target": "codex"},
+                {"state": "present", "hash": BASELINE_HASH},
+            ),
+            (
+                {"kind": "family", "target": None},
+                {"state": "present", "hash": BASELINE_HASH},
+            ),
+            (
+                {"kind": "client", "target": "../codex"},
+                {"state": "present", "hash": BASELINE_HASH},
+            ),
+            (
+                {"kind": "client", "target": "codex"},
+                {"state": "present", "hash": None},
+            ),
+            (
+                {"kind": "client", "target": "codex"},
+                {"state": "absent", "hash": BASELINE_HASH},
+            ),
+            (
+                {"kind": "base", "target": None},
+                {"state": "absent", "hash": None},
+            ),
+        )
+        value = self.make_metadata().to_dict()
+        for target_scope, layer_baseline in invalid_values:
+            with self.subTest(target_scope=target_scope, layer_baseline=layer_baseline):
+                candidate = dict(value)
+                candidate["target_scope"] = target_scope
+                candidate["layer_baseline"] = layer_baseline
+                with self.assertRaises(EditSessionMetadataError):
+                    EditSessionMetadata.from_dict(candidate)
+
+    def test_schema_versions_have_strict_independent_field_sets(self):
+        current = self.make_metadata().to_dict()
+        legacy_with_v2_fields = {**current, "schema_version": 1}
+        with self.assertRaises(EditSessionMetadataError):
+            EditSessionMetadata.from_dict(legacy_with_v2_fields)
+
+        legacy = {
+            key: value
+            for key, value in current.items()
+            if key not in {"target_scope", "layer_baseline"}
+        }
+        legacy["schema_version"] = 1
+        future = {**current, "schema_version": EDIT_SESSION_SCHEMA_VERSION + 1}
+        with self.assertRaises(EditSessionMetadataError):
+            EditSessionMetadata.from_dict(future)
+
+        loaded = EditSessionMetadata.from_dict(legacy)
+        self.assertEqual(loaded.target_scope.kind, EditSessionScopeKind.BASE)
 
     def test_new_session_ids_are_canonical_and_unique(self):
         first = self.make_metadata()
