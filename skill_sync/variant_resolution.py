@@ -117,6 +117,9 @@ def resolve_variant_for_client(
     base_root: str | Path,
     variant_skill_root: str | Path,
     target_client: str,
+    *,
+    override_target: str | None = None,
+    override_root: str | Path | None = None,
 ) -> LayeredVariantResolution:
     """Resolve Base -> family -> exact-client layers for one registered client.
 
@@ -135,12 +138,27 @@ def resolve_variant_for_client(
     base = Path(base_root)
     variant_root = Path(variant_skill_root)
 
+    if (override_target is None) != (override_root is None):
+        raise ValueError("override target and root must be provided together")
+
     selection = _capture_applicable_selection(variant_root, family, target_client)
+    plan_selection = selection
+    if override_target is not None and override_root is not None:
+        plan_selection = _selection_with_override(
+            selection,
+            family=family,
+            target_client=target_client,
+            override_target=override_target,
+            override_root=Path(override_root),
+        )
     overlay_plan = plan_variant_overlay(
         base,
-        (variant.path for variant in selection.variants),
+        (variant.path for variant in plan_selection.variants),
+        variant_target_names=(
+            variant.target for variant in plan_selection.variants
+        ),
     )
-    _verify_plan_selection(overlay_plan, selection)
+    _verify_plan_selection(overlay_plan, plan_selection)
     final_selection = _capture_applicable_selection(
         variant_root,
         family,
@@ -148,12 +166,13 @@ def resolve_variant_for_client(
     )
     if final_selection != selection:
         raise ValueError("Variant selection changed while resolving")
+    _verify_selection_identities(plan_selection)
 
     base_layer = overlay_plan.layers[0]
     layers: list[ResolutionLayerProvenance] = [
         _layer_provenance(base_layer, role="base", target=None)
     ]
-    for selected, plan_layer in zip(selection.variants, overlay_plan.layers[1:]):
+    for selected, plan_layer in zip(plan_selection.variants, overlay_plan.layers[1:]):
         layers.append(
             _layer_provenance(
                 plan_layer,
@@ -181,6 +200,39 @@ def resolve_variant_for_client(
         resolution_hash=resolution_hash,
     )
     return LayeredVariantResolution(provenance, overlay_plan)
+
+
+def _selection_with_override(
+    selection: _ApplicableSelection,
+    *,
+    family: str,
+    target_client: str,
+    override_target: str,
+    override_root: Path,
+) -> _ApplicableSelection:
+    requested = _requested_variant_roles(family, target_client)
+    requested_roles = {target: role for role, target in requested}
+    if override_target not in requested_roles:
+        raise ValueError(
+            f"Variant override {override_target!r} does not affect client {target_client!r}"
+        )
+    identity = _path_identity(override_root)
+    if identity is None or is_link_or_reparse(override_root) or not override_root.is_dir():
+        raise ValueError(f"Variant override must be a real directory: {override_root}")
+    canonical = {variant.target: variant for variant in selection.variants}
+    variants = tuple(
+        _ApplicableVariant(
+            role=role,
+            target=target,
+            path=override_root.absolute(),
+            identity=identity,
+        )
+        if target == override_target
+        else canonical[target]
+        for role, target in requested
+        if target == override_target or target in canonical
+    )
+    return _ApplicableSelection(selection.root_identity, variants)
 
 
 def _family_for_client(target_client: str) -> str:
@@ -246,11 +298,7 @@ def _capture_applicable_selection(
     target_client: str,
 ) -> _ApplicableSelection:
     scan = _scan_variant_targets(root)
-    requested = [("family", family)]
-    if family == target_client:
-        requested = [("family-client", family)]
-    else:
-        requested.append(("client", target_client))
+    requested = _requested_variant_roles(family, target_client)
 
     selected: list[_ApplicableVariant] = []
     for role, target in requested:
@@ -265,6 +313,15 @@ def _capture_applicable_selection(
                 )
             )
     return _ApplicableSelection(scan.root_identity, tuple(selected))
+
+
+def _requested_variant_roles(
+    family: str,
+    target_client: str,
+) -> tuple[tuple[str, str], ...]:
+    if family == target_client:
+        return (("family-client", family),)
+    return (("family", family), ("client", target_client))
 
 
 def _select_variant_target(
@@ -297,6 +354,12 @@ def _verify_plan_selection(
             or layer.source_identity != selected.identity
         ):
             raise ValueError("Variant selection changed while planning overlay")
+
+
+def _verify_selection_identities(selection: _ApplicableSelection) -> None:
+    for selected in selection.variants:
+        if _path_identity(selected.path) != selected.identity:
+            raise ValueError("Variant selection changed while resolving")
 
 
 def _layer_provenance(
@@ -342,16 +405,33 @@ def _resolution_hash(
     family: str,
     layers: tuple[ResolutionLayerProvenance, ...],
 ) -> str:
+    return resolution_hash_for_layers(
+        target_client=target_client,
+        family=family,
+        layers=tuple(
+            (layer.role, layer.target, layer.content_hash) for layer in layers
+        ),
+    )
+
+
+def resolution_hash_for_layers(
+    *,
+    target_client: str,
+    family: str,
+    layers: tuple[tuple[str, str | None, str], ...],
+) -> str:
+    """Recompute a portable resolution hash from persisted layer evidence."""
+
     digest = hashlib.sha256()
     digest.update(b"skill-sync-variant-resolution\0")
     _update_framed_field(digest, "resolver-version", VARIANT_RESOLVER_VERSION)
     _update_framed_field(digest, "target-client", target_client)
     _update_framed_field(digest, "family", family)
     _update_framed_field(digest, "layer-count", str(len(layers)))
-    for layer in layers:
-        _update_framed_field(digest, "layer-role", layer.role)
-        _update_framed_field(digest, "layer-target", layer.target or "")
-        _update_framed_field(digest, "layer-hash", layer.content_hash)
+    for role, target, content_hash in layers:
+        _update_framed_field(digest, "layer-role", role)
+        _update_framed_field(digest, "layer-target", target or "")
+        _update_framed_field(digest, "layer-hash", content_hash)
     return f"sha256:{digest.hexdigest()}"
 
 

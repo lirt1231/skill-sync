@@ -40,24 +40,24 @@ class Element {
   contains(item) { return Object.values(elements).includes(item); }
   querySelectorAll() {
     if (this.id !== "mutation-dialog") return [];
-    return [elements["mutation-close"], elements["mutation-delete-input"], elements["mutation-cancel"], elements["mutation-retry"], elements["mutation-confirm"]]
+    return [elements["mutation-close"], elements["mutation-delete-input"], elements["mutation-cancel"], elements["mutation-retry"], elements["mutation-partial"], elements["mutation-confirm"]]
       .filter(item => !item.disabled && !item.classList.contains("hidden"));
   }
 }
 
 const ids = [
   "setup","app","setup-form","setup-submit","refresh","sync","sync-label","sync-summary",
-  "issue-list","skill-list","search","search-wrap","sync-filter","source-filter","agent-filter",
+  "issue-list","skill-list","search","search-wrap","repair-all","status-tabs","status-synced","status-synced-count","status-changed","status-changed-count","status-local","status-local-count","source-filter","agent-filter",
   "clear-filters","visible-count","select-all-checkbox","select-all","select-selected",
   "deselect-selected","link-selected","copy-selected","copy-agent","delete-selected",
   "clear-selection","selection-count","selection-bar","agent-list","import-tabs","imports",
   "select-all-imports","clear-imports","import-selected","import-count","import-bar","detail-drawer",
-  "detail-name","detail-status","detail-description","detail-sync","detail-path","detail-agents",
-  "detail-backup","close-detail","load-failure","retry-load","toast","mutation-layer",
+  "detail-name","detail-status","detail-description","detail-sync","detail-hash","detail-path","detail-agents","detail-variants","detail-sessions","detail-deployments",
+  "detail-repair","detail-backup","close-detail","load-failure","retry-load","toast","mutation-layer",
   "mutation-dialog","mutation-close","mutation-title","mutation-status","mutation-summary",
   "mutation-findings","mutation-targets","mutation-steps","mutation-effects","mutation-recovery",
   "mutation-delete-confirmation","mutation-delete-phrase","mutation-delete-input","mutation-result",
-  "mutation-cancel","mutation-retry","mutation-confirm",
+  "mutation-cancel","mutation-retry","mutation-partial","mutation-confirm",
 ];
 const elements = Object.fromEntries(ids.map(id => [id, new Element(id)]));
 const views = ["skills","agents","imports"].map(name => new Element(`view-${name}`));
@@ -94,7 +94,7 @@ context.globalThis = context;
 vm.createContext(context);
 const source = appSource + `
 globalThis.testApi = {
-  requestPlannedMutation, confirmPendingMutation, cancelPendingMutation, retryPendingMutation,
+  requestPlannedMutation, confirmPendingMutation, cancelPendingMutation, retryPendingMutation, repairSkill, planSafeRepairSubset,
   setState(value){state=value;render();}, setToken(value){token=value;},
   setDeletePhrase(value){document.querySelector("#mutation-delete-input").value=value;updateMutationConfirmState();},
   snapshot(){return {pending:pendingMutation&&{phase:pendingMutation.phase,operation:pendingMutation.operation,plan:pendingMutation.plan,result:pendingMutation.result},busy:[...inFlightOperations.keys()]};}
@@ -115,7 +115,7 @@ function plan(operation,{skills=["alpha"],clients=[],summary="Ready",canExecute=
 }
 
 function assertHtmlContract(){
-  for(const id of ["mutation-layer","mutation-dialog","mutation-confirm","mutation-cancel","mutation-retry","mutation-delete-input"]){
+  for(const id of ["mutation-layer","mutation-dialog","mutation-confirm","mutation-cancel","mutation-retry","mutation-partial","mutation-delete-input"]){
     assert.match(htmlSource,new RegExp(`id="${id}"`));
   }
   assert.doesNotMatch(appSource,/\bconfirm\s*\(/,"native confirm must be removed");
@@ -153,6 +153,7 @@ async function testBlockedPlanAndDeletePhraseGate(){
   fetchImpl=async(url)=>url==="/api/plan"?response(plan("delete",{skills:["alpha"],canExecute:false,status:"blocked"})):(mutations+=1,response({}));
   await api.requestPlannedMutation("delete","/api/delete",{skills:["alpha"]},elements["delete-selected"]);
   assert.equal(elements["mutation-confirm"].disabled,true);
+  assert.equal(elements["mutation-confirm"].classList.contains("hidden"),true);
   assert.equal(await api.confirmPendingMutation(),false);assert.equal(mutations,0);
 
   api.cancelPendingMutation();const multi=plan("delete",{skills:["alpha","beta"]});
@@ -194,6 +195,87 @@ async function testEveryMutationUsesItsPlanContract(){
   }
 }
 
+async function testSkillRepairEntryUsesPlanThenLink(){
+  api.cancelPendingMutation();api.setState(baseState());api.setToken("token");
+  const ready=plan("link-repair",{skills:["alpha"]});const calls=[];
+  fetchImpl=async(url,options)=>{calls.push([url,JSON.parse(options.body)]);if(url==="/api/plan")return response(ready);return response({result:{},state:baseState()});};
+  await api.repairSkill("alpha",elements["detail-repair"]);
+  assert.deepEqual(calls.map(item=>item[0]),["/api/plan"]);
+  assert.deepEqual(calls[0][1],{operation:"link-repair",request:{skills:["alpha"]}});
+  assert.equal(api.snapshot().pending.phase,"confirm");
+  assert.equal(elements["mutation-confirm"].disabled,false);
+  await api.confirmPendingMutation();
+  assert.deepEqual(calls.map(item=>item[0]),["/api/plan","/api/plan","/api/link"]);
+  assert.deepEqual(calls[2][1],{skills:["alpha"],views:["summary","inventory","agents","managed"]});
+  assert.equal(api.snapshot().pending.phase,"result");
+  assert.equal(api.snapshot().pending.result.ok,true);
+  api.cancelPendingMutation();
+}
+
+async function testBlockedRepairExplainsConflictAndCanRetargetSafeClients(){
+  api.cancelPendingMutation();api.setState(baseState());api.setToken("token");
+  const clients=[
+    {skill:"dws",client:"codex",effect:"blocked",current_state:"conflict"},
+    {skill:"dws",client:"workbuddy",effect:"build-and-swap",current_state:"stale-render"},
+    {skill:"dws",client:"kimi-code",effect:"build-and-swap",current_state:"stale-render"},
+    {skill:"dws",client:"claude-code",effect:"blocked",current_state:"conflict"},
+  ];
+  const blocked=plan("link-repair",{skills:["dws"],clients,canExecute:false,status:"conflict"});
+  blocked.steps=clients.map((item,index)=>({order:index+1,action:item.effect,skill:"dws",client:item.client,state:item.current_state}));
+  blocked.conflicts=[{code:"conflict",client:"codex",destination:"/agents/codex/dws",detail:"Agent destination contains unmanaged content."},{code:"conflict",client:"claude-code",destination:"/agents/claude/dws",detail:"Agent destination contains unmanaged content."}];
+  blocked.blockers=[{code:"unsafe-agent-path",client:"codex",destination:"/agents/codex/dws",detail:"Agent destination contains unmanaged content."},{code:"unsafe-agent-path",client:"claude-code",destination:"/agents/claude/dws",detail:"Agent destination contains unmanaged content."}];
+  const safe=plan("link-repair",{skills:["dws"],clients:clients.slice(1,3)});const posted=[];
+  fetchImpl=async(_url,options)=>{const body=JSON.parse(options.body);posted.push(body);return response(body.request.agents?safe:blocked);};
+  await api.requestPlannedMutation("link-repair","/api/link",{skills:["dws"]},elements["detail-repair"]);
+  assert.match(elements["mutation-summary"].textContent,/WorkBuddy、Kimi Code 可以自动修复/);
+  assert.match(elements["mutation-summary"].textContent,/Codex、Claude Code.*不会覆盖|Codex、Claude Code.*避免覆盖/);
+  assert.doesNotMatch(elements["mutation-findings"].innerHTML,/unsafe-agent-path|deployment is missing|stale-render/);
+  assert.match(elements["mutation-findings"].innerHTML,/目标位置存在冲突/);
+  assert.match(elements["mutation-findings"].innerHTML,/先备份或移走这个目录/);
+  assert.match(elements["mutation-findings"].innerHTML,/\/agents\/codex\/dws/);
+  assert.equal(elements["mutation-confirm"].classList.contains("hidden"),true);
+  assert.equal(elements["mutation-partial"].classList.contains("hidden"),false);
+  assert.equal(elements["mutation-partial"].textContent,"先修复可安全处理的 2 个客户端");
+  await api.planSafeRepairSubset();
+  assert.deepEqual(posted[1],{operation:"link-repair",request:{skills:["dws"],agents:["workbuddy","kimi-code"]}});
+  assert.equal(elements["mutation-partial"].classList.contains("hidden"),true);
+  assert.equal(elements["mutation-confirm"].classList.contains("hidden"),false);
+  assert.equal(elements["mutation-confirm"].disabled,false);
+  assert.doesNotMatch(elements["mutation-effects"].innerHTML,/Rendered deployment|Agent 链接/);
+  assert.doesNotMatch(elements["mutation-recovery"].innerHTML,/The action records|Interrupted swaps/);
+  api.cancelPendingMutation();
+}
+
+async function testOneClickRepairTargetsSafeClientsAndWaitsForConfirmation(){
+  api.cancelPendingMutation();api.setState(baseState());api.setToken("token");
+  const clients=[
+    {skill:"dws",client:"codex",effect:"blocked",current_state:"conflict"},
+    {skill:"dws",client:"workbuddy",effect:"build-and-swap",current_state:"stale-render"},
+    {skill:"dws",client:"kimi-code",effect:"build-and-swap",current_state:"stale-render"},
+  ];
+  const blocked=plan("link-repair",{skills:["dws"],clients,canExecute:false,status:"conflict"});
+  const safe=plan("link-repair",{skills:["dws"],clients:clients.slice(1)});const calls=[];
+  fetchImpl=async(url,options)=>{
+    const body=JSON.parse(options.body);calls.push([url,body]);
+    if(url==="/api/link")return response({result:{},state:baseState()});
+    return response(body.request.agents?safe:blocked);
+  };
+  await api.repairSkill("dws",elements["detail-repair"]);
+  assert.deepEqual(calls.map(item=>item[0]),["/api/plan","/api/plan"]);
+  assert.deepEqual(calls[1][1],{operation:"link-repair",request:{skills:["dws"],agents:["workbuddy","kimi-code"]}});
+  assert.equal(api.snapshot().pending.phase,"confirm");
+  assert.equal(elements["mutation-confirm"].disabled,false);
+  assert.match(elements["mutation-summary"].textContent,/WorkBuddy、Kimi Code/);
+  assert.match(elements["mutation-summary"].textContent,/Codex.*不会改动/);
+  await api.confirmPendingMutation();
+  assert.deepEqual(calls.map(item=>item[0]),["/api/plan","/api/plan","/api/plan","/api/link"]);
+  assert.deepEqual(calls[3][1],{skills:["dws"],agents:["workbuddy","kimi-code"],views:["summary","inventory","agents","managed"]});
+  assert.equal(api.snapshot().pending.phase,"result");
+  assert.equal(api.snapshot().pending.result.ok,true);
+  assert.equal(elements["mutation-result"].textContent,"已修复 WorkBuddy、Kimi Code；Codex 因目标位置已有其他内容未改动。");
+  api.cancelPendingMutation();
+}
+
 async function testEscapeCancelsAndRestoresFocus(){
   api.setState(baseState());api.setToken("token");elements.sync.focus();
   fetchImpl=async()=>response(plan("sync"));
@@ -222,6 +304,9 @@ async function testTabAndShiftTabStayInsideDialog(){
   await testBlockedPlanAndDeletePhraseGate();
   await testFailureResultRemainsActionable();
   await testEveryMutationUsesItsPlanContract();
+  await testSkillRepairEntryUsesPlanThenLink();
+  await testBlockedRepairExplainsConflictAndCanRetargetSafeClients();
+  await testOneClickRepairTargetsSafeClientsAndWaitsForConfirmation();
   await testEscapeCancelsAndRestoresFocus();
   await testTabAndShiftTabStayInsideDialog();
   process.stdout.write("mutation confirmation tests passed\n");

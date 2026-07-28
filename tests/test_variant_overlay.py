@@ -55,13 +55,13 @@ class VariantOverlayGoldenFixtureTest(unittest.TestCase):
         self.assert_fixture_resolution("base-family", "kimi")
 
     def test_base_plus_exact_client(self):
-        self.assert_fixture_resolution("base-client", "kimi-desktop")
+        self.assert_fixture_resolution("base-client", "kimi-code")
 
     def test_base_plus_family_plus_client(self):
         self.assert_fixture_resolution(
             "base-family-client",
             "kimi",
-            "kimi-desktop",
+            "kimi-code",
         )
 
     def test_exact_client_overrides_family_and_shared_script_stays_unchanged(self):
@@ -69,12 +69,12 @@ class VariantOverlayGoldenFixtureTest(unittest.TestCase):
             FIXTURE_ROOT / "base",
             (
                 FIXTURE_ROOT / "variants" / "kimi",
-                FIXTURE_ROOT / "variants" / "kimi-desktop",
+                FIXTURE_ROOT / "variants" / "kimi-code",
             ),
         )
 
         entries = {entry.relative_path: entry for entry in plan.files}
-        self.assertEqual(entries["SKILL.md"].content, b"# Kimi Desktop\n")
+        self.assertEqual(entries["SKILL.md"].content, b"# Kimi Code\n")
         self.assertEqual(entries["scripts/shared.sh"].content, b"printf 'shared\\n'\n")
         self.assertNotIn("references/remove.md", entries)
         self.assertNotIn("references/family.md", entries)

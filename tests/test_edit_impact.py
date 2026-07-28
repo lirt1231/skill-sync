@@ -85,13 +85,6 @@ class EditImpactTest(unittest.TestCase):
                 True,
             ),
             AgentClient(
-                "kimi-desktop",
-                "kimi",
-                "Kimi Desktop",
-                self.root / "clients/kimi-desktop/skills",
-                False,
-            ),
-            AgentClient(
                 "claude-code",
                 "claude",
                 "Claude Code",
@@ -155,7 +148,7 @@ class EditImpactTest(unittest.TestCase):
         self.assertFalse(result["stale_baseline"])
         self.assertTrue(result["has_workspace_changes"])
         self.assertEqual([row["client"] for row in result["clients"]], [
-            "codex", "workbuddy", "kimi-code", "kimi-desktop", "claude-code"
+            "codex", "workbuddy", "kimi-code", "claude-code"
         ])
         rows = {row["client"]: row for row in result["clients"]}
         self.assertEqual(rows["codex"]["current_deployment_state"], "valid")
@@ -164,7 +157,6 @@ class EditImpactTest(unittest.TestCase):
         self.assertEqual(rows["workbuddy"]["availability"], "undetected")
         self.assertEqual(rows["workbuddy"]["action"], "undetected")
         self.assertEqual(rows["kimi-code"]["availability"], "disabled")
-        self.assertEqual(rows["kimi-desktop"]["availability"], "disabled")
         self.assertEqual(rows["claude-code"]["availability"], "available")
         self.assertTrue(all(row["affected"] for row in rows.values()))
         self.assertTrue(all(row["deployment_would_change"] for row in rows.values()))
@@ -172,7 +164,7 @@ class EditImpactTest(unittest.TestCase):
             all(not Path(row["proposed_deployment_path"]).exists() for row in rows.values())
         )
         families = {row["agent"]: row for row in result["families"]}
-        self.assertEqual(families["kimi"]["clients"], ["kimi-code", "kimi-desktop"])
+        self.assertEqual(families["kimi"]["clients"], ["kimi-code"])
         self.assertFalse(families["kimi"]["enabled"])
 
     def test_impact_marks_canonical_changes_as_stale_baseline(self):

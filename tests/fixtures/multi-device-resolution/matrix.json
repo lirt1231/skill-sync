@@ -1,0 +1,31 @@
+{
+  "cases": [
+    {
+      "name": "codex-workbuddy-base",
+      "skill": "base-shared",
+      "machine_a_client": "codex",
+      "machine_b_client": "workbuddy",
+      "applied_targets": [],
+      "same_output": true,
+      "same_resolution": false
+    },
+    {
+      "name": "kimi-family",
+      "skill": "kimi-shared",
+      "machine_a_client": "kimi-code",
+      "machine_b_client": "kimi-code",
+      "applied_targets": ["kimi"],
+      "same_output": true,
+      "same_resolution": true
+    },
+    {
+      "name": "same-codex-client",
+      "skill": "codex-client",
+      "machine_a_client": "codex",
+      "machine_b_client": "codex",
+      "applied_targets": ["codex"],
+      "same_output": true,
+      "same_resolution": true
+    }
+  ]
+}

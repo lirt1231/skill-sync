@@ -329,6 +329,179 @@ class CanonicalSwap:
         return _path_identity(self.source) == identity
 
 
+@dataclass
+class AbsentCanonicalSwap:
+    """Publish a previously absent authored layer with rollback ownership checks."""
+
+    source: Path
+    candidate: Path
+    previous: Path
+    expected_new_hash: str
+    candidate_identity: tuple[int, int, int]
+    created_parents: tuple[tuple[Path, tuple[int, int, int]], ...]
+    installed_identity: tuple[int, int, int] | None = None
+    previous_moved: bool = False
+
+    @classmethod
+    def prepare(
+        cls,
+        source: str | Path,
+        replacement: str | Path,
+        *,
+        expected_new_hash: str,
+        token: str,
+        allowed_root: str | Path,
+    ) -> "AbsentCanonicalSwap":
+        source_path = Path(source)
+        replacement_path = Path(replacement)
+        root = Path(allowed_root)
+        _assert_real_directory(root, "authored source root")
+        _assert_real_directory(replacement_path, "edit workspace")
+        if source_path.exists() or is_link_or_reparse(source_path):
+            raise FileExistsError("absent authored layer appeared before staging")
+        try:
+            source_path.parent.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("authored layer is outside its portable source root") from exc
+
+        created = _prepare_missing_parents(root, source_path.parent)
+        candidate = source_path.parent / f".{source_path.name}.apply-stage-{token}"
+        if candidate.exists() or is_link_or_reparse(candidate):
+            _remove_created_parents(created)
+            raise FileExistsError(f"edit apply path already exists: {candidate}")
+        candidate_identity: tuple[int, int, int] | None = None
+        try:
+            candidate_hash = copy_skill_dir(replacement_path, candidate)
+            if candidate_hash != expected_new_hash:
+                raise FileExistsError("edit workspace changed while staging apply")
+            candidate_identity = _require_identity(candidate, "staged authored layer")
+            fsync_tree(candidate)
+            if hash_skill_dir(replacement_path) != expected_new_hash:
+                raise FileExistsError("edit workspace changed after staging apply")
+            if source_path.exists() or is_link_or_reparse(source_path):
+                raise FileExistsError("absent authored layer appeared while staging apply")
+            return cls(
+                source=source_path,
+                candidate=candidate,
+                previous=source_path,
+                expected_new_hash=expected_new_hash,
+                candidate_identity=candidate_identity,
+                created_parents=created,
+            )
+        except Exception:
+            _remove_owned_tree(candidate, candidate_identity)
+            _remove_created_parents(created)
+            raise
+
+    def apply(self) -> None:
+        if self.source.exists() or is_link_or_reparse(self.source):
+            raise FileExistsError("absent authored layer appeared before publication")
+        if (
+            _path_identity(self.candidate) != self.candidate_identity
+            or hash_skill_dir(self.candidate) != self.expected_new_hash
+        ):
+            raise FileExistsError("staged authored layer changed before publication")
+        rename_no_replace(self.candidate, self.source)
+        self.installed_identity = _require_identity(
+            self.source,
+            "installed authored layer",
+        )
+        self.previous_moved = True
+        if self.installed_identity != self.candidate_identity:
+            raise CanonicalSwapRecoveryRequired(
+                "installed authored layer failed identity verification",
+                recovery_path=self.source,
+            )
+        if hash_skill_dir(self.source) != self.expected_new_hash:
+            if self.rollback():
+                raise CanonicalSwapError(
+                    "installed authored layer failed hash verification"
+                )
+            raise CanonicalSwapRecoveryRequired(
+                "installed authored layer failed verification and could not be removed",
+                recovery_path=self.source,
+            )
+        fsync_directory(self.source.parent)
+
+    def rollback(self) -> bool:
+        if not self.previous_moved:
+            return not self.source.exists() and not is_link_or_reparse(self.source)
+        if (
+            self.installed_identity is None
+            or _path_identity(self.source) != self.installed_identity
+        ):
+            return False
+        failed = self.source.parent / (
+            f".{self.source.name}.apply-failed-{time.time_ns()}"
+        )
+        try:
+            rename_no_replace(self.source, failed)
+        except (OSError, FileExistsError):
+            return False
+        failed_identity = _path_identity(failed)
+        fsync_directory(self.source.parent)
+        if failed_identity != self.installed_identity:
+            if failed_identity is not None and not self.source.exists():
+                try:
+                    rename_no_replace(failed, self.source)
+                except (OSError, FileExistsError):
+                    pass
+            return False
+        if not _remove_owned_tree(failed, failed_identity):
+            return False
+        self.previous_moved = False
+        self.installed_identity = None
+        _remove_created_parents(self.created_parents)
+        return not self.source.exists() and not is_link_or_reparse(self.source)
+
+    def finalize(self) -> None:
+        if self.candidate.exists() or is_link_or_reparse(self.candidate):
+            if not _remove_owned_tree(self.candidate, self.candidate_identity):
+                raise CanonicalSwapRecoveryRequired(
+                    "could not remove staged authored layer",
+                    recovery_path=self.candidate,
+                )
+        self.previous_moved = False
+        fsync_directory(self.source.parent)
+
+
+def _prepare_missing_parents(
+    root: Path,
+    destination: Path,
+) -> tuple[tuple[Path, tuple[int, int, int]], ...]:
+    relative = destination.relative_to(root)
+    current = root
+    created: list[tuple[Path, tuple[int, int, int]]] = []
+    try:
+        for part in relative.parts:
+            child = current / part
+            if child.exists() or is_link_or_reparse(child):
+                _assert_real_directory(child, "authored source parent")
+            else:
+                os.mkdir(child, mode=0o700)
+                identity = _require_identity(child, "created authored source parent")
+                created.append((child, identity))
+                fsync_directory(current)
+            current = child
+        return tuple(created)
+    except Exception:
+        _remove_created_parents(tuple(created))
+        raise
+
+
+def _remove_created_parents(
+    created: tuple[tuple[Path, tuple[int, int, int]], ...],
+) -> None:
+    for path, identity in reversed(created):
+        if _path_identity(path) != identity:
+            continue
+        try:
+            path.rmdir()
+        except OSError:
+            continue
+        fsync_directory(path.parent)
+
+
 def write_private_json_atomic(path: str | Path, value: dict[str, Any]) -> None:
     """Create a new private receipt without replacing any existing path."""
 

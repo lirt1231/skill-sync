@@ -54,23 +54,24 @@ function boot(initialHref = "http://skill-sync.test/") {
     setAttribute(name, value) { this.attributes[name] = String(value); }
     getAttribute(name) { return this.attributes[name]; }
     focus() { document.activeElement = this; }
+    closest(selector) { return selector === ".hidden" && this.classList.contains("hidden") ? this : null; }
     querySelectorAll() {
       if (this.id !== "detail-drawer") return [];
-      return [elements["close-detail"], elements["detail-backup"]].filter(item => !item.disabled);
+      return [elements["close-detail"], elements["detail-repair"], elements["detail-backup"]].filter(item => !item.disabled);
     }
     contains(item) {
-      return this.id === "detail-drawer" && [this, elements["close-detail"], elements["detail-backup"]].includes(item);
+      return this.id === "detail-drawer" && [this, elements["close-detail"], elements["detail-repair"], elements["detail-backup"]].includes(item);
     }
   }
 
   const ids = [
     "setup","app","setup-form","setup-submit","refresh","sync","sync-label","sync-summary",
-    "issue-list","skill-list","search","search-wrap","search-toggle","sync-filter","source-filter","agent-filter","clear-filters","visible-count","select-all-checkbox",
+    "issue-list","skill-list","search","search-wrap","search-toggle","repair-all","status-tabs","status-synced","status-synced-count","status-changed","status-changed-count","status-local","status-local-count","source-filter","agent-filter","clear-filters","visible-count","select-all-checkbox",
     "select-all","select-selected","deselect-selected","link-selected","copy-selected","copy-agent",
     "delete-selected","clear-selection","selection-count","selection-bar","agent-list","import-tabs",
     "imports","select-all-imports","clear-imports","import-selected","import-count","import-bar",
-    "detail-drawer","detail-name","detail-status","detail-description","detail-sync","detail-path",
-    "detail-agents","detail-backup","close-detail","load-failure","retry-load","toast",
+    "detail-drawer","detail-name","detail-status","detail-description","detail-sync","detail-hash","detail-path","detail-variants","detail-sessions","detail-deployments",
+    "detail-agents","detail-repair","detail-backup","close-detail","load-failure","retry-load","toast",
   ];
   const elements = Object.fromEntries(ids.map(id => [id, new Element(id)]));
   const views = ["skills","agents","imports"].map(name => new Element(`view-${name}`));
@@ -133,7 +134,7 @@ globalThis.testApi = {
     selected.clear(); names.forEach(name => selected.add(name));
     activeView = view; render();
   },
-  openDetail, closeDetail, handleSkillRowKeydown, handleDetailKeydown,
+  openDetail, closeDetail, handleDetailKeydown,
   restoreDetailFromLocation,
   snapshot() { return {detailSkill, activeView, selected:[...selected]}; }
 };`;
@@ -163,7 +164,18 @@ function keyEvent(key, currentTarget, {shiftKey = false, target = currentTarget}
 }
 
 function testFixedDrawerAndLongListOpen() {
-  assert.match(styleSource, /\.detail-drawer\{[^}]*position:fixed[^}]*height:100vh[^}]*overflow-y:auto/);
+  assert.match(styleSource, /\.detail-drawer\{[^}]*position:fixed[^}]*z-index:30[^}]*height:100dvh[^}]*overflow-y:auto/);
+  assert.match(styleSource, /\.detail-drawer\{[^}]*z-index:30[^}]*height:100dvh/,
+    "the mobile drawer must cover bottom navigation and follow the dynamic viewport");
+  assert.match(styleSource, /\.skill-metadata \.mobile-sync-state\{display:inline-flex\}/,
+    "mobile inventory must retain its sync state");
+  assert.match(styleSource, /\.sync-strip\{display:grid;grid-template-columns:31px minmax\(0,1fr\)\}/,
+    "mobile sync summary must not force horizontal overflow");
+  assert.match(styleSource, /\.issue-list span\{min-width:0;overflow-wrap:anywhere\}/,
+    "long issue details must wrap inside the mobile viewport");
+  assert.match(styleSource, /#toast\{[^}]*z-index:60/,
+    "toasts must remain visible above the drawer and mutation dialog");
+  assert.match(styleSource, /\.connection-state\.online i,\.detail-status\.ok i\{background:var\(--green\)\}/);
   const app = boot(); app.api.setState(baseState(Array.from({length: 120}, (_, index) => `skill-${index}`)));
   app.document.documentElement.scrollTop = 6400;
   const row = app.getTrigger("skill-119", "row");
@@ -173,26 +185,20 @@ function testFixedDrawerAndLongListOpen() {
   assert.equal(app.document.activeElement, app.elements["close-detail"], "focus must enter the visible drawer");
 }
 
-function testKeyboardLoopAndStableFocusRestore() {
+function testNonModalDrawerAndStableFocusRestore() {
   const app = boot(); app.api.setState(baseState());
   const originalRow = app.getTrigger("alpha", "row");
-  for (const key of ["Enter", " "]) {
-    const row = app.getTrigger("alpha", "row");
-    const event = keyEvent(key, row);
-    app.api.handleSkillRowKeydown(event, "alpha");
-    assert.equal(event.prevented, true);
-    assert.equal(app.api.snapshot().detailSkill, "alpha");
-    if (key === "Enter") app.api.closeDetail();
-  }
+  app.api.openDetail("alpha", originalRow);
 
   const close = app.elements["close-detail"], backup = app.elements["detail-backup"];
   close.focus();
   const reverse = keyEvent("Tab", close, {shiftKey: true});
   app.api.handleDetailKeydown(reverse);
-  assert.equal(reverse.prevented, true); assert.equal(app.document.activeElement, backup);
+  assert.equal(reverse.prevented, false); assert.equal(app.document.activeElement, close,
+    "a non-modal detail panel must not trap keyboard focus");
   const forward = keyEvent("Tab", backup);
   app.api.handleDetailKeydown(forward);
-  assert.equal(forward.prevented, true); assert.equal(app.document.activeElement, close);
+  assert.equal(forward.prevented, false);
 
   const escape = keyEvent("Escape", close);
   app.api.handleDetailKeydown(escape);
@@ -201,7 +207,8 @@ function testKeyboardLoopAndStableFocusRestore() {
   const rebuiltRow = app.getTrigger("alpha", "row");
   assert.notEqual(rebuiltRow, originalRow, "render must replace the original trigger node");
   assert.equal(app.document.activeElement, rebuiltRow, "close must restore by stable skill identity after DOM rebuild");
-  assert.match(app.elements["skill-list"].innerHTML, /<button[^>]*data-detail-trigger="button"[^>]*aria-label="查看详情"/);
+  assert.match(app.elements["skill-list"].innerHTML, /<button[^>]*data-detail-trigger="button"[^>]*aria-label="查看 alpha 详情"/);
+  assert.doesNotMatch(app.elements["skill-list"].innerHTML, /role="button"|onclick=|onkeydown=/);
 }
 
 function testRefreshHistoryAndContextPreservation() {
@@ -211,7 +218,7 @@ function testRefreshHistoryAndContextPreservation() {
   assert.equal(new URL(detailUrl).searchParams.get("detail"), "alpha");
   app.api.closeDetail();
   app.history.back();
-  assert.equal(app.api.snapshot().detailSkill, "alpha", "back must restore an existing detail target");
+  assert.equal(app.api.snapshot().detailSkill, null, "closing detail must not add another history step");
   assert.equal(app.elements.search.value, "alp");
   assert.deepEqual(app.api.snapshot().selected, ["alpha"]);
   assert.equal(app.api.snapshot().activeView, "skills");
@@ -228,6 +235,6 @@ function testRefreshHistoryAndContextPreservation() {
 }
 
 testFixedDrawerAndLongListOpen();
-testKeyboardLoopAndStableFocusRestore();
+testNonModalDrawerAndStableFocusRestore();
 testRefreshHistoryAndContextPreservation();
 process.stdout.write("web ui detail navigation tests passed\n");

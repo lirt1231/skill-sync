@@ -6,17 +6,21 @@ reuse the same behavior and handle :class:`SkillSyncError` consistently.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
+import tempfile
 import time
 import uuid
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from skill_sync import git
+from skill_sync import git, portable_sync, variant_source
 from skill_sync.agents import (
+    AGENT_FAMILIES,
     aggregate_agent_targets,
     detect_agents,
     detect_clients,
@@ -26,9 +30,11 @@ from skill_sync.config import default_config_path, default_data_root, load_confi
 from skill_sync.copying import copy_skill_dir, rename_no_replace
 from skill_sync.deployment import (
     deployment_path,
+    expected_layered_provenance,
     expected_provenance,
     remove_verified_deployment,
     render_base_deployment,
+    render_layered_deployment,
     resolution_hash,
     verify_deployment,
 )
@@ -40,6 +46,7 @@ from skill_sync.edit_recovery import (
     inspect_authored_deployment,
 )
 from skill_sync.edit_apply import (
+    AbsentCanonicalSwap,
     CanonicalSwap,
     CanonicalSwapRecoveryRequired,
     PrivateJsonReceipt,
@@ -50,21 +57,28 @@ from skill_sync.edit_apply import (
 from skill_sync.edit_session import (
     ActiveEditSessionError,
     CanonicalSkillChangedError,
+    EditLayerBaseline,
+    EditLayerBaselineState,
     EditSessionMetadata,
     EditSessionMetadataError,
+    EditSessionPaths,
     EditSessionPublicationRecoveryRequired,
+    EditSessionScope,
+    EditSessionScopeKind,
     EditSessionStatus,
     EditSessionStore,
 )
 from skill_sync.edit_validation import (
     EditTreeInspectionError,
+    FileRecord,
     TreeInspection,
+    TreeIssue,
     build_diff,
     inspect_tree,
     validate_workspace,
 )
 from skill_sync.errors import SkillSyncError
-from skill_sync.hash import hash_skill_dir, is_link_or_reparse
+from skill_sync.hash import hash_skill_dir, hash_skill_files, is_link_or_reparse
 from skill_sync.linking import (
     DirectoryLinkSwap,
     DirectoryLinkSwapRecoveryRequired,
@@ -77,13 +91,39 @@ from skill_sync.local_lock import local_file_lock
 from skill_sync.ownership import inspect_ownership
 from skill_sync.platforms import get_adapter
 from skill_sync.protocol import EXIT_CONFLICT, EXIT_SAFETY
-from skill_sync.registry import empty_registry, load_registry, save_registry
+from skill_sync.registry import (
+    empty_registry,
+    load_registry,
+    parse_registry_text,
+    register_variant_target,
+    registry_variant_targets,
+    save_registry,
+)
 from skill_sync.skill_metadata import read_skill_description
+from skill_sync.variant import (
+    VARIANT_MANIFEST_FILE,
+    build_minimal_variant_manifest,
+)
+from skill_sync.variant_overlay import VariantOverlayLayer, plan_variant_overlay
+from skill_sync.variant_resolution import (
+    LayeredVariantResolution,
+    resolve_variant_for_client,
+)
 
 
 REGISTRY_FILE = "registry.yaml"
 DEFAULT_AGENT_TARGETS = "codex,workbuddy,kimi,claude"
 WEB_MUTATION_ACTIONS = ("sync", "import", "agent", "link-repair", "delete")
+
+
+@dataclass(frozen=True, slots=True)
+class _ClientDeploymentSpec:
+    """One client's current content-addressed deployment contract."""
+
+    path: Path
+    resolution_hash: str
+    expected_provenance: dict[str, Any]
+    layered_resolution: LayeredVariantResolution | None
 
 
 class _EditTransitionRecoveryRequired(RuntimeError):
@@ -131,6 +171,21 @@ def edit_session_status(
         ) from exc
 
 
+def edit_session_paths(
+    session_id: str,
+    config_path: str | Path | None = None,
+) -> dict[str, str]:
+    """Return machine-local paths without changing the stable metadata contract."""
+
+    store = EditSessionStore(_data_root(_load_local_config(config_path)))
+    edit_session_status(session_id, config_path=config_path)
+    paths = store.paths(session_id)
+    return {
+        "baseline_path": str(paths.baseline.absolute()),
+        "workspace_path": str(paths.workspace.absolute()),
+    }
+
+
 def is_initialized(config_path: str | Path | None = None) -> bool:
     """Return whether this machine has a usable local sync checkout configured."""
     config = load_config(_config_path(config_path))
@@ -170,16 +225,28 @@ def sync_preview(
             git.fetch(repo, branch)
         git_state = git.state(repo, branch, fetch_remote=False)
         targets = _target_names(registry, skill_names)
+        remote_registry = (
+            _cached_remote_registry(repo, branch)
+            if git_state.behind > 0
+            else registry
+        )
+        remote_changes = (
+            _remote_sync_unit_keys(repo, branch, registry, remote_registry)
+            if git_state.behind > 0
+            else set()
+        )
+        units = _sync_unit_rows(config, registry, targets, remote_changes)
+        unit_conflicts = [row for row in units if row["state"] == "conflict"]
         issues: list[dict[str, str]] = []
         unexpected_dirty = _unexpected_dirty_paths(repo)
         if unexpected_dirty:
             issues.append({"type": "dirty-repository", "detail": ", ".join(unexpected_dirty)})
         install_needed = _any_missing_local_install(config, registry, targets)
-        local_changed = _any_local_changed(
-            config, registry, [name for name in targets if not _needs_local_install(config, registry, name)]
-        )
+        local_changed = any(row["changed_local"] for row in units)
         current_diagnosis = (
-            doctor(config_path=config_path) if diagnosis is None else diagnosis
+            doctor(config_path=config_path, _sync_units=units)
+            if diagnosis is None
+            else diagnosis
         )
         link_issues = [
             issue for issue in current_diagnosis["issues"]
@@ -189,9 +256,14 @@ def sync_preview(
         registry_dirty = not git_state.clean and not unexpected_dirty
         if unexpected_dirty:
             action, summary = "blocked", "The sync repository has unrelated local changes."
-        elif git_state.diverged or (git_state.behind > 0 and local_changed):
+        elif git_state.diverged or unit_conflicts:
             action, summary = "conflict", "Both the remote repository and local Skills changed."
-            issues.append({"type": "content-conflict", "detail": "Choose and merge content manually."})
+            issues.append(
+                {
+                    "type": "content-conflict",
+                    "detail": "The same Base or Variant unit changed locally and remotely.",
+                }
+            )
         elif git_state.behind > 0 or install_needed:
             action, summary = "pull", "Remote Skill changes are ready to install."
         elif local_changed or registry_dirty or git_state.ahead > 0:
@@ -206,6 +278,7 @@ def sync_preview(
             "action": action,
             "summary": summary,
             "skills": targets,
+            "units": units,
             "repo": {
                 "path": str(repo), "branch": branch, "clean": git_state.clean,
                 "ahead": git_state.ahead, "behind": git_state.behind, "diverged": git_state.diverged,
@@ -953,36 +1026,70 @@ def managed_check(
 def edit_begin(
     skill_name: str,
     *,
+    scope: str = "base",
+    target: str | None = None,
     actor: str | None = None,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Create a Base-only managed edit session for one selected Skill."""
+    """Create a Base, family, or client source-layer edit session."""
 
     config = _load_local_config(config_path)
     try:
         registry = _load_local_registry(config)
         _target_names(registry, [skill_name])
-        source = _local_skill_path_or_default(config, registry, skill_name).absolute()
-        _validate_skill_path(source)
-        baseline_hash = hash_skill_dir(source)
         store = EditSessionStore(_data_root(config))
+        target_scope, affected_clients = _edit_target_scope(scope, target)
         with local_file_lock(_data_root(config) / "locks" / "deployment.lock"):
-            metadata, paths = store.begin(
-                logical_skill=skill_name,
-                source=source,
-                baseline_hash=baseline_hash,
-                actor=actor,
-            )
-        return {
+            locked_config = _load_local_config(config_path)
+            if _data_root(locked_config) != store.data_root:
+                raise SkillSyncError(
+                    "skill-sync data root changed while beginning edit session",
+                    code="unsafe_edit_session",
+                    exit_code=EXIT_SAFETY,
+                    details={"skill": skill_name},
+                )
+            locked_registry = _load_local_registry(locked_config)
+            _target_names(locked_registry, [skill_name])
+            if target_scope.kind is EditSessionScopeKind.BASE:
+                source = _local_skill_path_or_default(
+                    locked_config, locked_registry, skill_name
+                ).absolute()
+                _validate_skill_path(source)
+                baseline_hash = hash_skill_dir(source)
+                metadata, paths = store.begin(
+                    logical_skill=skill_name,
+                    source=source,
+                    baseline_hash=baseline_hash,
+                    actor=actor,
+                )
+            else:
+                with store.skill_lock(skill_name):
+                    metadata, paths = _begin_scoped_edit_locked(
+                        store=store,
+                        skill_name=skill_name,
+                        target_scope=target_scope,
+                        actor=actor,
+                        config_path=config_path,
+                    )
+        result = {
             "session_id": metadata.session_id,
             "skill": metadata.logical_skill,
-            "scope": "base",
+            "scope": metadata.target_scope.kind.value,
             "status": metadata.status.value,
             "actor": metadata.actor,
             "baseline_hash": metadata.baseline_hash,
             "baseline_path": str(paths.baseline.absolute()),
             "workspace_path": str(paths.workspace.absolute()),
         }
+        if metadata.target_scope.kind is not EditSessionScopeKind.BASE:
+            result.update(
+                {
+                    "target": metadata.target_scope.target,
+                    "affected_clients": list(affected_clients),
+                    "layer_baseline": metadata.layer_baseline.to_dict(),
+                }
+            )
+        return result
     except ActiveEditSessionError as exc:
         raise SkillSyncError(
             str(exc),
@@ -1017,22 +1124,187 @@ def edit_begin(
         ) from exc
 
 
+def _edit_target_scope(
+    scope: str,
+    target: str | None,
+) -> tuple[EditSessionScope, tuple[str, ...]]:
+    if scope == "base":
+        if target is not None:
+            raise SkillSyncError(
+                "Base edit scope must not have a target",
+                code="edit_scope_invalid",
+                exit_code=EXIT_SAFETY,
+            )
+        return EditSessionScope.base(), tuple(
+            client_id for family in AGENT_FAMILIES for client_id in family.client_ids
+        )
+    if target is None:
+        raise SkillSyncError(
+            f"{scope} edit scope requires a target",
+            code="edit_scope_invalid",
+            exit_code=EXIT_SAFETY,
+        )
+    try:
+        family, affected_clients, _ = variant_source.variant_target_metadata(
+            scope, target
+        )
+    except SkillSyncError as exc:
+        raise SkillSyncError(
+            str(exc),
+            code=exc.code,
+            exit_code=EXIT_SAFETY,
+            details=exc.details,
+        ) from exc
+    if scope == "family":
+        return EditSessionScope.family(family), affected_clients
+    return EditSessionScope.client(target), affected_clients
+
+
+def _begin_scoped_edit_locked(
+    *,
+    store: EditSessionStore,
+    skill_name: str,
+    target_scope: EditSessionScope,
+    actor: str | None,
+    config_path: str | Path | None,
+) -> tuple[EditSessionMetadata, EditSessionPaths]:
+    target = target_scope.target
+    if target is None:
+        raise SkillSyncError(
+            "scoped edit target is missing",
+            code="edit_scope_invalid",
+            exit_code=EXIT_SAFETY,
+        )
+    sources = variant_source.resolve_variant_source_paths(
+        skill_name,
+        config_path=config_path,
+    )
+    if sources.skill != skill_name:
+        raise SkillSyncError(
+            "selected Skill spelling does not match canonical Variant source",
+            code="variant_source_changed",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill_name, "canonical_skill": sources.skill},
+        )
+    matches = [
+        observation
+        for observation in sources.observations
+        if observation.role.startswith("variant-target:")
+        and observation.path.name.casefold() == target.casefold()
+    ]
+    if matches and (len(matches) != 1 or matches[0].path.name != target):
+        raise SkillSyncError(
+            "Variant target has a case-insensitive ambiguity",
+            code="variant_target_ambiguous",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill_name, "target": target},
+        )
+    variant_source.verify_variant_source_paths(sources)
+    if matches:
+        layer_path = matches[0].path
+        layer_snapshot = _capture_scoped_layer_snapshot(
+            sources=sources,
+            layer_path=layer_path,
+            skill_name=skill_name,
+            target=target,
+        )
+        layer_hash = hash_skill_files(
+            (entry.relative_path, entry.content) for entry in layer_snapshot.files
+        )
+
+        def verify_existing_layer() -> None:
+            variant_source.verify_variant_source_paths(sources)
+            current = _capture_scoped_layer_snapshot(
+                sources=sources,
+                layer_path=layer_path,
+                skill_name=skill_name,
+                target=target,
+            )
+            if current != layer_snapshot:
+                raise SkillSyncError(
+                    "Variant edit layer changed while beginning the session",
+                    code="variant_source_changed",
+                    exit_code=EXIT_SAFETY,
+                    details={"skill": skill_name, "target": target},
+                )
+
+        return store.begin_locked(
+            logical_skill=skill_name,
+            source=layer_path,
+            baseline_hash=layer_hash,
+            actor=actor,
+            target_scope=target_scope,
+            layer_baseline=EditLayerBaseline.present(layer_hash),
+            publication_guard=verify_existing_layer,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix=".scoped-begin-", dir=store.data_root
+    ) as root:
+        template = Path(root) / target
+        template.mkdir(mode=0o700)
+        (template / VARIANT_MANIFEST_FILE).write_bytes(
+            build_minimal_variant_manifest(target)
+        )
+        template_hash = hash_skill_dir(template)
+        return store.begin_locked(
+            logical_skill=skill_name,
+            source=template,
+            baseline_hash=template_hash,
+            actor=actor,
+            target_scope=target_scope,
+            layer_baseline=EditLayerBaseline.absent(),
+            publication_guard=lambda: variant_source.verify_variant_source_paths(
+                sources
+            ),
+        )
+
+
+def _capture_scoped_layer_snapshot(
+    *,
+    sources: variant_source.VariantSourcePaths,
+    layer_path: Path,
+    skill_name: str,
+    target: str,
+) -> VariantOverlayLayer:
+    try:
+        plan = plan_variant_overlay(sources.base_root, (layer_path,))
+    except (OSError, ValueError) as exc:
+        raise SkillSyncError(
+            f"Variant edit layer is unsafe: {exc}",
+            code="variant_source_unsafe",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill_name, "target": target},
+        ) from exc
+    if len(plan.layers) != 2 or plan.layers[0] != sources.initial_base_layer:
+        raise SkillSyncError(
+            "Variant Base source changed while beginning the session",
+            code="variant_source_changed",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill_name, "target": target},
+        )
+    return plan.layers[1]
+
+
 def edit_abort(
     session_id: str,
     *,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Abort a Base edit session without reading or writing canonical content."""
+    """Abort an edit session without reading or writing canonical content."""
 
     config = _load_local_config(config_path)
     try:
         metadata = EditSessionStore(_data_root(config)).abort(session_id)
-        return {
+        result = {
             "session_id": metadata.session_id,
             "skill": metadata.logical_skill,
-            "scope": "base",
+            "scope": metadata.target_scope.kind.value,
             "status": metadata.status.value,
         }
+        if metadata.target_scope.target is not None:
+            result["target"] = metadata.target_scope.target
+        return result
     except EditSessionMetadataError as exc:
         raise SkillSyncError(
             f"could not safely abort edit session: {exc}",
@@ -1051,11 +1323,14 @@ def edit_abort(
 def edit_diff(
     session_id: str,
     *,
+    resolved_client: str | None = None,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Diff an active Base edit workspace without changing any state."""
+    """Diff an active authored layer and any affected client resolutions."""
 
-    metadata, baseline, workspace = _active_edit_trees(session_id, config_path)
+    metadata, baseline, workspace = _active_edit_trees(
+        session_id, config_path, operation="diff"
+    )
     try:
         result = build_diff(baseline, workspace)
     except EditTreeInspectionError as exc:
@@ -1065,12 +1340,65 @@ def edit_diff(
             exit_code=EXIT_SAFETY,
             details={"session_id": session_id},
         ) from exc
-    return {
+    response = {
         "session_id": metadata.session_id,
         "skill": metadata.logical_skill,
-        "scope": "base",
+        "scope": metadata.target_scope.kind.value,
         "status": metadata.status.value,
         **result,
+    }
+    if metadata.target_scope.kind is EditSessionScopeKind.BASE:
+        if resolved_client is not None:
+            raise SkillSyncError(
+                "--resolved-client is only available for family or client sessions",
+                code="edit_resolved_client_invalid",
+                exit_code=EXIT_SAFETY,
+                details={"session_id": session_id, "client": resolved_client},
+            )
+        return response
+
+    target = metadata.target_scope.target
+    if target is None:  # guarded by strict session metadata validation
+        raise SkillSyncError(
+            "scoped edit session has no target",
+            code="unsafe_edit_session",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        )
+    clients = _scoped_edit_clients(metadata)
+    if resolved_client is not None:
+        if resolved_client not in clients:
+            raise SkillSyncError(
+                "requested resolved client is outside this edit scope",
+                code="edit_resolved_client_invalid",
+                exit_code=EXIT_SAFETY,
+                details={
+                    "session_id": session_id,
+                    "client": resolved_client,
+                    "affected_clients": list(clients),
+                },
+            )
+        clients = (resolved_client,)
+    current_layer = _scoped_current_layer(metadata, config_path=config_path)
+    resolved_diffs = [
+        _scoped_resolved_diff(
+            metadata,
+            workspace_path=EditSessionStore(
+                _data_root(_load_local_config(config_path))
+            ).paths(session_id).workspace,
+            client=client,
+            config_path=config_path,
+        )
+        for client in clients
+    ]
+    return {
+        **response,
+        "target": target,
+        "source_diff": result,
+        "layer_baseline": metadata.layer_baseline.to_dict(),
+        "current_layer": current_layer,
+        "stale_baseline": current_layer != metadata.layer_baseline.to_dict(),
+        "resolved_diffs": resolved_diffs,
     }
 
 
@@ -1079,15 +1407,27 @@ def edit_validate(
     *,
     config_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Validate an active Base edit workspace without changing any state."""
+    """Validate an active Base or Variant authored-layer workspace."""
 
-    metadata, baseline, workspace = _active_edit_trees(session_id, config_path)
-    issues = validate_workspace(workspace, logical_skill=metadata.logical_skill)
+    metadata, baseline, workspace = _active_edit_trees(
+        session_id, config_path, operation="validate"
+    )
+    if metadata.target_scope.kind is EditSessionScopeKind.BASE:
+        issues = validate_workspace(workspace, logical_skill=metadata.logical_skill)
+    else:
+        issues = _validate_scoped_workspace(
+            metadata,
+            workspace,
+            workspace_path=EditSessionStore(
+                _data_root(_load_local_config(config_path))
+            ).paths(session_id).workspace,
+            config_path=config_path,
+        )
     workspace_hash = workspace.hash
-    return {
+    result = {
         "session_id": metadata.session_id,
         "skill": metadata.logical_skill,
-        "scope": "base",
+        "scope": metadata.target_scope.kind.value,
         "status": metadata.status.value,
         "valid": not issues,
         "changed": workspace_hash != baseline.hash,
@@ -1095,6 +1435,19 @@ def edit_validate(
         "workspace_hash": workspace_hash,
         "issues": [issue.to_dict() for issue in issues],
     }
+    if metadata.target_scope.kind is not EditSessionScopeKind.BASE:
+        current_layer = _scoped_current_layer(metadata, config_path=config_path)
+        result.update(
+            {
+                "target": metadata.target_scope.target,
+                "layer_baseline": metadata.layer_baseline.to_dict(),
+                "current_layer": current_layer,
+                "stale_baseline": current_layer
+                != metadata.layer_baseline.to_dict(),
+                "affected_clients": list(_scoped_edit_clients(metadata)),
+            }
+        )
+    return result
 
 
 def edit_recover(
@@ -1138,6 +1491,13 @@ def edit_recover(
                 )
             _assert_no_incomplete_deployment_receipts(data_root)
             if action == "capture":
+                if "capture" not in preview["allowed_actions"]:
+                    raise SkillSyncError(
+                        "capturing a layered deployment requires a scoped recovery workflow",
+                        code="edit_recovery_scoped_capture_unsupported",
+                        exit_code=EXIT_SAFETY,
+                        details={"skill": skill_name, "client": client},
+                    )
                 return _edit_recovery_capture(store, preview)
             with store.skill_lock(skill_name):
                 refreshed = _edit_recovery_preview(
@@ -1215,11 +1575,14 @@ def _edit_recovery_preview(
     _validate_skill_path(canonical)
     canonical_hash = hash_skill_dir(canonical)
     rendered_root = _rendered_root(config)
-    expected = deployment_path(
+    spec = _client_deployment_spec(
+        canonical,
         rendered_root,
         skill_name,
-        resolution_hash(skill_name, canonical_hash, client_id),
+        client_id,
+        source_hash=canonical_hash,
     )
+    expected = spec.path
     destination = target_client.skills_dir / skill_name
     if link_state(expected, destination) != "linked":
         raise SkillSyncError(
@@ -1230,7 +1593,7 @@ def _edit_recovery_preview(
         )
     verification = verify_deployment(
         expected,
-        expected_provenance=expected_provenance(skill_name, canonical_hash, client_id),
+        expected_provenance=spec.expected_provenance,
     )
     if verification.state != "tampered":
         raise SkillSyncError(
@@ -1242,16 +1605,39 @@ def _edit_recovery_preview(
     try:
         observed_before = hash_skill_dir(expected)
         canonical_tree = inspect_tree(canonical)
+        expected_tree = canonical_tree
+        if spec.layered_resolution is not None:
+            expected_tree = TreeInspection(
+                files={
+                    entry.relative_path: FileRecord(
+                        entry.relative_path,
+                        entry.content,
+                    )
+                    for entry in spec.layered_resolution.overlay_plan.files
+                },
+                issues=(),
+            )
         authored = inspect_authored_deployment(expected)
-        if canonical_tree.issues or authored.issues or authored.hash is None:
+        if expected_tree.issues or authored.issues or authored.hash is None:
             raise EditTreeInspectionError("tampered deployment contains unsafe paths")
         if canonical_tree.hash != canonical_hash:
             raise EditTreeInspectionError("canonical Skill changed during recovery preview")
-        diff = build_diff(canonical_tree, authored)
+        diff = build_diff(expected_tree, authored)
         observed_hash = hash_skill_dir(expected)
         if observed_hash != observed_before:
             raise EditTreeInspectionError(
                 "tampered deployment changed during recovery preview"
+            )
+        refreshed_spec = _client_deployment_spec(
+            canonical,
+            rendered_root,
+            skill_name,
+            client_id,
+            source_hash=canonical_hash,
+        )
+        if refreshed_spec.resolution_hash != spec.resolution_hash:
+            raise EditTreeInspectionError(
+                "deployment sources changed during recovery preview"
             )
     except (EditTreeInspectionError, OSError, ValueError) as exc:
         raise SkillSyncError(
@@ -1271,12 +1657,19 @@ def _edit_recovery_preview(
         "canonical_path": str(canonical),
         "canonical_hash": canonical_hash,
         "deployment_path": str(expected),
+        "resolution_hash": spec.resolution_hash,
+        "resolver_version": spec.expected_provenance["resolver_version"],
+        "applied_layers": spec.expected_provenance["applied_layers"],
         "destination": str(destination),
         "tampered_authored_hash": authored.hash,
         "observed_hash": observed_hash,
         "reason": verification.reason,
         "diff": diff,
-        "allowed_actions": ["capture", "discard"],
+        "allowed_actions": (
+            ["capture", "discard"]
+            if spec.layered_resolution is None
+            else ["discard"]
+        ),
         "blocked_by_session": blocked,
     }
 
@@ -1514,6 +1907,24 @@ def _edit_recovery_discard(
 ) -> dict[str, Any]:
     data_root = _data_root(config)
     operation_id = str(uuid.uuid4())
+    canonical = Path(preview["canonical_path"])
+    rendered_root = _rendered_root(config)
+    spec = _client_deployment_spec(
+        canonical,
+        rendered_root,
+        preview["skill"],
+        preview["client"],
+        source_hash=preview["canonical_hash"],
+    )
+    if (
+        str(spec.path) != preview["deployment_path"]
+        or spec.resolution_hash != preview["resolution_hash"]
+    ):
+        raise SkillSyncError(
+            "deployment sources changed before recovery",
+            code="edit_recovery_conflict",
+            exit_code=EXIT_CONFLICT,
+        )
     quarantine = DeploymentQuarantine.prepare(
         preview["deployment_path"],
         expected_hash=preview["observed_hash"],
@@ -1535,17 +1946,25 @@ def _edit_recovery_discard(
         quarantine.apply()
         receipt["phase"] = "rebuilding"
         writer.update(receipt)
-        deployed = render_base_deployment(
-            preview["canonical_path"],
-            _rendered_root(config),
+        spec = _client_deployment_spec(
+            canonical,
+            rendered_root,
+            preview["skill"],
+            preview["client"],
+            source_hash=preview["canonical_hash"],
+        )
+        if spec.resolution_hash != preview["resolution_hash"]:
+            raise FileExistsError("deployment sources changed during recovery")
+        deployed = _render_client_deployment(
+            spec,
+            canonical,
+            rendered_root,
             preview["skill"],
             preview["client"],
         )
         verification = verify_deployment(
             deployed.path,
-            expected_provenance=expected_provenance(
-                preview["skill"], preview["canonical_hash"], preview["client"]
-            ),
+            expected_provenance=spec.expected_provenance,
         )
         if not verification.ok or link_state(
             deployed.path, Path(preview["destination"])
@@ -1627,9 +2046,37 @@ def _edit_recovery_discard(
         ) from exc
 
 
+def _require_base_edit_operation(
+    metadata: EditSessionMetadata,
+    operation: str,
+) -> None:
+    if metadata.target_scope.kind is EditSessionScopeKind.BASE:
+        return
+    raise SkillSyncError(
+        (
+            f"edit {operation} does not support "
+            f"{metadata.target_scope.kind.value} scoped sessions yet"
+        ),
+        code="scoped_edit_operation_unsupported",
+        exit_code=EXIT_SAFETY,
+        details={
+            "session_id": metadata.session_id,
+            "scope": metadata.target_scope.kind.value,
+            "target": metadata.target_scope.target,
+            "required_capability": (
+                "scoped-edit-apply"
+                if operation == "apply"
+                else "scoped-edit-inspection"
+            ),
+        },
+    )
+
+
 def _active_edit_trees(
     session_id: str,
     config_path: str | Path | None,
+    *,
+    operation: str,
 ) -> tuple[EditSessionMetadata, TreeInspection, TreeInspection]:
     config = _load_local_config(config_path)
     store = EditSessionStore(_data_root(config))
@@ -1656,7 +2103,6 @@ def _active_edit_trees(
             exit_code=EXIT_SAFETY,
             details={"session_id": session_id, "status": metadata.status.value},
         )
-
     paths = store.paths(session_id)
     for label, path in (("baseline", paths.baseline), ("workspace", paths.workspace)):
         if is_link_or_reparse(path) or not path.is_dir():
@@ -1685,6 +2131,176 @@ def _active_edit_trees(
             details={"session_id": session_id},
         )
     return metadata, baseline, workspace
+
+
+def _scoped_edit_clients(metadata: EditSessionMetadata) -> tuple[str, ...]:
+    target = metadata.target_scope.target
+    if target is None:
+        return ()
+    if metadata.target_scope.kind is EditSessionScopeKind.FAMILY:
+        return next(
+            family.client_ids for family in AGENT_FAMILIES if family.id == target
+        )
+    return (target,)
+
+
+def _scoped_current_layer(
+    metadata: EditSessionMetadata,
+    *,
+    config_path: str | Path | None,
+) -> dict[str, Any]:
+    target = metadata.target_scope.target
+    if target is None:
+        raise EditSessionMetadataError("scoped edit session target is missing")
+    sources = variant_source.resolve_variant_source_paths(
+        metadata.logical_skill,
+        config_path=config_path,
+    )
+    matches = [
+        observation
+        for observation in sources.observations
+        if observation.role.startswith("variant-target:")
+        and observation.path.name == target
+    ]
+    if not matches:
+        variant_source.verify_variant_source_paths(sources)
+        return EditLayerBaseline.absent().to_dict()
+    if len(matches) != 1:
+        raise SkillSyncError(
+            "Variant target is ambiguous while inspecting edit baseline",
+            code="variant_target_ambiguous",
+            exit_code=EXIT_SAFETY,
+            details={"skill": metadata.logical_skill, "target": target},
+        )
+    layer = _capture_scoped_layer_snapshot(
+        sources=sources,
+        layer_path=matches[0].path,
+        skill_name=metadata.logical_skill,
+        target=target,
+    )
+    variant_source.verify_variant_source_paths(sources)
+    layer_hash = hash_skill_files(
+        (entry.relative_path, entry.content) for entry in layer.files
+    )
+    return EditLayerBaseline.present(layer_hash).to_dict()
+
+
+def _resolution_tree(resolution: LayeredVariantResolution) -> TreeInspection:
+    return TreeInspection(
+        files={
+            entry.relative_path: FileRecord(entry.relative_path, entry.content)
+            for entry in resolution.overlay_plan.files
+        },
+        issues=(),
+    )
+
+
+def _scoped_resolutions(
+    metadata: EditSessionMetadata,
+    *,
+    workspace_path: Path,
+    client: str,
+    config_path: str | Path | None,
+) -> tuple[LayeredVariantResolution, LayeredVariantResolution]:
+    target = metadata.target_scope.target
+    if target is None:
+        raise EditSessionMetadataError("scoped edit session target is missing")
+    sources = variant_source.resolve_variant_source_paths(
+        metadata.logical_skill,
+        config_path=config_path,
+    )
+    variant_source.verify_variant_source_paths(sources)
+    try:
+        current = resolve_variant_for_client(
+            sources.base_root,
+            sources.variant_skill_root,
+            client,
+        )
+        proposed = resolve_variant_for_client(
+            sources.base_root,
+            sources.variant_skill_root,
+            client,
+            override_target=target,
+            override_root=workspace_path,
+        )
+    except (OSError, ValueError) as exc:
+        variant_source.verify_variant_source_paths(sources)
+        raise SkillSyncError(
+            f"scoped Variant resolution is invalid: {exc}",
+            code="variant_resolution_invalid",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": metadata.session_id,
+                "skill": metadata.logical_skill,
+                "client": client,
+                "target": target,
+            },
+        ) from exc
+    variant_source.verify_variant_source_paths(sources, resolution=current)
+    variant_source.verify_variant_source_paths(sources)
+    return current, proposed
+
+
+def _scoped_resolved_diff(
+    metadata: EditSessionMetadata,
+    *,
+    workspace_path: Path,
+    client: str,
+    config_path: str | Path | None,
+) -> dict[str, Any]:
+    current, proposed = _scoped_resolutions(
+        metadata,
+        workspace_path=workspace_path,
+        client=client,
+        config_path=config_path,
+    )
+    diff = build_diff(_resolution_tree(current), _resolution_tree(proposed))
+    return {
+        "client": client,
+        "family": current.family,
+        "current_resolution_hash": current.resolution_hash,
+        "proposed_resolution_hash": proposed.resolution_hash,
+        "current_output_hash": current.output_hash,
+        "proposed_output_hash": proposed.output_hash,
+        **diff,
+    }
+
+
+def _validate_scoped_workspace(
+    metadata: EditSessionMetadata,
+    workspace: TreeInspection,
+    *,
+    workspace_path: Path,
+    config_path: str | Path | None,
+) -> list[TreeIssue]:
+    issues = list(workspace.issues)
+    if VARIANT_MANIFEST_FILE not in workspace.files:
+        issues.append(
+            TreeIssue(
+                "missing_variant_manifest",
+                VARIANT_MANIFEST_FILE,
+                f"Variant workspace must contain {VARIANT_MANIFEST_FILE}",
+            )
+        )
+    if issues:
+        return sorted(issues, key=lambda issue: (issue.path, issue.code, issue.message))
+    try:
+        for client in _scoped_edit_clients(metadata):
+            _scoped_resolutions(
+                metadata,
+                workspace_path=workspace_path,
+                client=client,
+                config_path=config_path,
+            )
+    except SkillSyncError as exc:
+        issues.append(
+            TreeIssue(
+                "invalid_variant_overlay",
+                VARIANT_MANIFEST_FILE,
+                str(exc),
+            )
+        )
+    return sorted(issues, key=lambda issue: (issue.path, issue.code, issue.message))
 
 
 def edit_impact(
@@ -1728,6 +2344,13 @@ def edit_impact(
                 exit_code=EXIT_SAFETY,
                 details={"session_id": session_id, "status": metadata.status.value},
             )
+        if metadata.target_scope.kind is not EditSessionScopeKind.BASE:
+            return _scoped_edit_impact(
+                metadata,
+                config=config,
+                config_path=config_path,
+            )
+        _require_base_edit_operation(metadata, "impact")
         registry = _load_local_registry(config)
         _target_names(registry, [metadata.logical_skill])
         source = _local_skill_path_or_default(
@@ -1771,35 +2394,40 @@ def edit_impact(
         entry = registry.get("skills", {}).get(metadata.logical_skill, {})
         configured = _configured_client_targets(entry)
         rendered_root = _rendered_root(config)
+        variant_skill_root = source.parent.parent / "variants" / metadata.logical_skill
         rows: list[dict[str, Any]] = []
 
         for client in clients:
             if configured and not {client.id, client.family_id}.intersection(configured):
                 continue
             enabled = client.family_id not in disabled
-            current_resolution = resolution_hash(
-                metadata.logical_skill, current_hash, client.id
+            current_spec = _client_deployment_spec(
+                source,
+                rendered_root,
+                metadata.logical_skill,
+                client.id,
+                source_hash=current_hash,
+                variant_skill_root=variant_skill_root,
             )
-            proposed_resolution = resolution_hash(
-                metadata.logical_skill, workspace_hash, client.id
+            proposed_spec = _client_deployment_spec(
+                paths.workspace,
+                rendered_root,
+                metadata.logical_skill,
+                client.id,
+                source_hash=workspace_hash,
+                variant_skill_root=variant_skill_root,
             )
-            current_deployment = deployment_path(
-                rendered_root, metadata.logical_skill, current_resolution
-            )
-            proposed_deployment = deployment_path(
-                rendered_root, metadata.logical_skill, proposed_resolution
-            )
+            current_resolution = current_spec.resolution_hash
+            proposed_resolution = proposed_spec.resolution_hash
+            current_deployment = current_spec.path
+            proposed_deployment = proposed_spec.path
             current_verification = verify_deployment(
                 current_deployment,
-                expected_provenance=expected_provenance(
-                    metadata.logical_skill, current_hash, client.id
-                ),
+                expected_provenance=current_spec.expected_provenance,
             )
             proposed_verification = verify_deployment(
                 proposed_deployment,
-                expected_provenance=expected_provenance(
-                    metadata.logical_skill, workspace_hash, client.id
-                ),
+                expected_provenance=proposed_spec.expected_provenance,
             )
             destination = client.skills_dir / metadata.logical_skill
             current_link_state, current_target = _deployment_link_state(
@@ -1856,6 +2484,9 @@ def edit_impact(
                     "availability": availability,
                     "destination": str(destination),
                     "current_resolution_hash": current_resolution,
+                    "current_applied_layers": current_spec.expected_provenance[
+                        "applied_layers"
+                    ],
                     "current_deployment_path": str(current_deployment),
                     "current_deployment_state": current_verification.state,
                     "current_link_state": current_link_state,
@@ -1863,6 +2494,9 @@ def edit_impact(
                         None if current_target is None else str(current_target)
                     ),
                     "proposed_resolution_hash": proposed_resolution,
+                    "proposed_applied_layers": proposed_spec.expected_provenance[
+                        "applied_layers"
+                    ],
                     "proposed_deployment_path": str(proposed_deployment),
                     "proposed_deployment_state": proposed_verification.state,
                     "proposed_link_state": proposed_link_state,
@@ -1935,6 +2569,187 @@ def edit_impact(
         ) from exc
 
 
+def _scoped_edit_impact(
+    metadata: EditSessionMetadata,
+    *,
+    config: dict[str, Any],
+    config_path: str | Path | None,
+) -> dict[str, Any]:
+    _, baseline, workspace = _active_edit_trees(
+        metadata.session_id,
+        config_path,
+        operation="impact",
+    )
+    store = EditSessionStore(_data_root(config))
+    workspace_path = store.paths(metadata.session_id).workspace
+    issues = _validate_scoped_workspace(
+        metadata,
+        workspace,
+        workspace_path=workspace_path,
+        config_path=config_path,
+    )
+    if issues or workspace.hash is None:
+        raise SkillSyncError(
+            "scoped edit workspace failed validation",
+            code="invalid_edit_workspace",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": metadata.session_id,
+                "issues": [issue.to_dict() for issue in issues],
+            },
+        )
+
+    registry = _load_local_registry(config)
+    _target_names(registry, [metadata.logical_skill])
+    current_layer = _scoped_current_layer(metadata, config_path=config_path)
+    stale_baseline = current_layer != metadata.layer_baseline.to_dict()
+    scope_clients = set(_scoped_edit_clients(metadata))
+    disabled = _disabled_agents(config)
+    clients = detect_clients()
+    entry = registry.get("skills", {}).get(metadata.logical_skill, {})
+    configured = _configured_client_targets(entry)
+    rendered_root = _rendered_root(config)
+    rows: list[dict[str, Any]] = []
+
+    for client in clients:
+        if configured and not {client.id, client.family_id}.intersection(configured):
+            continue
+        sources = variant_source.resolve_variant_source_paths(
+            metadata.logical_skill,
+            config_path=config_path,
+        )
+        try:
+            current = resolve_variant_for_client(
+                sources.base_root,
+                sources.variant_skill_root,
+                client.id,
+            )
+        except (OSError, ValueError) as exc:
+            raise SkillSyncError(
+                f"current Variant resolution is invalid: {exc}",
+                code="variant_resolution_invalid",
+                exit_code=EXIT_SAFETY,
+                details={"skill": metadata.logical_skill, "client": client.id},
+            ) from exc
+        variant_source.verify_variant_source_paths(sources, resolution=current)
+        scope_affected = client.id in scope_clients
+        proposed = current
+        if scope_affected:
+            _, proposed = _scoped_resolutions(
+                metadata,
+                workspace_path=workspace_path,
+                client=client.id,
+                config_path=config_path,
+            )
+        deployment_would_change = (
+            current.resolution_hash != proposed.resolution_hash
+        )
+        current_deployment = deployment_path(
+            rendered_root,
+            metadata.logical_skill,
+            current.resolution_hash,
+        )
+        proposed_deployment = deployment_path(
+            rendered_root,
+            metadata.logical_skill,
+            proposed.resolution_hash,
+        )
+        current_state = verify_deployment(current_deployment).state
+        proposed_state = verify_deployment(proposed_deployment).state
+        enabled = client.family_id not in disabled
+        affected = scope_affected and deployment_would_change
+        requires_rebuild = affected and proposed_state != "valid"
+        if not enabled:
+            availability, action = "disabled", "disabled"
+        elif not client.detected:
+            availability, action = "undetected", "undetected"
+        elif stale_baseline and scope_affected:
+            availability, action = "available", "blocked"
+        elif requires_rebuild:
+            availability, action = "available", "rebuild"
+        elif affected:
+            availability, action = "available", "relink"
+        else:
+            availability, action = "available", "noop"
+        rows.append(
+            {
+                "client": client.id,
+                "agent": client.family_id,
+                "display_name": client.display_name,
+                "detected": client.detected,
+                "enabled": enabled,
+                "availability": availability,
+                "scope_affected": scope_affected,
+                "current_resolution_hash": current.resolution_hash,
+                "proposed_resolution_hash": proposed.resolution_hash,
+                "current_output_hash": current.output_hash,
+                "proposed_output_hash": proposed.output_hash,
+                "current_deployment_path": str(current_deployment),
+                "proposed_deployment_path": str(proposed_deployment),
+                "current_deployment_state": current_state,
+                "proposed_deployment_state": proposed_state,
+                "deployment_would_change": deployment_would_change,
+                "requires_rebuild": requires_rebuild,
+                "affected": affected,
+                "hypothetical_action": "rebuild" if requires_rebuild else "noop",
+                "action": action,
+                "blocked_reason": (
+                    "stale-baseline"
+                    if stale_baseline
+                    and scope_affected
+                    and enabled
+                    and client.detected
+                    else None
+                ),
+            }
+        )
+
+    families = []
+    for agent in aggregate_agent_targets(clients):
+        members = [row for row in rows if row["agent"] == agent.name]
+        if members:
+            families.append(
+                {
+                    "agent": agent.name,
+                    "display_name": agent.display_name,
+                    "detected": agent.detected,
+                    "enabled": agent.name not in disabled,
+                    "clients": [row["client"] for row in members],
+                    "affected_clients": [
+                        row["client"] for row in members if row["affected"]
+                    ],
+                }
+            )
+
+    return {
+        "session_id": metadata.session_id,
+        "skill": metadata.logical_skill,
+        "scope": metadata.target_scope.kind.value,
+        "target": metadata.target_scope.target,
+        "status": metadata.status.value,
+        "baseline_hash": metadata.baseline_hash,
+        "current_hash": current_layer["hash"],
+        "workspace_hash": workspace.hash,
+        "layer_baseline": metadata.layer_baseline.to_dict(),
+        "current_layer": current_layer,
+        "stale_baseline": stale_baseline,
+        "blocked": stale_baseline,
+        "blocked_reason": (
+            "canonical-layer-changed-since-begin" if stale_baseline else None
+        ),
+        "has_workspace_changes": workspace.hash != baseline.hash,
+        "registry_targets": sorted(configured),
+        "families": families,
+        "clients": rows,
+        "summary": {
+            "affected": sum(bool(row["affected"]) for row in rows),
+            "requires_rebuild": sum(bool(row["requires_rebuild"]) for row in rows),
+            "disabled": sum(row["availability"] == "disabled" for row in rows),
+            "undetected": sum(row["availability"] == "undetected" for row in rows),
+        },
+    }
+
+
 def edit_apply(
     session_id: str,
     *,
@@ -1978,6 +2793,7 @@ def edit_apply(
                     store,
                     session_id,
                     expected_skill=lock_metadata.logical_skill,
+                    config_path=config_path,
                 )
     except SkillSyncError:
         raise
@@ -2000,6 +2816,7 @@ def _edit_apply_locked(
     session_id: str,
     *,
     expected_skill: str,
+    config_path: str | Path | None,
 ) -> dict[str, Any]:
     metadata = store.load(session_id)
     if metadata.logical_skill != expected_skill:
@@ -2016,6 +2833,14 @@ def _edit_apply_locked(
             exit_code=EXIT_SAFETY,
             details={"session_id": session_id, "status": metadata.status.value},
         )
+    if metadata.target_scope.kind is not EditSessionScopeKind.BASE:
+        return _edit_apply_scoped_locked(
+            config,
+            store,
+            metadata,
+            config_path=config_path,
+        )
+    _require_base_edit_operation(metadata, "apply")
 
     registry = _load_local_registry(config)
     _target_names(registry, [metadata.logical_skill])
@@ -2162,6 +2987,13 @@ def _edit_apply_locked(
         receipt["clients"] = deployment_transaction["clients"]
         receipt["phase"] = "deployments-ready"
         receipt_writer.update(receipt)
+        _verify_base_edit_deployments(
+            metadata.logical_skill,
+            source,
+            paths.workspace,
+            deployment_transaction,
+            proposed=True,
+        )
         receipt["status"] = "applying"
         receipt["phase"] = "canonical-replace"
         receipt_writer.update(receipt)
@@ -2185,6 +3017,13 @@ def _edit_apply_locked(
                 code="edit_canonical_changed_during_deploy",
                 exit_code=EXIT_CONFLICT,
             )
+        _verify_base_edit_deployments(
+            metadata.logical_skill,
+            source,
+            paths.workspace,
+            deployment_transaction,
+            proposed=False,
+        )
         for row in deployment_transaction["active"]:
             if link_state(Path(row["deployment_path"]), Path(row["destination"])) != "linked":
                 raise SkillSyncError(
@@ -2451,6 +3290,510 @@ def _edit_apply_locked(
     }
 
 
+def _edit_apply_scoped_locked(
+    config: dict[str, Any],
+    store: EditSessionStore,
+    metadata: EditSessionMetadata,
+    *,
+    config_path: str | Path | None,
+) -> dict[str, Any]:
+    session_id = metadata.session_id
+    target = metadata.target_scope.target
+    if target is None:
+        raise SkillSyncError(
+            "scoped edit session target is missing",
+            code="unsafe_edit_session",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        )
+    registry = _load_local_registry(config)
+    _target_names(registry, [metadata.logical_skill])
+    previous_registry = copy.deepcopy(registry)
+    registry_changed = register_variant_target(
+        registry,
+        metadata.logical_skill,
+        target,
+    )
+    registry_path = _repo_path(config) / REGISTRY_FILE
+    paths = store.paths(session_id)
+    try:
+        baseline = inspect_tree(paths.baseline)
+        workspace = inspect_tree(paths.workspace)
+    except (EditTreeInspectionError, OSError) as exc:
+        raise SkillSyncError(
+            f"edit session trees are unsafe or incomplete: {exc}",
+            code="edit_session_incomplete",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+    if baseline.issues or baseline.hash != metadata.baseline_hash:
+        raise SkillSyncError(
+            "edit session baseline is damaged or does not match its recorded hash",
+            code="unsafe_edit_baseline",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        )
+    issues = _validate_scoped_workspace(
+        metadata,
+        workspace,
+        workspace_path=paths.workspace,
+        config_path=config_path,
+    )
+    if issues or workspace.hash is None:
+        raise SkillSyncError(
+            "scoped edit workspace failed validation",
+            code="invalid_edit_workspace",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "issues": [issue.to_dict() for issue in issues],
+            },
+        )
+    workspace_hash = workspace.hash
+    if workspace_hash == metadata.baseline_hash:
+        raise SkillSyncError(
+            "edit workspace has no changes to apply",
+            code="edit_workspace_unchanged",
+            exit_code=EXIT_CONFLICT,
+            details={"session_id": session_id},
+        )
+    current_layer = _scoped_current_layer(metadata, config_path=config_path)
+    if current_layer != metadata.layer_baseline.to_dict():
+        raise SkillSyncError(
+            "canonical Variant layer changed since this edit session began",
+            code="edit_baseline_conflict",
+            exit_code=EXIT_CONFLICT,
+            details={
+                "session_id": session_id,
+                "expected_layer": metadata.layer_baseline.to_dict(),
+                "actual_layer": current_layer,
+            },
+        )
+    sources = variant_source.resolve_variant_source_paths(
+        metadata.logical_skill,
+        config_path=config_path,
+    )
+    variant_source.verify_variant_source_paths(sources)
+    source = sources.variant_skill_root / target
+    layer_present = metadata.layer_baseline.state is EditLayerBaselineState.PRESENT
+
+    data_root_path = store.data_root
+    receipt_path = data_root_path / "operations" / f"edit-apply-{session_id}.json"
+    if receipt_path.exists() or is_link_or_reparse(receipt_path):
+        raise SkillSyncError(
+            "an edit apply receipt already exists for this session",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id, "receipt_path": str(receipt_path)},
+        )
+    backup_parent = prepare_private_directory(
+        data_root_path / "backups" / "edit-apply" / metadata.logical_skill
+    )
+    backup_path = (
+        backup_parent / f"{time.time_ns()}-{session_id}-{target}"
+        if layer_present
+        else None
+    )
+    receipt: dict[str, Any] = {
+        "schema_version": 1,
+        "operation": "edit-apply",
+        "operation_id": session_id,
+        "session_id": session_id,
+        "skill": metadata.logical_skill,
+        "scope": metadata.target_scope.kind.value,
+        "target": target,
+        "status": "prepared",
+        "phase": "backup-pending",
+        "created_at": time.time(),
+        "canonical_path": str(source),
+        "backup_path": None if backup_path is None else str(backup_path),
+        "layer_baseline": metadata.layer_baseline.to_dict(),
+        "baseline_hash": metadata.baseline_hash,
+        "workspace_hash": workspace_hash,
+        "deployments_rebuilt": False,
+    }
+    receipt_writer = PrivateJsonReceipt.create(receipt_path, receipt)
+    try:
+        if backup_path is not None:
+            backup_hash = copy_skill_dir(source, backup_path)
+            if backup_hash != metadata.baseline_hash:
+                raise OSError("canonical Variant backup does not match the edit baseline")
+            fsync_tree(backup_path)
+        receipt["phase"] = "backup-ready"
+        receipt_writer.update(receipt)
+    except (OSError, ValueError) as exc:
+        receipt["status"] = "rolled-back"
+        receipt["phase"] = "backup-failed"
+        receipt["error_code"] = "edit_backup_failed"
+        receipt["completed_at"] = time.time()
+        receipt_writer.update(receipt)
+        raise SkillSyncError(
+            "could not create a durable canonical Variant backup",
+            code="edit_backup_failed",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id, "receipt_path": str(receipt_path)},
+        ) from exc
+
+    swap: CanonicalSwap | AbsentCanonicalSwap | None = None
+    deployment_transaction: dict[str, Any] | None = None
+    applied_link_swaps: list[DirectoryLinkSwap] = []
+    cleanup_pending: list[str] = []
+    applying = False
+    applied_metadata = False
+    registry_applied = False
+
+    def recovery_path() -> Path:
+        if swap is not None and swap.previous_moved:
+            return swap.previous
+        if backup_path is not None:
+            return backup_path
+        return paths.workspace
+
+    try:
+        _transition_edit_metadata(
+            store,
+            session_id,
+            expected=EditSessionStatus.ACTIVE,
+            target=EditSessionStatus.APPLYING,
+        )
+        applying = True
+        _assert_no_incomplete_deployment_receipts(store.data_root)
+        receipt["phase"] = "deployments-preparing"
+        receipt_writer.update(receipt)
+        deployment_transaction = _prepare_scoped_edit_deployments(
+            config,
+            registry,
+            metadata,
+            sources,
+            paths.workspace,
+            session_id,
+        )
+        receipt["clients"] = deployment_transaction["clients"]
+        receipt["phase"] = "deployments-ready"
+        receipt_writer.update(receipt)
+        _verify_scoped_edit_deployments(
+            metadata,
+            sources,
+            paths.workspace,
+            deployment_transaction,
+            proposed=True,
+        )
+        if layer_present:
+            swap = CanonicalSwap.prepare(
+                source,
+                paths.workspace,
+                expected_old_hash=metadata.baseline_hash,
+                expected_new_hash=workspace_hash,
+                token=session_id,
+            )
+        else:
+            swap = AbsentCanonicalSwap.prepare(
+                source,
+                paths.workspace,
+                expected_new_hash=workspace_hash,
+                token=session_id,
+                allowed_root=sources.portable_root,
+            )
+        receipt["status"] = "applying"
+        receipt["phase"] = "canonical-replace"
+        receipt_writer.update(receipt)
+
+        swap.apply()
+        receipt["phase"] = "canonical-applied"
+        receipt_writer.update(receipt)
+        if registry_changed:
+            receipt["phase"] = "registry-applying"
+            receipt_writer.update(receipt)
+            save_registry(registry_path, registry)
+            registry_applied = True
+            receipt["phase"] = "registry-applied"
+            receipt_writer.update(receipt)
+        receipt["phase"] = "links-swapping"
+        receipt["completed_clients"] = []
+        receipt_writer.update(receipt)
+        for link_swap in deployment_transaction["swaps"]:
+            link_swap.apply()
+            applied_link_swaps.append(link_swap)
+            receipt["completed_clients"].append(
+                deployment_transaction["swap_clients"][link_swap.destination]
+            )
+            receipt_writer.update(receipt)
+        applied_layer = _scoped_current_layer(metadata, config_path=config_path)
+        if applied_layer != EditLayerBaseline.present(workspace_hash).to_dict():
+            raise SkillSyncError(
+                "canonical Variant layer changed during deployment link swaps",
+                code="edit_canonical_changed_during_deploy",
+                exit_code=EXIT_CONFLICT,
+            )
+        _verify_scoped_edit_deployments(
+            metadata,
+            variant_source.resolve_variant_source_paths(
+                metadata.logical_skill,
+                config_path=config_path,
+            ),
+            paths.workspace,
+            deployment_transaction,
+            proposed=False,
+        )
+        for row in deployment_transaction["active"]:
+            if link_state(Path(row["deployment_path"]), Path(row["destination"])) != "linked":
+                raise SkillSyncError(
+                    "an applied deployment link failed final verification",
+                    code="edit_deployment_verification_failed",
+                    exit_code=EXIT_SAFETY,
+                    details={"client": row["client"]},
+                )
+        receipt["phase"] = "links-applied"
+        receipt_writer.update(receipt)
+        _transition_edit_metadata(
+            store,
+            session_id,
+            expected=EditSessionStatus.APPLYING,
+            target=EditSessionStatus.APPLIED,
+        )
+        applied_metadata = True
+        receipt["status"] = "completed"
+        receipt["phase"] = "completed"
+        receipt["completed_at"] = time.time()
+        receipt_writer.update(receipt)
+        for link_swap in applied_link_swaps:
+            try:
+                link_swap.finalize()
+            except Exception as exc:
+                cleanup_pending.append(
+                    str(
+                        exc.recovery_path
+                        if isinstance(exc, DirectoryLinkSwapRecoveryRequired)
+                        else link_swap.backup
+                    )
+                )
+        try:
+            swap.finalize()
+        except Exception as exc:
+            cleanup_pending.append(
+                str(
+                    exc.recovery_path
+                    if isinstance(exc, CanonicalSwapRecoveryRequired)
+                    else swap.previous
+                )
+            )
+        if cleanup_pending:
+            receipt["status"] = "cleanup-pending"
+            receipt["phase"] = "cleanup-pending"
+            receipt["cleanup_pending"] = cleanup_pending
+            try:
+                receipt_writer.update(receipt)
+            except Exception:
+                cleanup_pending.append(str(receipt_path))
+    except DirectoryLinkSwapRecoveryRequired as exc:
+        _mark_edit_apply_recovery(
+            store,
+            session_id,
+            receipt,
+            receipt_path,
+            receipt_writer,
+            recovery_path=exc.recovery_path,
+        )
+        raise SkillSyncError(
+            "deployment link swap requires recovery",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "receipt_path": str(receipt_path),
+                "recovery_path": str(exc.recovery_path),
+            },
+        ) from exc
+    except ReceiptRecoveryRequired as exc:
+        try:
+            current = store.load(session_id)
+            if current.status is EditSessionStatus.APPLYING:
+                _transition_edit_metadata(
+                    store,
+                    session_id,
+                    expected=EditSessionStatus.APPLYING,
+                    target=EditSessionStatus.NEEDS_RECOVERY,
+                )
+        except (EditSessionMetadataError, OSError, _EditTransitionRecoveryRequired):
+            pass
+        raise SkillSyncError(
+            "edit apply receipt changed and requires recovery",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "receipt_path": str(receipt_path),
+                "recovery_path": str(recovery_path()),
+            },
+        ) from exc
+    except CanonicalSwapRecoveryRequired as exc:
+        _mark_edit_apply_recovery(
+            store,
+            session_id,
+            receipt,
+            receipt_path,
+            receipt_writer,
+            recovery_path=exc.recovery_path,
+        )
+        raise SkillSyncError(
+            "edit apply could not safely restore the previous Variant layer",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "receipt_path": str(receipt_path),
+                "recovery_path": str(exc.recovery_path),
+            },
+        ) from exc
+    except _EditTransitionRecoveryRequired as exc:
+        path = recovery_path()
+        _mark_edit_apply_recovery(
+            store,
+            session_id,
+            receipt,
+            receipt_path,
+            receipt_writer,
+            recovery_path=path,
+        )
+        raise SkillSyncError(
+            "edit session metadata durability is ambiguous and requires recovery",
+            code="edit_apply_recovery_required",
+            exit_code=EXIT_SAFETY,
+            details={
+                "session_id": session_id,
+                "receipt_path": str(receipt_path),
+                "recovery_path": str(path),
+            },
+        ) from exc
+    except Exception as exc:
+        if applied_metadata:
+            path = recovery_path()
+            _mark_edit_apply_recovery(
+                store,
+                session_id,
+                receipt,
+                receipt_path,
+                receipt_writer,
+                recovery_path=path,
+            )
+            raise SkillSyncError(
+                "Variant layer was applied but final receipt cleanup needs recovery",
+                code="edit_apply_recovery_required",
+                exit_code=EXIT_SAFETY,
+                details={"session_id": session_id, "receipt_path": str(receipt_path)},
+            ) from exc
+        links_rolled_back = True
+        for link_swap in reversed(applied_link_swaps):
+            try:
+                if not link_swap.rollback():
+                    links_rolled_back = False
+            except Exception:
+                links_rolled_back = False
+        try:
+            registry_rolled_back = True
+            if registry_applied:
+                try:
+                    save_registry(registry_path, previous_registry)
+                except Exception:
+                    registry_rolled_back = False
+            rolled_back = (
+                links_rolled_back
+                and registry_rolled_back
+                and (swap is None or swap.rollback())
+            )
+        except Exception:
+            rolled_back = False
+        if rolled_back and swap is not None:
+            for link_swap in applied_link_swaps:
+                try:
+                    link_swap.finalize()
+                except Exception as cleanup_exc:
+                    cleanup_pending.append(
+                        str(
+                            cleanup_exc.recovery_path
+                            if isinstance(
+                                cleanup_exc,
+                                DirectoryLinkSwapRecoveryRequired,
+                            )
+                            else link_swap.backup
+                        )
+                    )
+            try:
+                swap.finalize()
+            except Exception as cleanup_exc:
+                cleanup_pending.append(
+                    str(
+                        cleanup_exc.recovery_path
+                        if isinstance(cleanup_exc, CanonicalSwapRecoveryRequired)
+                        else swap.previous
+                    )
+                )
+        if applying and rolled_back:
+            try:
+                _transition_edit_metadata(
+                    store,
+                    session_id,
+                    expected=EditSessionStatus.APPLYING,
+                    target=EditSessionStatus.ACTIVE,
+                )
+            except (EditSessionMetadataError, OSError, _EditTransitionRecoveryRequired):
+                rolled_back = False
+        if not rolled_back:
+            path = recovery_path()
+            _mark_edit_apply_recovery(
+                store,
+                session_id,
+                receipt,
+                receipt_path,
+                receipt_writer,
+                recovery_path=path,
+            )
+            raise SkillSyncError(
+                "edit apply failed and requires recovery",
+                code="edit_apply_recovery_required",
+                exit_code=EXIT_SAFETY,
+                details={
+                    "session_id": session_id,
+                    "receipt_path": str(receipt_path),
+                    "recovery_path": str(path),
+                },
+            ) from exc
+        receipt["status"] = "rolled-back"
+        receipt["phase"] = "rolled-back"
+        receipt["error_code"] = "edit_apply_failed"
+        receipt["completed_at"] = time.time()
+        if cleanup_pending:
+            receipt["cleanup_pending"] = cleanup_pending
+        receipt_writer.update(receipt)
+        raise SkillSyncError(
+            "edit apply failed; the previous Variant layer was restored",
+            code="edit_apply_failed",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id, "receipt_path": str(receipt_path)},
+        ) from exc
+
+    if deployment_transaction is None:  # pragma: no cover - success invariant
+        raise RuntimeError("scoped deployment transaction was not prepared")
+    return {
+        "session_id": session_id,
+        "skill": metadata.logical_skill,
+        "scope": metadata.target_scope.kind.value,
+        "target": target,
+        "status": "applied",
+        "previous_layer": metadata.layer_baseline.to_dict(),
+        "applied_hash": workspace_hash,
+        "backup_path": None if backup_path is None else str(backup_path),
+        "receipt_path": str(receipt_path),
+        "deployments_rebuilt": bool(deployment_transaction["deployments"]),
+        "deployments": deployment_transaction["deployments"],
+        "clients_relinked": len(applied_link_swaps),
+        "registry_updated": registry_changed,
+        "registry_version": registry["version"],
+        "skipped_clients": deployment_transaction["skipped"],
+        "cleanup_pending": cleanup_pending,
+    }
+
+
 def _mark_edit_apply_recovery(
     store: EditSessionStore,
     session_id: str,
@@ -2507,6 +3850,8 @@ def _prepare_edit_deployments(
     deployments: list[dict[str, Any]] = []
     swaps: list[DirectoryLinkSwap] = []
     swap_clients: dict[Path, str] = {}
+    resolutions: dict[str, dict[str, Any]] = {}
+    variant_skill_root = canonical_source.parent.parent / "variants" / skill_name
 
     for client in clients:
         reason: str | None = None
@@ -2528,7 +3873,16 @@ def _prepare_edit_deployments(
             skipped.append({"client": client.id, "reason": reason})
             continue
 
-        deployed = render_base_deployment(
+        spec = _client_deployment_spec(
+            workspace,
+            rendered_root,
+            skill_name,
+            client.id,
+            source_hash=workspace_hash,
+            variant_skill_root=variant_skill_root,
+        )
+        deployed = _render_client_deployment(
+            spec,
             workspace,
             rendered_root,
             skill_name,
@@ -2536,9 +3890,7 @@ def _prepare_edit_deployments(
         )
         verification = verify_deployment(
             deployed.path,
-            expected_provenance=expected_provenance(
-                skill_name, workspace_hash, client.id
-            ),
+            expected_provenance=spec.expected_provenance,
         )
         if not verification.ok:
             raise SkillSyncError(
@@ -2572,6 +3924,8 @@ def _prepare_edit_deployments(
             "destination": str(destination),
             "deployment_path": str(deployed.path),
             "deployment_created": deployed.created,
+            "resolution_hash": spec.resolution_hash,
+            "applied_layers": spec.expected_provenance["applied_layers"],
             "previous_state": current_state,
             "previous_target": None if current_target is None else str(current_target),
         }
@@ -2582,8 +3936,13 @@ def _prepare_edit_deployments(
                 "client": client.id,
                 "path": str(deployed.path),
                 "created": deployed.created,
+                "resolution_hash": spec.resolution_hash,
             }
         )
+        resolutions[client.id] = {
+            "resolution_hash": spec.resolution_hash,
+            "expected_provenance": spec.expected_provenance,
+        }
         if action == "noop":
             continue
         allowed = () if current_target is None else (current_target,)
@@ -2603,7 +3962,279 @@ def _prepare_edit_deployments(
         "deployments": deployments,
         "swaps": swaps,
         "swap_clients": swap_clients,
+        "resolutions": resolutions,
     }
+
+
+def _verify_base_edit_deployments(
+    skill_name: str,
+    canonical_source: Path,
+    workspace: Path,
+    transaction: dict[str, Any],
+    *,
+    proposed: bool,
+) -> None:
+    if not transaction["active"]:
+        return
+    base_source = workspace if proposed else canonical_source
+    variant_skill_root = canonical_source.parent.parent / "variants" / skill_name
+    rendered_root = Path(transaction["active"][0]["deployment_path"]).parent.parent
+    for row in transaction["active"]:
+        client = row["client"]
+        try:
+            spec = _client_deployment_spec(
+                base_source,
+                rendered_root,
+                skill_name,
+                client,
+                variant_skill_root=variant_skill_root,
+            )
+        except (OSError, ValueError) as exc:
+            raise SkillSyncError(
+                f"Base edit deployment inputs changed during apply: {exc}",
+                code="edit_canonical_changed_during_deploy",
+                exit_code=EXIT_CONFLICT,
+                details={"client": client},
+            ) from exc
+        expected = transaction["resolutions"][client]
+        if spec.resolution_hash != expected["resolution_hash"]:
+            raise SkillSyncError(
+                "Base edit deployment resolution changed during apply",
+                code="edit_canonical_changed_during_deploy",
+                exit_code=EXIT_CONFLICT,
+                details={"client": client},
+            )
+        verification = verify_deployment(
+            Path(row["deployment_path"]),
+            expected_provenance=expected["expected_provenance"],
+        )
+        if not verification.ok:
+            raise SkillSyncError(
+                "Base edit deployment changed during apply",
+                code="edit_deployment_verification_failed",
+                exit_code=EXIT_SAFETY,
+                details={"client": client, "state": verification.state},
+            )
+
+
+def _prepare_scoped_edit_deployments(
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    metadata: EditSessionMetadata,
+    sources: variant_source.VariantSourcePaths,
+    workspace: Path,
+    session_id: str,
+) -> dict[str, Any]:
+    """Render and prepare link swaps only for clients inside a scoped edit."""
+
+    target = metadata.target_scope.target
+    if target is None:
+        raise EditSessionMetadataError("scoped edit session target is missing")
+    scope_clients = set(_scoped_edit_clients(metadata))
+    clients = detect_clients()
+    disabled = _disabled_agents(config)
+    entry = registry.get("skills", {}).get(metadata.logical_skill, {})
+    configured = _configured_client_targets(entry)
+    rendered_root = _rendered_root(config)
+    rows: list[dict[str, Any]] = []
+    active: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    deployments: list[dict[str, Any]] = []
+    swaps: list[DirectoryLinkSwap] = []
+    swap_clients: dict[Path, str] = {}
+    resolutions: dict[str, dict[str, Any]] = {}
+
+    for client in clients:
+        if client.id not in scope_clients:
+            continue
+        reason: str | None = None
+        if configured and not {client.id, client.family_id}.intersection(configured):
+            reason = "config-excluded"
+        elif client.family_id in disabled:
+            reason = "disabled"
+        elif not client.detected:
+            reason = "undetected"
+        if reason is not None:
+            rows.append(
+                {
+                    "client": client.id,
+                    "agent": client.family_id,
+                    "status": "skipped",
+                    "reason": reason,
+                    "destination": str(client.skills_dir / metadata.logical_skill),
+                }
+            )
+            skipped.append({"client": client.id, "reason": reason})
+            continue
+
+        try:
+            resolution = resolve_variant_for_client(
+                sources.base_root,
+                sources.variant_skill_root,
+                client.id,
+                override_target=target,
+                override_root=workspace,
+            )
+        except (OSError, ValueError) as exc:
+            variant_source.verify_variant_source_paths(sources)
+            raise SkillSyncError(
+                f"could not resolve scoped edit deployment: {exc}",
+                code="variant_resolution_invalid",
+                exit_code=EXIT_SAFETY,
+                details={"client": client.id, "target": target},
+            ) from exc
+        variant_source.verify_variant_source_paths(sources)
+        deployed = render_layered_deployment(
+            resolution,
+            rendered_root,
+            metadata.logical_skill,
+        )
+        expected = expected_layered_provenance(
+            metadata.logical_skill,
+            resolution,
+        )
+        verification = verify_deployment(
+            deployed.path,
+            expected_provenance=expected,
+        )
+        if not verification.ok:
+            raise SkillSyncError(
+                "rendered scoped edit deployment failed verification",
+                code="edit_deployment_verification_failed",
+                exit_code=EXIT_SAFETY,
+                details={"client": client.id, "state": verification.state},
+            )
+        destination = client.skills_dir / metadata.logical_skill
+        current_state, current_target = _deployment_link_state(
+            sources.base_root,
+            destination,
+            deployed.path,
+            rendered_root,
+            metadata.logical_skill,
+            client.id,
+        )
+        action = _deployment_action(current_state, "valid")
+        if action == "blocked":
+            raise SkillSyncError(
+                "scoped edit deployment is blocked by an unsafe Agent path",
+                code="edit_deployment_blocked",
+                exit_code=EXIT_SAFETY,
+                details={"client": client.id, "state": current_state},
+            )
+        row = {
+            "client": client.id,
+            "agent": client.family_id,
+            "status": "ready",
+            "action": action,
+            "destination": str(destination),
+            "deployment_path": str(deployed.path),
+            "deployment_created": deployed.created,
+            "resolution_hash": resolution.resolution_hash,
+            "output_hash": resolution.output_hash,
+            "previous_state": current_state,
+            "previous_target": None if current_target is None else str(current_target),
+        }
+        rows.append(row)
+        active.append(row)
+        deployments.append(
+            {
+                "client": client.id,
+                "path": str(deployed.path),
+                "created": deployed.created,
+                "resolution_hash": resolution.resolution_hash,
+            }
+        )
+        resolutions[client.id] = {
+            "resolution_hash": resolution.resolution_hash,
+            "output_hash": resolution.output_hash,
+            "expected_provenance": expected,
+        }
+        if action == "noop":
+            continue
+        allowed = () if current_target is None else (current_target,)
+        link_swap = DirectoryLinkSwap.prepare(
+            deployed.path,
+            destination,
+            allowed_current_sources=allowed,
+            token=f"{session_id}-{client.id}",
+        )
+        swaps.append(link_swap)
+        swap_clients[destination] = client.id
+
+    return {
+        "clients": rows,
+        "active": active,
+        "skipped": skipped,
+        "deployments": deployments,
+        "swaps": swaps,
+        "swap_clients": swap_clients,
+        "resolutions": resolutions,
+    }
+
+
+def _verify_scoped_edit_deployments(
+    metadata: EditSessionMetadata,
+    sources: variant_source.VariantSourcePaths,
+    workspace: Path,
+    transaction: dict[str, Any],
+    *,
+    proposed: bool,
+) -> None:
+    target = metadata.target_scope.target
+    if target is None:
+        raise EditSessionMetadataError("scoped edit session target is missing")
+    for row in transaction["active"]:
+        client = row["client"]
+        try:
+            resolution = resolve_variant_for_client(
+                sources.base_root,
+                sources.variant_skill_root,
+                client,
+                **(
+                    {"override_target": target, "override_root": workspace}
+                    if proposed
+                    else {}
+                ),
+            )
+        except (OSError, ValueError) as exc:
+            raise SkillSyncError(
+                f"scoped deployment inputs changed during apply: {exc}",
+                code="edit_canonical_changed_during_deploy",
+                exit_code=EXIT_CONFLICT,
+                details={"client": client, "target": target},
+            ) from exc
+        expected = transaction["resolutions"][client]
+        if (
+            resolution.resolution_hash != expected["resolution_hash"]
+            or resolution.output_hash != expected["output_hash"]
+        ):
+            raise SkillSyncError(
+                "scoped deployment resolution changed during apply",
+                code="edit_canonical_changed_during_deploy",
+                exit_code=EXIT_CONFLICT,
+                details={"client": client, "target": target},
+            )
+        verification = verify_deployment(
+            Path(row["deployment_path"]),
+            expected_provenance=expected["expected_provenance"],
+        )
+        if not verification.ok:
+            raise SkillSyncError(
+                "scoped deployment changed during apply",
+                code="edit_deployment_verification_failed",
+                exit_code=EXIT_SAFETY,
+                details={"client": client, "state": verification.state},
+            )
+    if proposed:
+        variant_source.verify_variant_source_paths(sources)
+    else:
+        for row in transaction["active"]:
+            resolution = resolve_variant_for_client(
+                sources.base_root,
+                sources.variant_skill_root,
+                row["client"],
+            )
+            variant_source.verify_variant_source_paths(sources, resolution=resolution)
 
 
 def _transition_edit_metadata(
@@ -2742,7 +4373,30 @@ def status(
         branch = _branch(config)
         registry = _load_local_registry(config)
         git_state = git.state(repo, branch, fetch_remote=fetch_remote)
-        skills = [_skill_status(config, registry, name) for name in _target_names(registry, skill_names)]
+        targets = _target_names(registry, skill_names)
+        remote_registry = (
+            _cached_remote_registry(repo, branch)
+            if git_state.behind > 0
+            else registry
+        )
+        remote_changes = (
+            _remote_sync_unit_keys(repo, branch, registry, remote_registry)
+            if git_state.behind > 0
+            else set()
+        )
+        units = _sync_unit_rows(config, registry, targets, remote_changes)
+        units_by_skill = {
+            name: [row for row in units if row["skill"] == name]
+            for name in targets
+        }
+        skills = []
+        for name in targets:
+            base_unit = next(
+                unit for unit in units_by_skill[name] if unit["kind"] == "base"
+            )
+            row = _skill_status(config, registry, name, base_unit=base_unit)
+            row["units"] = units_by_skill[name]
+            skills.append(row)
         return {
             "schema_version": 1,
             "repo": {
@@ -2762,6 +4416,8 @@ def status(
 def pull(
     skill_names: Iterable[str] | None = None,
     config_path: str | Path | None = None,
+    *,
+    _merge_local_changes: bool = False,
 ) -> dict[str, Any]:
     """Fetch, fast-forward, and install selected remote Skills locally."""
 
@@ -2773,25 +4429,142 @@ def pull(
         if not git.is_clean(repo):
             raise SkillSyncError("sync repository is dirty; commit or discard changes before pull")
         git.fetch(repo, branch)
+        preflight_git_state = git.state(repo, branch, fetch_remote=False)
+        previous_registry = _load_local_registry(config)
+        remote_registry = _cached_remote_registry(repo, branch)
+        preflight_targets = _target_names(remote_registry, skill_names)
+        remote_changes = (
+            _remote_sync_unit_keys(
+                repo,
+                branch,
+                previous_registry,
+                remote_registry,
+            )
+            if preflight_git_state.behind > 0
+            else set()
+        )
+        preflight_units = _sync_unit_rows(
+            config,
+            previous_registry,
+            preflight_targets,
+            remote_changes,
+        )
+        conflicts = [row for row in preflight_units if row["state"] == "conflict"]
+        if conflicts:
+            raise SkillSyncError(
+                "the same Base or Variant unit changed locally and remotely",
+                code="sync_unit_conflict",
+                exit_code=EXIT_CONFLICT,
+                details={"units": conflicts},
+            )
+        preserved_bases = {
+            row["skill"]
+            for row in preflight_units
+            if row["kind"] == "base"
+            and row["changed_local"]
+            and not row["changed_remote"]
+        }
+        preserved_variants: dict[str, set[str]] = {}
+        preserved_baselines: dict[str, dict[str, str]] = {}
+        for row in preflight_units:
+            if (
+                row["kind"] != "variant"
+                or not row["changed_local"]
+                or row["changed_remote"]
+                or row["target"] is None
+            ):
+                continue
+            preserved_variants.setdefault(row["skill"], set()).add(row["target"])
+            if row["baseline_hash"] is not None:
+                preserved_baselines.setdefault(row["skill"], {})[row["target"]] = row[
+                    "baseline_hash"
+                ]
+        if not _merge_local_changes and (preserved_bases or preserved_variants):
+            changed_label = (
+                "Variant"
+                if preserved_variants and not preserved_bases
+                else "Base"
+                if preserved_bases and not preserved_variants
+                else "Base or Variant"
+            )
+            raise SkillSyncError(
+                f"refusing to overwrite locally changed {changed_label} source",
+                code="local_source_changed",
+                exit_code=EXIT_CONFLICT,
+                details={
+                    "bases": sorted(preserved_bases),
+                    "variants": {
+                        name: sorted(targets)
+                        for name, targets in sorted(preserved_variants.items())
+                    },
+                },
+            )
         git.merge_ff_only(repo, branch)
 
         registry = _load_local_registry(config)
         _reconcile_config_to_registry(config, registry)
         targets = _target_names(registry, skill_names)
-        _refuse_local_overwrite(config, registry, targets)
+        _verify_preflight_local_units(
+            config,
+            registry,
+            targets,
+            preflight_units,
+        )
+        variant_plans = _prepare_variant_pull_plans(
+            config,
+            registry,
+            targets,
+            preserved_targets=preserved_variants,
+            preserved_baselines=preserved_baselines,
+            config_path=config_path,
+        )
         installed: list[str] = []
+        installed_variants: list[dict[str, str]] = []
+        kept_variants: list[dict[str, str]] = []
         for name in targets:
             remote_skill = repo / "skills" / name
             if not remote_skill.exists():
                 continue
             destination = _local_skill_path_or_default(config, registry, name)
-            copied_hash = copy_skill_dir(remote_skill, destination)
-            config.setdefault("skills", {}).setdefault(name, {})["local_path"] = str(destination)
-            config["skills"][name]["last_installed_hash"] = copied_hash
-            installed.append(name)
+            if name not in preserved_bases:
+                copied_hash = copy_skill_dir(remote_skill, destination)
+                config.setdefault("skills", {}).setdefault(name, {})["local_path"] = str(destination)
+                config["skills"][name]["last_installed_hash"] = copied_hash
+                installed.append(name)
+            if name in variant_plans:
+                (
+                    units,
+                    variant_destination,
+                    next_baselines,
+                    preserved,
+                ) = variant_plans[name]
+                hashes = portable_sync.replace_variant_set(units, variant_destination)
+                _set_variant_baselines(config, name, next_baselines)
+                installed_variants.extend(
+                    {
+                        "skill": name,
+                        "target": target,
+                        "hash": hash_value,
+                    }
+                    for target, hash_value in sorted(hashes.items())
+                    if target not in preserved
+                )
+                kept_variants.extend(
+                    {
+                        "skill": name,
+                        "target": target,
+                        "hash": hashes[target],
+                    }
+                    for target in sorted(preserved)
+                    if target in hashes
+                )
 
         save_config(config_file, config)
-        return {"pulled": installed}
+        return {
+            "pulled": installed,
+            "pulled_variants": installed_variants,
+            "preserved_variants": kept_variants,
+        }
     except SkillSyncError:
         raise
     except (git.GitError, ValueError, OSError) as exc:
@@ -2821,20 +4594,53 @@ def push(
         if current.behind > 0:
             raise SkillSyncError("remote has commits not present locally; pull before push")
 
+        variant_plans = _prepare_variant_push_plans(
+            config,
+            registry,
+            targets,
+            config_path=config_path,
+        )
         pushed_hashes: dict[str, str] = {}
+        pushed_variant_hashes: dict[str, dict[str, str]] = {}
         for name in targets:
             source = _local_skill_path(config, name)
             _validate_skill_path(source)
             destination = repo / "skills" / name
             pushed_hashes[name] = copy_skill_dir(source, destination)
+            if name in variant_plans:
+                units = variant_plans[name]
+                variant_destination = repo / "variants" / name
+                if units or variant_destination.exists() or is_link_or_reparse(
+                    variant_destination
+                ):
+                    pushed_variant_hashes[name] = portable_sync.replace_variant_set(
+                        units,
+                        variant_destination,
+                    )
+                else:
+                    pushed_variant_hashes[name] = {}
 
         committed = git.commit_all_if_changed(repo, message or "Sync selected skills")
         git.push(repo, branch)
 
         for name, hash_value in pushed_hashes.items():
             config.setdefault("skills", {}).setdefault(name, {})["last_installed_hash"] = hash_value
+            if name in pushed_variant_hashes:
+                _set_variant_baselines(config, name, pushed_variant_hashes[name])
         save_config(config_file, config)
-        return {"pushed": list(pushed_hashes), "committed": committed}
+        return {
+            "pushed": list(pushed_hashes),
+            "pushed_variants": [
+                {
+                    "skill": name,
+                    "target": target,
+                    "hash": hash_value,
+                }
+                for name in sorted(pushed_variant_hashes)
+                for target, hash_value in sorted(pushed_variant_hashes[name].items())
+            ],
+            "committed": committed,
+        }
     except SkillSyncError:
         raise
     except (git.GitError, ValueError, OSError) as exc:
@@ -2865,7 +4671,11 @@ def sync(
         if action == "conflict":
             raise SkillSyncError("both remote and local selected Skills changed; resolve manually")
         if action == "pull":
-            result = pull(skill_names=targets, config_path=config_path)
+            result = pull(
+                skill_names=targets,
+                config_path=config_path,
+                _merge_local_changes=True,
+            )
             if "platform" not in _load_local_config(config_path):
                 result["links"] = link_skills(skill_names=targets, config_path=config_path)["links"]
             return result
@@ -3353,6 +5163,7 @@ def _link_safety_findings(
             "code": "unsafe-agent-path",
             "skill": skill["name"],
             "client": client["client"],
+            "destination": client["destination"],
             "detail": client.get("reason") or client["current_state"],
         }
         for skill in plan
@@ -3364,6 +5175,7 @@ def _link_safety_findings(
             "code": client["current_state"],
             "skill": skill["name"],
             "client": client["client"],
+            "destination": client["destination"],
             "detail": client.get("reason")
             or "Agent path is not safely replaceable.",
         }
@@ -3542,15 +5354,226 @@ def _local_skill_path_or_default(
     return get_adapter(platform).default_skill_dir() / name
 
 
-def _skill_status(config: dict[str, Any], registry: dict[str, Any], name: str) -> dict[str, Any]:
-    local_path = _local_skill_path(config, name)
-    _validate_skill_path(local_path)
-    local_hash = hash_skill_dir(local_path)
+def _cached_remote_registry(repo: Path, branch: str) -> dict[str, Any]:
+    return parse_registry_text(git.read_remote_file(repo, REGISTRY_FILE, branch))
+
+
+def _remote_sync_unit_keys(
+    repo: Path,
+    branch: str,
+    registry: dict[str, Any],
+    remote_registry: dict[str, Any],
+) -> set[tuple[str, str, str | None]]:
+    changed: set[tuple[str, str, str | None]] = set()
+    for raw_path in git.remote_changed_paths(repo, branch):
+        parts = Path(raw_path).parts
+        if len(parts) >= 2 and parts[0] == "skills":
+            changed.add((parts[1], "base", None))
+        elif len(parts) >= 3 and parts[0] == "variants":
+            changed.add((parts[1], "variant", parts[2]))
+
+    current_skills = registry.get("skills", {})
+    remote_skills = remote_registry.get("skills", {})
+    if not isinstance(current_skills, dict) or not isinstance(remote_skills, dict):
+        raise SkillSyncError("registry skills must be a mapping")
+    for name in set(current_skills) | set(remote_skills):
+        current_targets = (
+            set(registry_variant_targets(registry, name))
+            if name in current_skills
+            else set()
+        )
+        remote_targets = (
+            set(registry_variant_targets(remote_registry, name))
+            if name in remote_skills
+            else set()
+        )
+        for target in current_targets ^ remote_targets:
+            changed.add((name, "variant", target))
+    return changed
+
+
+def _sync_unit_rows(
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    targets: list[str],
+    remote_changes: set[tuple[str, str, str | None]],
+) -> list[dict[str, Any]]:
     repo = _repo_path(config)
-    remote_path = repo / "skills" / name
-    remote_hash = hash_skill_dir(remote_path) if remote_path.exists() else None
-    baseline = config.get("skills", {}).get(name, {}).get("last_installed_hash")
-    changed_local = local_hash != (baseline or remote_hash)
+    rows: list[dict[str, Any]] = []
+    skills_config = config.get("skills", {})
+    if not isinstance(skills_config, dict):
+        raise SkillSyncError("config skills must be a mapping")
+    skills_root = _global_skill_root(config)
+    variants_root = skills_root.parent / "variants"
+
+    for name in targets:
+        entry = skills_config.get(name, {})
+        if not isinstance(entry, dict):
+            raise SkillSyncError(f"invalid local Skill config: {name}")
+        local_base = _local_skill_path_or_default(config, registry, name)
+        local_base_hash: str | None = None
+        if local_base.exists() or is_link_or_reparse(local_base):
+            _validate_skill_path(local_base)
+            local_base_hash = hash_skill_dir(local_base)
+        repo_base = repo / "skills" / name
+        repo_base_hash = (
+            hash_skill_dir(repo_base)
+            if repo_base.is_dir() and not is_link_or_reparse(repo_base)
+            else None
+        )
+        base_baseline = entry.get("last_installed_hash")
+        if base_baseline is not None and not isinstance(base_baseline, str):
+            raise SkillSyncError(f"invalid local Skill baseline: {name}")
+        base_changed_local = (
+            local_base_hash is not None
+            and local_base_hash != (base_baseline or repo_base_hash)
+        )
+        base_changed_remote = (name, "base", None) in remote_changes
+        rows.append(
+            _sync_unit_row(
+                skill=name,
+                kind="base",
+                target=None,
+                local_hash=local_base_hash,
+                repository_hash=repo_base_hash,
+                baseline_hash=base_baseline,
+                changed_local=base_changed_local,
+                changed_remote=base_changed_remote,
+            )
+        )
+
+        if registry.get("version") != 3:
+            continue
+
+        registry_skills = registry.get("skills", {})
+        declared = (
+            set(registry_variant_targets(registry, name))
+            if registry.get("version") == 3
+            and isinstance(registry_skills, dict)
+            and name in registry_skills
+            else set()
+        )
+        baselines = _variant_baselines(config, name)
+        local_hashes = portable_sync.inspect_materialized_targets(
+            variants_root / name
+        )
+        repo_hashes = portable_sync.inspect_materialized_targets(
+            repo / "variants" / name
+        )
+        remote_targets = {
+            target
+            for skill, kind, target in remote_changes
+            if skill == name and kind == "variant" and target is not None
+        }
+        variant_targets = sorted(
+            declared
+            | set(baselines)
+            | set(local_hashes)
+            | set(repo_hashes)
+            | remote_targets
+        )
+        for target in variant_targets:
+            local_hash = local_hashes.get(target)
+            baseline = baselines.get(target) or repo_hashes.get(target)
+            changed_local = local_hash is not None and local_hash != baseline
+            changed_remote = (name, "variant", target) in remote_changes
+            rows.append(
+                _sync_unit_row(
+                    skill=name,
+                    kind="variant",
+                    target=target,
+                    local_hash=local_hash,
+                    repository_hash=repo_hashes.get(target),
+                    baseline_hash=baselines.get(target),
+                    changed_local=changed_local,
+                    changed_remote=changed_remote,
+                )
+            )
+    return rows
+
+
+def _sync_unit_row(
+    *,
+    skill: str,
+    kind: str,
+    target: str | None,
+    local_hash: str | None,
+    repository_hash: str | None,
+    baseline_hash: str | None,
+    changed_local: bool,
+    changed_remote: bool,
+) -> dict[str, Any]:
+    if changed_local and changed_remote:
+        state = "conflict"
+    elif changed_local:
+        state = "local-changed"
+    elif changed_remote:
+        state = "remote-changed"
+    elif local_hash is None:
+        state = "missing"
+    else:
+        state = "current"
+    return {
+        "id": f"{skill}:{kind}" + ("" if target is None else f":{target}"),
+        "skill": skill,
+        "kind": kind,
+        "target": target,
+        "local_hash": local_hash,
+        "repository_hash": repository_hash,
+        "baseline_hash": baseline_hash,
+        "changed_local": changed_local,
+        "changed_remote": changed_remote,
+        "state": state,
+    }
+
+
+def _verify_preflight_local_units(
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    targets: list[str],
+    preflight_units: list[dict[str, Any]],
+) -> None:
+    current = {
+        row["id"]: row
+        for row in _sync_unit_rows(config, registry, targets, set())
+    }
+    changed = [
+        row["id"]
+        for row in preflight_units
+        if row["id"] in current
+        and row["local_hash"] != current[row["id"]]["local_hash"]
+    ]
+    if changed:
+        raise SkillSyncError(
+            "local Base or Variant source changed during pull preflight",
+            code="sync_source_changed",
+            exit_code=EXIT_CONFLICT,
+            details={"units": sorted(changed)},
+        )
+
+
+def _skill_status(
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    name: str,
+    *,
+    base_unit: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    local_path = _local_skill_path(config, name)
+    if base_unit is None:
+        _validate_skill_path(local_path)
+        local_hash = hash_skill_dir(local_path)
+        repo = _repo_path(config)
+        remote_path = repo / "skills" / name
+        remote_hash = hash_skill_dir(remote_path) if remote_path.exists() else None
+        baseline = config.get("skills", {}).get(name, {}).get("last_installed_hash")
+        changed_local = local_hash != (baseline or remote_hash)
+    else:
+        local_hash = base_unit["local_hash"]
+        remote_hash = base_unit["repository_hash"]
+        changed_local = base_unit["changed_local"]
+        if local_hash is None:
+            raise SkillSyncError(f"local Skill is missing: {name}")
     entry = registry.get("skills", {}).get(name, {})
     platform = entry.get("source_platform", config.get("platform", "global")) if isinstance(entry, dict) else config.get("platform", "global")
     return {
@@ -3588,6 +5611,180 @@ def _reconcile_config_to_registry(config: dict[str, Any], registry: dict[str, An
     for name in list(skills):
         if name not in selected:
             del skills[name]
+
+
+def _prepare_variant_push_plans(
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    targets: list[str],
+    *,
+    config_path: str | Path | None,
+) -> dict[str, tuple[portable_sync.PortableVariantUnit, ...]]:
+    if registry.get("version") != 3:
+        return {}
+    plans: dict[str, tuple[portable_sync.PortableVariantUnit, ...]] = {}
+    for name in targets:
+        declared = registry_variant_targets(registry, name)
+        sources = variant_source.resolve_variant_source_paths(
+            name,
+            config_path=config_path,
+        )
+        local_source = _local_skill_path(config, name).absolute()
+        if sources.base_root != local_source:
+            raise SkillSyncError(
+                f"selected Base path does not match the portable Variant root: {name}",
+                code="portable_variant_source_mismatch",
+                exit_code=EXIT_SAFETY,
+                details={
+                    "skill": name,
+                    "selected_base": str(local_source),
+                    "portable_base": str(sources.base_root),
+                },
+            )
+        units = portable_sync.inspect_variant_units(
+            skill=name,
+            base_root=sources.base_root,
+            variant_skill_root=sources.variant_skill_root,
+            targets=declared,
+        )
+        variant_source.verify_variant_source_paths(sources)
+        plans[name] = units
+    return plans
+
+
+def _prepare_variant_pull_plans(
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    targets: list[str],
+    *,
+    preserved_targets: dict[str, set[str]],
+    preserved_baselines: dict[str, dict[str, str]],
+    config_path: str | Path | None,
+) -> dict[
+    str,
+    tuple[
+        tuple[portable_sync.PortableVariantUnit, ...],
+        Path,
+        dict[str, str],
+        set[str],
+    ],
+]:
+    if registry.get("version") != 3:
+        return {}
+    repo = _repo_path(config)
+    raw_skills_root = config.get("skills_root") or Path.home() / ".agents" / "skills"
+    skills_root = Path(raw_skills_root).expanduser()
+    if not skills_root.is_absolute():
+        raise SkillSyncError(
+            "configured skills_root must be an absolute path",
+            code="variant_config_invalid",
+            exit_code=EXIT_SAFETY,
+        )
+    variants_root = skills_root.absolute().parent / "variants"
+    plans: dict[
+        str,
+        tuple[
+            tuple[portable_sync.PortableVariantUnit, ...],
+            Path,
+            dict[str, str],
+            set[str],
+        ],
+    ] = {}
+    for name in targets:
+        declared = registry_variant_targets(registry, name)
+        remote_base = repo / "skills" / name
+        if not remote_base.is_dir() or is_link_or_reparse(remote_base):
+            if declared:
+                raise SkillSyncError(
+                    f"portable Base source is missing for registered Variants: {name}",
+                    code="portable_variant_source_missing",
+                    exit_code=EXIT_SAFETY,
+                    details={"skill": name},
+                )
+            continue
+        remote_units = portable_sync.inspect_variant_units(
+            skill=name,
+            base_root=remote_base,
+            variant_skill_root=repo / "variants" / name,
+            targets=declared,
+        )
+        destination = variants_root / name
+        preserved = set(declared) & preserved_targets.get(name, set())
+        local_units: tuple[portable_sync.PortableVariantUnit, ...] = ()
+        if preserved:
+            sources = variant_source.resolve_variant_source_paths(
+                name,
+                config_path=config_path,
+            )
+            local_units = portable_sync.inspect_variant_units(
+                skill=name,
+                base_root=sources.base_root,
+                variant_skill_root=sources.variant_skill_root,
+                targets=preserved,
+            )
+            variant_source.verify_variant_source_paths(sources)
+        units_by_target = {unit.target: unit for unit in remote_units}
+        units_by_target.update({unit.target: unit for unit in local_units})
+        ordered_units = tuple(units_by_target[target] for target in declared)
+        next_baselines = {
+            unit.target: unit.content_hash
+            for unit in remote_units
+            if unit.target not in preserved
+        }
+        for target in preserved:
+            baseline = preserved_baselines.get(name, {}).get(target)
+            if baseline is None:
+                raise SkillSyncError(
+                    f"missing baseline for locally changed Variant source: {name}/{target}",
+                    code="variant_baseline_invalid",
+                    exit_code=EXIT_SAFETY,
+                )
+            next_baselines[target] = baseline
+        plans[name] = (
+            ordered_units,
+            destination,
+            next_baselines,
+            preserved,
+        )
+    return plans
+
+
+def _variant_baselines(config: dict[str, Any], name: str) -> dict[str, str]:
+    entry = config.get("skills", {}).get(name, {})
+    if not isinstance(entry, dict):
+        raise SkillSyncError(f"invalid local Skill config: {name}")
+    raw = entry.get("variant_baselines", {})
+    if not isinstance(raw, dict) or not all(
+        isinstance(target, str)
+        and isinstance(hash_value, str)
+        and hash_value.startswith("sha256:")
+        for target, hash_value in raw.items()
+    ):
+        raise SkillSyncError(
+            f"invalid local Variant baselines: {name}",
+            code="variant_baseline_invalid",
+            exit_code=EXIT_SAFETY,
+        )
+    return dict(raw)
+
+
+def _set_variant_baselines(
+    config: dict[str, Any],
+    name: str,
+    hashes: dict[str, str],
+) -> None:
+    skills = config.setdefault("skills", {})
+    if not isinstance(skills, dict):
+        raise SkillSyncError("config skills must be a mapping")
+    entry = skills.setdefault(name, {})
+    if not isinstance(entry, dict):
+        raise SkillSyncError(f"invalid local Skill config: {name}")
+    if hashes:
+        entry["variant_baselines"] = {
+            target: hashes[target] for target in sorted(hashes)
+        }
+    else:
+        entry.pop("variant_baselines", None)
 
 
 def _refuse_local_overwrite(
@@ -3768,7 +5965,25 @@ def _deploy_migrate_unlocked(
         for client in skill["clients"]:
             if client["deployment_state"] == "valid":
                 continue
-            deployed = render_base_deployment(
+            spec = _client_deployment_spec(
+                source,
+                rendered_root,
+                skill["name"],
+                client["client"],
+                source_hash=skill["source_hash"],
+            )
+            if spec.resolution_hash != client["resolution_hash"]:
+                raise SkillSyncError(
+                    "deployment inputs changed while preparing deployments",
+                    code="deployment_source_changed",
+                    exit_code=EXIT_CONFLICT,
+                    details={
+                        "skill": skill["name"],
+                        "client": client["client"],
+                    },
+                )
+            deployed = _render_client_deployment(
+                spec,
                 source,
                 rendered_root,
                 skill["name"],
@@ -3792,12 +6007,27 @@ def _deploy_migrate_unlocked(
         for skill in prepared
         if skill["source_hash"] != initial_hashes.get(skill["name"])
     ]
-    if changed_sources:
+    initial_resolutions = {
+        (skill["name"], client["client"]): client["resolution_hash"]
+        for skill in initial
+        for client in skill["clients"]
+    }
+    changed_resolutions = [
+        {"skill": skill["name"], "client": client["client"]}
+        for skill in prepared
+        for client in skill["clients"]
+        if client["resolution_hash"]
+        != initial_resolutions.get((skill["name"], client["client"]))
+    ]
+    if changed_sources or changed_resolutions:
         raise SkillSyncError(
-            "canonical Skill changed while preparing deployments",
+            "deployment sources changed while preparing deployments",
             code="deployment_source_changed",
             exit_code=EXIT_CONFLICT,
-            details={"skills": changed_sources},
+            details={
+                "skills": changed_sources,
+                "clients": changed_resolutions,
+            },
         )
     unprepared = [
         {"skill": skill["name"], **client}
@@ -3858,12 +6088,30 @@ def _deploy_migrate_unlocked(
                 new_target = Path(client["deployment_path"])
                 old_target_text = client.get("current_target")
                 old_target = Path(old_target_text) if old_target_text else None
-                if hash_skill_dir(Path(skill["source_path"])) != skill["source_hash"]:
+                source = Path(skill["source_path"])
+                if hash_skill_dir(source) != skill["source_hash"]:
                     raise SkillSyncError(
                         f"canonical Skill changed before link swap: {skill['name']}",
                         code="deployment_source_changed",
                         exit_code=EXIT_CONFLICT,
                         details={"skill": skill["name"]},
+                    )
+                current_spec = _client_deployment_spec(
+                    source,
+                    rendered_root,
+                    skill["name"],
+                    client["client"],
+                    source_hash=skill["source_hash"],
+                )
+                if current_spec.resolution_hash != client["resolution_hash"]:
+                    raise SkillSyncError(
+                        "deployment inputs changed before link swap",
+                        code="deployment_source_changed",
+                        exit_code=EXIT_CONFLICT,
+                        details={
+                            "skill": skill["name"],
+                            "client": client["client"],
+                        },
                     )
                 receipt["status"] = "applying"
                 receipt["in_flight"] = str(destination)
@@ -3895,17 +6143,30 @@ def _deploy_migrate_unlocked(
                 receipt["completed"].append(str(destination))
                 receipt.pop("in_flight", None)
                 _write_json_atomic(receipt_path, receipt)
-        changed_after_swaps = [
-            skill["name"]
-            for skill in prepared
-            if hash_skill_dir(Path(skill["source_path"])) != skill["source_hash"]
-        ]
+        changed_after_swaps: list[dict[str, str]] = []
+        for skill in prepared:
+            source = Path(skill["source_path"])
+            if hash_skill_dir(source) != skill["source_hash"]:
+                changed_after_swaps.append({"skill": skill["name"], "client": "base"})
+                continue
+            for client in skill["clients"]:
+                current_spec = _client_deployment_spec(
+                    source,
+                    rendered_root,
+                    skill["name"],
+                    client["client"],
+                    source_hash=skill["source_hash"],
+                )
+                if current_spec.resolution_hash != client["resolution_hash"]:
+                    changed_after_swaps.append(
+                        {"skill": skill["name"], "client": client["client"]}
+                    )
         if changed_after_swaps:
             raise SkillSyncError(
-                "canonical Skill changed during link migration",
+                "deployment sources changed during link migration",
                 code="deployment_source_changed",
                 exit_code=EXIT_CONFLICT,
-                details={"skills": changed_after_swaps},
+                details={"clients": changed_after_swaps},
             )
     except Exception as exc:
         rollback_errors: list[str] = []
@@ -4417,10 +6678,26 @@ def _deployment_plan(
         for client in available:
             if configured and not {client.id, client.family_id}.intersection(configured):
                 continue
-            resolved_hash = resolution_hash(name, source_hash, client.id)
-            desired = deployment_path(rendered_root, name, resolved_hash)
-            expected = expected_provenance(name, source_hash, client.id)
-            verification = verify_deployment(desired, expected_provenance=expected)
+            try:
+                spec = _client_deployment_spec(
+                    source,
+                    rendered_root,
+                    name,
+                    client.id,
+                    source_hash=source_hash,
+                )
+            except (OSError, ValueError) as exc:
+                raise SkillSyncError(
+                    f"could not resolve deployment for {name}/{client.id}: {exc}",
+                    code="variant_resolution_invalid",
+                    exit_code=EXIT_SAFETY,
+                    details={"skill": name, "client": client.id},
+                ) from exc
+            desired = spec.path
+            verification = verify_deployment(
+                desired,
+                expected_provenance=spec.expected_provenance,
+            )
             destination = client.skills_dir / name
             if "platform" in config and _same_path_location(source, destination):
                 # Legacy platform-mode installs may use the Agent directory as
@@ -4436,17 +6713,25 @@ def _deployment_plan(
                 client.id,
             )
             action = _deployment_action(current_state, verification.state)
+            reason = (
+                _deployment_block_reason(current_state, verification.state)
+                if action == "blocked"
+                else verification.reason
+            )
             rows.append(
                 {
                     "client": client.id,
                     "agent": client.family_id,
                     "destination": str(destination),
                     "deployment_path": str(desired),
+                    "resolution_hash": spec.resolution_hash,
+                    "resolver_version": spec.expected_provenance["resolver_version"],
+                    "applied_layers": spec.expected_provenance["applied_layers"],
                     "deployment_state": verification.state,
                     "current_state": current_state,
                     "current_target": None if current_target is None else str(current_target),
                     "action": action,
-                    "reason": verification.reason,
+                    "reason": reason,
                 }
             )
         result.append(
@@ -4458,6 +6743,61 @@ def _deployment_plan(
             }
         )
     return result
+
+
+def _client_deployment_spec(
+    source: Path,
+    rendered_root: Path,
+    skill_name: str,
+    client_id: str,
+    *,
+    source_hash: str | None = None,
+    variant_skill_root: Path | None = None,
+) -> _ClientDeploymentSpec:
+    """Resolve the deployment format without migrating Base-only clients."""
+
+    canonical_hash = hash_skill_dir(source) if source_hash is None else source_hash
+    variants = (
+        source.parent.parent / "variants" / skill_name
+        if variant_skill_root is None
+        else variant_skill_root
+    )
+    layered = resolve_variant_for_client(source, variants, client_id)
+    if layered.applied_variant_targets:
+        expected = expected_layered_provenance(skill_name, layered)
+        return _ClientDeploymentSpec(
+            path=deployment_path(rendered_root, skill_name, layered.resolution_hash),
+            resolution_hash=layered.resolution_hash,
+            expected_provenance=expected,
+            layered_resolution=layered,
+        )
+    resolved_hash = resolution_hash(skill_name, canonical_hash, client_id)
+    return _ClientDeploymentSpec(
+        path=deployment_path(rendered_root, skill_name, resolved_hash),
+        resolution_hash=resolved_hash,
+        expected_provenance=expected_provenance(
+            skill_name,
+            canonical_hash,
+            client_id,
+        ),
+        layered_resolution=None,
+    )
+
+
+def _render_client_deployment(
+    spec: _ClientDeploymentSpec,
+    source: Path,
+    rendered_root: Path,
+    skill_name: str,
+    client_id: str,
+):
+    if spec.layered_resolution is not None:
+        return render_layered_deployment(
+            spec.layered_resolution,
+            rendered_root,
+            skill_name,
+        )
+    return render_base_deployment(source, rendered_root, skill_name, client_id)
 
 
 def _deployment_link_state(
@@ -4516,6 +6856,21 @@ def _deployment_action(current_state: str, deployment_state: str) -> str:
     if current_state in {"direct-source-link", "stale-render"}:
         return "swap" if deployment_state == "valid" else "build-and-swap"
     return "blocked"
+
+
+def _deployment_block_reason(current_state: str, deployment_state: str) -> str:
+    current_reasons = {
+        "conflict": "Agent destination contains unmanaged content.",
+        "wrong-link": "Agent link points to a different location.",
+        "broken-link": "Agent link target is missing.",
+        "tampered-render": "The active managed deployment was modified.",
+        "missing-render": "The active managed deployment is missing.",
+    }
+    if current_state in current_reasons:
+        return current_reasons[current_state]
+    if deployment_state == "tampered":
+        return "The desired managed deployment was modified."
+    return "Agent destination is not safely replaceable."
 
 
 def _directory_link_target(destination: Path) -> Path | None:
@@ -4790,9 +7145,32 @@ def doctor(
     config_path: str | Path | None = None,
     *,
     clients: Iterable[Any] | None = None,
+    _sync_units: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     config = _load_local_config(config_path)
     registry = _load_local_registry(config)
+    if _sync_units is None:
+        repo = _repo_path(config)
+        branch = _branch(config)
+        git_state = git.state(repo, branch, fetch_remote=False)
+        remote_registry = (
+            _cached_remote_registry(repo, branch)
+            if git_state.behind > 0
+            else registry
+        )
+        remote_changes = (
+            _remote_sync_unit_keys(repo, branch, registry, remote_registry)
+            if git_state.behind > 0
+            else set()
+        )
+        sync_units = _sync_unit_rows(
+            config,
+            registry,
+            sorted(_selected_names(registry)),
+            remote_changes,
+        )
+    else:
+        sync_units = _sync_units
     client_snapshot = tuple(detect_clients() if clients is None else clients)
     agents = aggregate_agent_targets(client_snapshot)
     disabled_agents = _disabled_agents(config)
@@ -4889,6 +7267,7 @@ def doctor(
         "client_matrix": client_matrix,
         "deployment_operations": deployment_operations,
         "recovery_required": bool(deployment_operations),
+        "sync_units": sync_units,
         "issues": issues,
     }
 
@@ -4983,7 +7362,7 @@ def _configured_client_targets(entry: Any) -> set[str]:
 
 
 def _normalize_agent_name(name: str) -> str:
-    if name in {"kimi-code", "kimi-desktop"}:
+    if name == "kimi-code":
         return "kimi"
     return name
 

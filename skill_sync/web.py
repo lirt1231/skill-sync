@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import threading
@@ -12,12 +13,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from skill_sync import core
+from skill_sync import core, variant_source
 from skill_sync.errors import SkillSyncError
 
 
 STATIC_DIR = Path(__file__).with_name("web_static")
-STATE_VIEWS = ("summary", "inventory", "agents", "import-candidates")
+STATE_VIEWS = (
+    "summary",
+    "inventory",
+    "agents",
+    "managed",
+    "import-candidates",
+)
 
 
 def serve(host: str = "127.0.0.1", port: int = 8765, config_path: str | None = None, open_browser: bool = True) -> None:
@@ -78,6 +85,8 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(body, dict):
+                    raise SkillSyncError("request body must be a JSON object")
                 path = urlparse(self.path).path
                 if path == "/api/plan":
                     self._json(
@@ -88,8 +97,79 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                         )
                     )
                     return
+                if path == "/api/edit/inspect":
+                    request = _edit_request(
+                        body,
+                        allowed={"session_id"},
+                        required={"session_id"},
+                    )
+                    self._json(
+                        {"inspection": _edit_inspection(request["session_id"], config_path)}
+                    )
+                    return
                 views = _body_views(body.get("views"))
-                kwargs = {"skill_names": body.get("skills"), "config_path": config_path}
+                if path == "/api/edit/begin":
+                    request = _edit_request(
+                        body,
+                        allowed={"skill", "scope", "target", "actor", "views"},
+                        required={"skill", "scope"},
+                    )
+                    result = core.edit_begin(
+                        request["skill"],
+                        scope=request["scope"],
+                        target=request.get("target"),
+                        actor=request.get("actor"),
+                        config_path=config_path,
+                    )
+                elif path == "/api/edit/apply":
+                    request = _edit_request(
+                        body,
+                        allowed={"session_id", "inspection_id", "views"},
+                        required={"session_id", "inspection_id"},
+                    )
+                    inspection = _edit_inspection(request["session_id"], config_path)
+                    if inspection["inspection_id"] != request["inspection_id"]:
+                        raise SkillSyncError(
+                            "edit session inspection changed; review it and confirm again",
+                            code="edit_inspection_changed",
+                            details={"inspection": inspection},
+                        )
+                    if not inspection["can_apply"]:
+                        raise SkillSyncError(
+                            "edit session cannot be applied safely",
+                            code="edit_apply_blocked",
+                            details={
+                                "session_id": request["session_id"],
+                                "blockers": inspection["blockers"],
+                            },
+                        )
+                    result = core.edit_apply(
+                        request["session_id"], config_path=config_path
+                    )
+                elif path == "/api/edit/abort":
+                    request = _edit_request(
+                        body,
+                        allowed={"session_id", "views"},
+                        required={"session_id"},
+                    )
+                    session = core.edit_session_status(
+                        request["session_id"], config_path=config_path
+                    )
+                    if session.get("status") != "active":
+                        raise SkillSyncError(
+                            "only an active edit session can be aborted",
+                            code="edit_abort_blocked",
+                            details={
+                                "session_id": request["session_id"],
+                                "status": session.get("status"),
+                            },
+                        )
+                    result = core.edit_abort(
+                        request["session_id"], config_path=config_path
+                    )
+                else:
+                    kwargs = {"skill_names": body.get("skills"), "config_path": config_path}
+                    result = None
                 if path == "/api/init":
                     result = core.init_sync(
                         body.get("repo", ""),
@@ -128,6 +208,8 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                         result = core.disable_agent_sync(body.get("agent", ""), config_path=config_path)
                 elif path == "/api/backup":
                     result = core.backup_global_skill(body.get("skill", ""), config_path=config_path)
+                elif path in {"/api/edit/begin", "/api/edit/apply", "/api/edit/abort"}:
+                    pass
                 else:
                     self._json({"error": "unknown action"}, HTTPStatus.NOT_FOUND)
                     return
@@ -147,7 +229,10 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                     return
                 self._json({"result": result, "state": next_state})
             except (SkillSyncError, ValueError, OSError) as exc:
-                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                payload = {"error": str(exc)}
+                if isinstance(exc, SkillSyncError):
+                    payload.update({"code": exc.code, "details": exc.details})
+                self._json(payload, HTTPStatus.BAD_REQUEST)
 
         def _json(self, value: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
             content = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -161,6 +246,149 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
             return
 
     return Handler
+
+
+def _edit_request(
+    body: dict[str, Any],
+    *,
+    allowed: set[str],
+    required: set[str],
+) -> dict[str, Any]:
+    unknown = set(body) - allowed
+    if unknown:
+        raise SkillSyncError(
+            "unknown edit request field: " + ", ".join(sorted(unknown)),
+            code="edit_request_invalid",
+        )
+    missing = required - set(body)
+    if missing:
+        raise SkillSyncError(
+            "missing edit request field: " + ", ".join(sorted(missing)),
+            code="edit_request_invalid",
+        )
+    for field in required:
+        if not isinstance(body[field], str) or not body[field].strip():
+            raise SkillSyncError(
+                f"edit request field must be a non-empty string: {field}",
+                code="edit_request_invalid",
+            )
+    if "scope" in body and body["scope"] not in {"base", "family", "client"}:
+        raise SkillSyncError(
+            "edit scope must be base, family, or client",
+            code="edit_request_invalid",
+        )
+    if body.get("scope") == "base" and body.get("target") is not None:
+        raise SkillSyncError(
+            "Base edit scope must not have a target",
+            code="edit_request_invalid",
+        )
+    if body.get("scope") in {"family", "client"}:
+        target = body.get("target")
+        if not isinstance(target, str) or not target.strip():
+            raise SkillSyncError(
+                f"{body['scope']} edit scope requires a target",
+                code="edit_request_invalid",
+            )
+    if "actor" in body and body["actor"] is not None and not isinstance(body["actor"], str):
+        raise SkillSyncError(
+            "edit request actor must be a string",
+            code="edit_request_invalid",
+        )
+    return body
+
+
+def _edit_inspection(session_id: str, config_path: str | None) -> dict[str, Any]:
+    """Aggregate the three read-only edit checks into one confirmable snapshot."""
+
+    session = core.edit_session_status(session_id, config_path=config_path)
+    session.update(core.edit_session_paths(session_id, config_path=config_path))
+    if session.get("status") != "active":
+        raise SkillSyncError(
+            "only an active edit session can be inspected",
+            code="edit_inspection_blocked",
+            details={"session_id": session_id, "status": session.get("status")},
+        )
+
+    results: dict[str, Any] = {}
+    errors: list[dict[str, Any]] = []
+    checks = (
+        ("diff", core.edit_diff),
+        ("validation", core.edit_validate),
+        ("impact", core.edit_impact),
+    )
+    for stage, operation in checks:
+        try:
+            results[stage] = operation(session_id, config_path=config_path)
+        except SkillSyncError as exc:
+            results[stage] = None
+            errors.append({"stage": stage, "code": exc.code, "message": str(exc)})
+
+    blockers = list(errors)
+    diff = results["diff"]
+    validation = results["validation"]
+    impact = results["impact"]
+    expected_identity = {
+        "session_id": session_id,
+        "skill": session.get("logical_skill"),
+        "scope": (session.get("target_scope") or {}).get("kind", "base"),
+        "target": (session.get("target_scope") or {}).get("target"),
+    }
+    for stage, value in results.items():
+        if value is None:
+            continue
+        actual = {key: value.get(key) for key in expected_identity}
+        if actual != expected_identity:
+            blockers.append(
+                {
+                    "stage": stage,
+                    "code": "edit_inspection_scope_mismatch",
+                    "message": "edit inspection scope changed unexpectedly",
+                }
+            )
+    if validation is not None:
+        if not validation.get("valid"):
+            blockers.append(
+                {"stage": "validation", "code": "invalid", "message": "workspace validation failed"}
+            )
+        if not validation.get("changed"):
+            blockers.append(
+                {"stage": "validation", "code": "unchanged", "message": "workspace has no authored changes"}
+            )
+        if validation.get("stale_baseline"):
+            blockers.append(
+                {"stage": "validation", "code": "stale-baseline", "message": "authored layer changed since begin"}
+            )
+    if diff is not None and not diff.get("changed"):
+        blockers.append(
+            {"stage": "diff", "code": "unchanged", "message": "workspace has no authored changes"}
+        )
+    if impact is not None:
+        if impact.get("blocked") or impact.get("stale_baseline"):
+            blockers.append(
+                {
+                    "stage": "impact",
+                    "code": impact.get("blocked_reason") or "blocked",
+                    "message": "edit impact is blocked",
+                }
+            )
+        if not impact.get("has_workspace_changes"):
+            blockers.append(
+                {"stage": "impact", "code": "unchanged", "message": "workspace has no authored changes"}
+            )
+
+    snapshot = {
+        "schema_version": 1,
+        "session": session,
+        **results,
+        "errors": errors,
+        "blockers": blockers,
+        "can_apply": not blockers,
+    }
+    fingerprint_source = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    snapshot["inspection_id"] = "sha256:" + hashlib.sha256(fingerprint_source).hexdigest()
+    return snapshot
 
 
 def _query_views(query: str) -> tuple[str, ...] | None:
@@ -232,6 +460,21 @@ def _state(
                 for agent in core.detect_agents()
             ]
             result["doctor"] = {"agents": agents, "matrix": [], "issues": []}
+        if "managed" in requested:
+            result["managed"] = {
+                "variants": {
+                    "variant_count": 0,
+                    "valid": True,
+                    "variants": [],
+                    "issues": [],
+                },
+                "deployments": {
+                    "skills": [],
+                    "operations": [],
+                    "recovery_required": False,
+                },
+                "sessions": {"sessions": []},
+            }
         if "import-candidates" in requested:
             result["import_candidates"] = []
         return result
@@ -242,6 +485,8 @@ def _state(
         result["doctor"] = diagnosis
     if "inventory" in requested:
         result["status"] = _inventory(config_path, diagnosis=diagnosis)
+    if "managed" in requested:
+        result["managed"] = _managed_state(config_path)
     if "import-candidates" in requested:
         try:
             result["import_candidates"] = core.scan_import_candidates(
@@ -250,6 +495,16 @@ def _state(
         except SkillSyncError:
             result["import_candidates"] = []
     return result
+
+
+def _managed_state(config_path: str | None) -> dict[str, Any]:
+    """Return CLI-identical Variant, deployment, and session read models."""
+
+    return {
+        "variants": variant_source.list_variants(config_path=config_path),
+        "deployments": core.deploy_status(config_path=config_path),
+        "sessions": core.list_edit_sessions(config_path=config_path),
+    }
 
 
 def _inventory(

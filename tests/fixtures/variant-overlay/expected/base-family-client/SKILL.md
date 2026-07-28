@@ -1,1 +1,1 @@
-# Kimi Desktop
+# Kimi Code

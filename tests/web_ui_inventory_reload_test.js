@@ -38,13 +38,13 @@ function boot(href) {
   }
   const ids = [
     "setup","app","setup-form","setup-submit","refresh","sync","sync-label","sync-summary",
-    "issue-list","skill-list","search","search-wrap","sync-filter","source-filter","agent-filter",
+    "issue-list","skill-list","search","search-wrap","repair-all","status-tabs","status-synced","status-synced-count","status-changed","status-changed-count","status-local","status-local-count","source-filter","agent-filter",
     "clear-filters","visible-count","select-all-checkbox","select-all","select-selected",
     "deselect-selected","link-selected","copy-selected","copy-agent","delete-selected",
     "clear-selection","selection-count","selection-bar","agent-list","import-tabs","imports",
     "select-all-imports","clear-imports","import-selected","import-count","import-bar","detail-drawer",
-    "detail-name","detail-status","detail-description","detail-sync","detail-path","detail-agents",
-    "detail-backup","close-detail","load-failure","retry-load","toast",
+    "detail-name","detail-status","detail-description","detail-sync","detail-hash","detail-path","detail-agents","detail-variants","detail-sessions","detail-deployments",
+    "detail-repair","detail-backup","close-detail","load-failure","retry-load","toast",
   ];
   const elements = Object.fromEntries(ids.map(id => [id, new Element(id)]));
   const views = ["skills","agents","imports"].map(name => new Element(`view-${name}`));
@@ -131,7 +131,7 @@ sessionStorage.setItem("skill-sync:web-context:v1", JSON.stringify({
 }));
 const invalid = boot(href); invalid.api.setState(state({pruned:true}));
 assert.deepEqual(invalid.api.snapshot(), {
-  search:"", filters:{status:"all",source:"all",agent:"all"},
+  search:"", filters:{status:"synced",source:"all",agent:"all"},
   selected:[], activeView:"skills", detailSkill:"alpha",
 }, "malformed and stale stored values must fail safely to valid defaults");
 

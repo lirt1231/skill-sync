@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from skill_sync.edit_session import (
     EDIT_SESSION_SCHEMA_VERSION,
@@ -124,7 +125,7 @@ class EditSessionStoreTest(unittest.TestCase):
                 EditLayerBaseline.present(BASELINE_HASH),
             ),
             (
-                EditSessionScope.client("kimi-desktop"),
+                EditSessionScope.client("kimi-code"),
                 EditLayerBaseline.absent(),
             ),
         )
@@ -326,6 +327,36 @@ class EditSessionStoreTest(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 store.create(replace(metadata, actor="workbuddy"))
             self.assertEqual(paths.metadata.read_bytes(), original)
+
+    def test_begin_passes_scoped_metadata_and_guard_failure_never_publishes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            source.mkdir()
+            (source / "variant.yaml").write_text(
+                "version: 1\ntarget: kimi\nmode: overlay\n",
+                encoding="utf-8",
+            )
+            store = EditSessionStore(root / "data")
+            source_hash = "sha256:" + "b" * 64
+
+            with mock.patch(
+                "skill_sync.edit_session.copy_skill_dir",
+                return_value=source_hash,
+            ), self.assertRaisesRegex(RuntimeError, "source changed"):
+                store.begin(
+                    logical_skill="alpha",
+                    source=source,
+                    baseline_hash=source_hash,
+                    target_scope=EditSessionScope.family("kimi"),
+                    layer_baseline=EditLayerBaseline.absent(),
+                    publication_guard=lambda: (_ for _ in ()).throw(
+                        RuntimeError("source changed")
+                    ),
+                )
+
+            self.assertEqual(store.list_metadata(), [])
+            self.assertEqual(list(store.root.glob(".begin-*")), [])
 
     def test_list_metadata_is_read_only_and_deterministically_sorted(self):
         with tempfile.TemporaryDirectory() as temp_dir:

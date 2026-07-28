@@ -34,12 +34,12 @@ class Element {
 
 const ids = [
   "setup","app","setup-form","setup-submit","refresh","sync","sync-label","sync-summary",
-  "issue-list","skill-list","search","search-wrap","search-toggle","sync-filter","source-filter","agent-filter","clear-filters","visible-count","select-all-checkbox",
+  "issue-list","skill-list","search","search-wrap","search-toggle","repair-all","status-tabs","status-synced","status-synced-count","status-changed","status-changed-count","status-local","status-local-count","source-filter","agent-filter","clear-filters","visible-count","select-all-checkbox",
   "select-all","select-selected","deselect-selected","link-selected","copy-selected","copy-agent",
   "delete-selected","clear-selection","selection-count","selection-bar","agent-list","import-tabs",
   "imports","select-all-imports","clear-imports","import-selected","import-count","import-bar",
-  "detail-drawer","detail-name","detail-status","detail-description","detail-sync","detail-path",
-  "detail-agents","detail-backup","close-detail","load-failure","retry-load","toast",
+  "detail-drawer","detail-name","detail-status","detail-description","detail-sync","detail-hash","detail-path","detail-variants","detail-sessions","detail-deployments",
+  "detail-agents","detail-repair","detail-backup","close-detail","load-failure","retry-load","toast","toast-close","initial-loading",
 ];
 const elements = Object.fromEntries(ids.map(id => [id, new Element(id)]));
 const views = ["skills","agents","imports"].map(name => new Element(`view-${name}`));
@@ -75,7 +75,7 @@ vm.createContext(context);
 const appPath = process.argv[2];
 const source = fs.readFileSync(appPath, "utf8") + `
 globalThis.testApi = {
-  action, getState, loadViews,
+  action, getState, loadViews, toast, dismissToast,
   setState(value) { state = value; render(); },
   clearState() { state = null; token = ""; },
   setToken(value) { token = value; },
@@ -85,7 +85,7 @@ globalThis.testApi = {
     selected.clear(); names.forEach(name => selected.add(name));
     detailSkill = detail; render();
   },
-  snapshot() { return {state, activeView, selected:[...selected], detailSkill, busy:[...inFlightOperations.keys()]}; }
+  snapshot() { return {state, activeView, selected:[...selected], detailSkill, busy:[...inFlightOperations.keys()],token}; }
 };`;
 vm.runInContext(source, context, {filename: appPath});
 const api = context.testApi;
@@ -164,7 +164,7 @@ async function testRefreshPreservesValidContext() {
   assert.equal(elements.search.value, "alp");
   assert.deepEqual(snapshot.selected, ["alpha"]);
   assert.equal(snapshot.detailSkill, "alpha", "a valid detail target must survive refresh");
-  assert.deepEqual(calls, ["/api/state?view=inventory", "/api/state?view=summary&view=agents"]);
+  assert.deepEqual(calls, ["/api/state?view=inventory", "/api/state?view=summary&view=agents&view=managed"]);
 }
 
 async function testFailureMessagesAndUnlock() {
@@ -183,6 +183,31 @@ async function testFailureMessagesAndUnlock() {
     assert.deepEqual(api.snapshot().busy, []);
     assert.equal(elements.sync.disabled, false, `busy leaked after ${message}`);
   }
+}
+
+async function testExpiredTokenRefreshesOnce() {
+  api.setState(baseState());api.setToken("stale-token");const calls=[];
+  fetchImpl=async(url,options)=>{
+    calls.push([url,options?.headers?.["X-Skill-Sync-Token"]]);
+    if(url==="/api/token")return response({token:"fresh-token"});
+    if(calls.filter(([path])=>path==="/api/sync").length===1)return response({error:"invalid token"},{ok:false,status:403});
+    return response({result:{},state:baseState()});
+  };
+  assert.equal(await api.action("/api/sync"),true);
+  assert.deepEqual(calls,[["/api/sync","stale-token"],["/api/token",undefined],["/api/sync","fresh-token"]]);
+  assert.equal(api.snapshot().token,"fresh-token");
+}
+
+async function testHtmlLoadErrorAndPersistentToast() {
+  api.setState(baseState());api.setToken("token");
+  fetchImpl=async()=>({ok:false,status:502,json:async()=>{throw new Error("html")}});
+  assert.equal(await api.getState(false),false);
+  assert.match(elements.toast.textContent,/状态加载失败/);
+  assert.equal(elements["toast-close"].classList.contains("hidden"),false);
+  api.toast("后续普通提示");
+  assert.match(elements.toast.textContent,/状态加载失败/,"an actionable error must not be overwritten by info");
+  api.dismissToast();
+  assert.equal(elements["toast-close"].classList.contains("hidden"),true);
 }
 
 async function testPostKeepsCapturedView() {
@@ -208,7 +233,7 @@ async function testDynamicAgentAndSetupStates() {
   pending.resolve(response({result:{},state:agentState(false)}));
   assert.equal(await operation, true);
   assert.match(elements["agent-list"].innerHTML, /aria-busy="false"[^>]*>启用<\/button>/);
-  assert.match(elements["agent-list"].innerHTML, /Claude Code[\s\S]*?<button disabled aria-busy="false"/);
+  assert.match(elements["agent-list"].innerHTML, /Claude Code[\s\S]*?<button type="button" disabled aria-busy="false"/);
 
   api.setState({initialized:false,status:{skills:[]},doctor:{agents:[],matrix:[],issues:[]},import_candidates:[]});
   const setupPending = deferred(); fetchImpl = async () => setupPending.promise;
@@ -236,6 +261,8 @@ async function testInitialFailureHasVisibleRetry() {
   await testStaleGetCannotOverwriteMutation();
   await testRefreshPreservesValidContext();
   await testFailureMessagesAndUnlock();
+  await testExpiredTokenRefreshesOnce();
+  await testHtmlLoadErrorAndPersistentToast();
   await testPostKeepsCapturedView();
   await testDynamicAgentAndSetupStates();
   await testInitialFailureHasVisibleRetry();

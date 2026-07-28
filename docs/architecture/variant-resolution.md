@@ -1,8 +1,8 @@
 # Variant Resolution Architecture
 
-This document describes the Variant source and read-only resolver available
-through roadmap commit 7.6. It separates implemented behavior from later
-deployment, editing, registry, and multi-device work.
+This document describes the Variant source, resolver, scoped-edit, deployment,
+portable registry intent, and multi-device synchronization model available
+through roadmap commit 9.5.
 
 ## Source and resolved views
 
@@ -16,25 +16,24 @@ authored sources                         immutable resolved view
                                   ├─ Base → family → exact client ─> client files
 ~/.agents/variants/<skill>/kimi/ ─┤
 ~/.agents/variants/<skill>/       │
-  kimi-desktop/                  ─┘
+  kimi-code/                     ─┘
 ```
 
-| View | Meaning | Managed operation available through 7.6 |
+| View | Meaning | Managed operation available through 9.1 |
 | --- | --- | --- |
-| Base source | Portable common Skill under `skills/<skill>/` | Full managed Base edit workflow |
-| Family source | Sparse overlay such as `variants/<skill>/kimi/` | Minimal manifest creation plus read-only list/validate only; no content edit/apply workflow |
-| Client source | Sparse overlay such as `variants/<skill>/kimi-desktop/` | Minimal manifest creation plus read-only list/validate only; no content edit/apply workflow |
-| Resolved view | Immutable in-memory file plan for one exact client | No; it is derived evidence, not an authoring source |
-| Rendered deployment | Content-addressed directory used by Agent links | Existing deployments are not Variant-aware yet |
+| Base source | Portable common Skill under `skills/<skill>/` | Full managed Base edit workflow; apply preserves applicable Variants |
+| Family source | Sparse overlay such as `variants/<skill>/kimi/` | Create plus transactional scoped edit workflow |
+| Client source | Sparse overlay such as `variants/<skill>/kimi-code/` | Create plus transactional scoped edit workflow |
+| Resolved view | Immutable in-memory file plan for one exact client | Read-only resolve/diff and apply evidence; never an authoring source |
+| Rendered deployment | Content-addressed directory used by Agent links | Atomic schema-v2 layered render when a Variant applies; Base-only clients retain schema v1 |
 
 The Base and Variant directories are authored sources. A resolved view is the
 deterministic result of applying source layers; it is not another source tree
 and must never be edited or copied back implicitly.
 
-`variant create` scaffolds only `variant.yaml`; it does not provide a managed
-way to author overlay files. Agents must not work around that limit by editing
-`~/.agents/variants` directly. Managed Family/Client content editing and apply
-belong to the later scoped edit-session roadmap.
+`variant create` scaffolds only `variant.yaml`. Author overlay files through
+`edit begin --family/--client`, and edit only the returned machine-local
+workspace. Agents must never edit `~/.agents/variants` directly.
 
 ## Layer selection and overlay semantics
 
@@ -45,7 +44,7 @@ family, then applies layers from least to most specific:
 2. the family Variant, when present;
 3. the exact-client Variant, when present.
 
-For `kimi-desktop`, `kimi` overrides Base and `kimi-desktop` overrides both.
+For `kimi-code`, `kimi` overrides Base and `kimi-code` overrides both.
 For Codex and WorkBuddy, the family ID and sole client ID are identical, so the
 same Variant directory is applied once rather than twice. Missing family and
 client layers are valid and produce a Base-only or partially adapted view.
@@ -78,21 +77,35 @@ Consequently, equal source content at different machine paths has the same
 portable resolution identity. A client-specific change affects only clients
 whose layer chain includes it, while a Base change affects every client view.
 
+When at least one Variant applies, the deployment stores portable schema-v2
+provenance: resolver version, exact client and family, ordered layer
+roles/targets/content hashes, final output hash, and rendered content hash. It
+never stores canonical or workspace absolute paths. Verification recomputes the
+resolution hash from the persisted layer chain and fails closed on malformed,
+stale, or tampered provenance. A Base-only client continues to use the existing
+schema-v1 deployment identity, avoiding an unnecessary fleet-wide migration.
+
 ## Source management and read-only inspection commands
 
-These are the complete Variant source-management and inspection commands
-implemented through 7.6:
+These are the Variant source-management and inspection commands implemented
+through 9.1:
 
 ```bash
 skill-sync variant list
 skill-sync variant list --skill my-skill --json
 skill-sync variant create my-skill --family kimi
-skill-sync variant create my-skill --client kimi-desktop
+skill-sync variant create my-skill --client kimi-code
 skill-sync variant validate my-skill
-skill-sync resolve my-skill --client kimi-desktop --dry-run
+skill-sync resolve my-skill --client kimi-code --dry-run
 skill-sync resolve my-skill --client codex --dry-run --json
-skill-sync diff my-skill --base --client kimi-desktop
+skill-sync diff my-skill --base --client kimi-code
 skill-sync diff my-skill --base --client claude-code --json
+skill-sync edit begin my-skill --family kimi --actor kimi-code
+skill-sync edit begin my-skill --client codex --actor codex
+skill-sync edit diff <session-id>
+skill-sync edit validate <session-id>
+skill-sync edit impact <session-id>
+skill-sync edit apply <session-id>
 ```
 
 `resolve` requires an explicit `--dry-run`; it has no output/materialization
@@ -116,9 +129,18 @@ instead, including the omission reason when present.
   `diff_omitted=total_size_limit`.
 - Small binary files do not consume the aggregate text budget.
 
-Both commands use the shared JSON v1 envelope. They do not write source,
+`resolve` and top-level `diff` use the shared JSON v1 envelope. They do not write source,
 configuration, registry, provenance files, deployments, caches, or Agent
 links. They do not invoke Git, fetch, commit, or push.
+
+A scoped edit workspace contains only its authored Family/Client layer. An
+absent Variant remains absent at begin and is published only during apply.
+Apply holds the deployment and per-Skill locks, validates the layer baseline,
+renders only affected detected/enabled clients, atomically replaces their
+links, and rolls back the source layer and prior links on ordinary failure.
+Family `kimi` therefore affects both Kimi clients, while Client `codex` does not
+rebuild or relink WorkBuddy. Apply writes local receipts/backups but never runs
+Git, commits, or pushes.
 
 ## Source-boundary threat model
 
@@ -142,27 +164,41 @@ ambiguity already present during initial validation fails closed with its
 existing structured name/Base ambiguity error. Guard paths and filesystem
 identities are local evidence only and never change cross-machine hashes.
 
-## Migration limits through 7.6
+## Portable synchronization and migration limits through 9.5
 
-The resolver is intentionally inspection-only. Do not infer any of these later
-roadmap capabilities:
+Registry schema v3 makes Variant intent portable. A v3 repository stores Base
+under `skills/<skill>/`, each declared authored layer under
+`variants/<skill>/<target>/`, and a sorted target allowlist in `registry.yaml`.
+Machine-local source roots, deployments, sessions, backups, credentials, and
+client detection never enter the Git package. Per-target installed baselines
+remain in local config only.
+
+`preview` and `status` expose Base and Variant sync units independently. A
+remote change to one unit can be pulled while preserving a local change to a
+different unit. A local and remote change to the same Base or Variant is a
+conflict and stops before fast-forward or authored-source replacement. A
+direct `pull` retains its stricter refusal to proceed over any local authored
+change; the merge behavior belongs to the preflighted `sync` workflow. Push is
+always explicit.
+
+Registry v1/v2 remains readable and Base-only. Read-only commands do not
+rewrite it; the first Variant mutation upgrades it to registry schema v3.
+Detailed upgrade, rollback, and new-machine procedures are in
+[Registry v3 Migration](../registry-v3-migration.md).
+
+Do not infer any of these later roadmap capabilities:
 
 - no `resolve --output` or arbitrary resolved-directory materialization;
 - no `variant delete` command;
-- no Family/Client edit-session scope or Variant apply workflow;
-- no Variant-aware registry schema, Git packaging, pull/push conflict unit, or
-  fresh-machine reconstruction of `variants/`;
-- no Variant-aware deployment cache rebuild or Agent-link switching;
 - no Web Variant badges, editor, client matrix, or resolved diff screen;
-- no persisted provenance manifest or stale Variant-render detection;
 - no custom adapter schema or dynamic client/family registry.
 
-Today, `variant create` writes only a local minimal source manifest and
-`resolve`/`diff` inspect existing local sources. Existing `sync`, `pull`,
-`push`, `link`, deployment, Web, and Base edit-session flows must not be treated
-as Variant-aware. Until the registry and multi-device commits land, do not
-claim that normal Skill Sync reconstructs Variant sources on another machine.
+Tampered layered deployments can be previewed against their current resolved
+output and discarded/rebuilt. Capture remains Base-only: a synthesized client
+output cannot be copied into Base without incorrectly widening its blast
+radius, so layered preview offers only explicit discard until scoped recovery
+can attribute authored changes to one layer.
 
 Before relying on a Variant, validate it and inspect every relevant exact
-client separately. Kimi Code and Kimi Desktop share the `kimi` family layer but
-may differ because an exact-client layer has higher precedence.
+client separately. Kimi Code receives the `kimi` family layer before its
+optional exact-client layer.

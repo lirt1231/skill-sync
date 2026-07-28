@@ -1,4 +1,4 @@
-"""Reproduce managed Skill edits from Claude Code and both Kimi clients."""
+"""Reproduce managed Skill edits from Claude Code and Kimi Code."""
 
 from __future__ import annotations
 
@@ -23,8 +23,7 @@ from skill_sync.registry import save_registry
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
 CLIENT_CASES = (
     ("claude-code", "claude", ("claude-code",)),
-    ("kimi-code", "kimi", ("kimi-code", "kimi-desktop")),
-    ("kimi-desktop", "kimi", ("kimi-code", "kimi-desktop")),
+    ("kimi-code", "kimi", ("kimi-code",)),
 )
 
 
@@ -117,13 +116,6 @@ class RemainingClientsManagedEditFlowTest(unittest.TestCase):
             client_roots = {
                 "claude-code": home / ".claude" / "skills",
                 "kimi-code": home / ".config" / "agents" / "skills",
-                "kimi-desktop": home
-                / "Library"
-                / "Application Support"
-                / "kimi-desktop"
-                / "daimon-share"
-                / "daimon"
-                / "skills",
             }
             environment = {
                 "HOME": str(home),
@@ -131,7 +123,6 @@ class RemainingClientsManagedEditFlowTest(unittest.TestCase):
                 "WORKBUDDY_HOME": str(root / "missing-workbuddy"),
                 "CLAUDE_HOME": str(home / ".claude"),
                 "KIMI_CODE_SKILLS_DIR": str(client_roots["kimi-code"]),
-                "KIMI_DESKTOP_SKILLS_DIR": str(client_roots["kimi-desktop"]),
             }
             links: dict[str, Path] = {}
             original_deployments: dict[str, Path] = {}
@@ -272,11 +263,8 @@ class RemainingClientsManagedEditFlowTest(unittest.TestCase):
     def test_claude_code_uses_the_managed_workspace_flow(self) -> None:
         self.run_case(*CLIENT_CASES[0])
 
-    def test_kimi_code_updates_both_family_endpoints_only_after_apply(self) -> None:
+    def test_kimi_code_updates_its_family_endpoint_only_after_apply(self) -> None:
         self.run_case(*CLIENT_CASES[1])
-
-    def test_kimi_desktop_updates_both_family_endpoints_only_after_apply(self) -> None:
-        self.run_case(*CLIENT_CASES[2])
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ class AgentDetectionTest(unittest.TestCase):
         family = get_family("kimi")
         self.assertIsInstance(family, AgentFamily)
         self.assertEqual(family.id, "kimi")
-        self.assertEqual(family.client_ids, ("kimi-code", "kimi-desktop"))
+        self.assertEqual(family.client_ids, ("kimi-code",))
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -39,64 +39,56 @@ class AgentDetectionTest(unittest.TestCase):
                 clients = detect_clients(env={}, home=Path(tmp))
         self.assertEqual(
             [client.id for client in clients],
-            ["codex", "workbuddy", "kimi-code", "kimi-desktop", "claude-code"],
+            ["codex", "workbuddy", "kimi-code", "claude-code"],
         )
 
     def test_expands_family_to_detected_clients(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             (home / ".kimi-code").mkdir()
-            desktop = home / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "skills"
-            desktop.mkdir(parents=True)
             with mock.patch("skill_sync.agents.shutil.which", return_value=None):
                 clients = detect_clients(env={}, home=home)
             expanded = expand_agent_clients("kimi", clients=clients)
         self.assertEqual(
             [client.id for client in expanded],
-            ["kimi-code", "kimi-desktop"],
+            ["kimi-code"],
         )
 
     def test_expands_concrete_client_without_expanding_family(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             (home / ".kimi-code").mkdir()
-            desktop = home / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "skills"
-            desktop.mkdir(parents=True)
             with mock.patch("skill_sync.agents.shutil.which", return_value=None):
                 clients = detect_clients(env={}, home=home)
-            expanded = expand_agent_clients("kimi-desktop", clients=clients)
-        self.assertEqual([client.id for client in expanded], ["kimi-desktop"])
+            expanded = expand_agent_clients("kimi-code", clients=clients)
+        self.assertEqual([client.id for client in expanded], ["kimi-code"])
 
     def test_family_expansion_omits_undetected_clients_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            desktop = home / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "skills"
-            desktop.mkdir(parents=True)
             with mock.patch("skill_sync.agents.shutil.which", return_value=None):
                 clients = detect_clients(env={}, home=home)
             detected = expand_agent_clients("kimi", clients=clients)
             all_clients = expand_agent_clients(
                 "kimi", clients=clients, detected_only=False
             )
-        self.assertEqual([client.id for client in detected], ["kimi-desktop"])
+        self.assertEqual([client.id for client in detected], [])
         self.assertEqual(
             [client.id for client in all_clients],
-            ["kimi-code", "kimi-desktop"],
+            ["kimi-code"],
         )
 
     def test_aggregates_detected_clients_into_family_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             code = home / ".config" / "agents" / "skills"
-            desktop = home / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "skills"
             (home / ".kimi-code").mkdir()
-            desktop.mkdir(parents=True)
             with mock.patch("skill_sync.agents.shutil.which", return_value=None):
                 clients = detect_clients(env={}, home=home)
             family = aggregate_agent_family("kimi", clients)
         self.assertEqual(family.name, "kimi")
         self.assertTrue(family.detected)
-        self.assertEqual(family.skill_dirs, (code, desktop))
+        self.assertEqual(family.skill_dirs, (code,))
 
     def test_detects_codex_and_workbuddy_skill_directories(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -122,26 +114,18 @@ class AgentDetectionTest(unittest.TestCase):
                 home / ".config" / "agents" / "skills",
             )
 
-    def test_kimi_detects_desktop_daimon_managed_skill_directory(self):
+    def test_kimi_desktop_is_not_a_supported_client(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            managed = home / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "skills"
-            managed.mkdir(parents=True)
-            with mock.patch("skill_sync.agents.shutil.which", return_value=None):
-                agents = {item.name: item for item in detect_agents(env={}, home=home)}
-            self.assertTrue(agents["kimi"].detected)
-            self.assertEqual(agents["kimi"].skills_dir, managed)
-
-    def test_kimi_combines_code_and_desktop_skill_directories(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            code = home / ".config" / "agents" / "skills"
-            desktop = home / "Library" / "Application Support" / "kimi-desktop" / "daimon-share" / "daimon" / "skills"
-            (home / ".kimi-code").mkdir()
+            desktop = home / "Library" / "Application Support" / "kimi-desktop"
             desktop.mkdir(parents=True)
             with mock.patch("skill_sync.agents.shutil.which", return_value=None):
                 agents = {item.name: item for item in detect_agents(env={}, home=home)}
-            self.assertEqual(agents["kimi"].skill_dirs, (code, desktop))
+                clients = detect_clients(env={"KIMI_DESKTOP_SKILLS_DIR": str(desktop)}, home=home)
+            self.assertFalse(agents["kimi"].detected)
+            self.assertNotIn("kimi-desktop", {client.id for client in clients})
+            with self.assertRaisesRegex(ValueError, "unknown agent client"):
+                get_client("kimi-desktop", env={}, home=home)
 
     def test_detects_claude_code_skill_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,7 +143,6 @@ class AgentDetectionTest(unittest.TestCase):
                     "CODEX_HOME": "/custom/codex",
                     "WORKBUDDY_HOME": "/custom/workbuddy",
                     "KIMI_CODE_SKILLS_DIR": "/custom/kimi-code-skills",
-                    "KIMI_DESKTOP_SKILLS_DIR": "/custom/kimi-desktop-skills",
                     "CLAUDE_HOME": "/custom/claude",
                 },
                 home=Path("/home/example"),
@@ -168,6 +151,6 @@ class AgentDetectionTest(unittest.TestCase):
         self.assertEqual(agents["workbuddy"].skills_dir, Path("/custom/workbuddy/skills"))
         self.assertEqual(
             agents["kimi"].skill_dirs,
-            (Path("/custom/kimi-code-skills"), Path("/custom/kimi-desktop-skills")),
+            (Path("/custom/kimi-code-skills"),),
         )
         self.assertEqual(agents["claude"].skills_dir, Path("/custom/claude/skills"))

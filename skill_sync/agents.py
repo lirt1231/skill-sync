@@ -64,7 +64,7 @@ class AgentTarget:
 AGENT_FAMILIES: tuple[AgentFamily, ...] = (
     AgentFamily("codex", "Codex", ("codex",)),
     AgentFamily("workbuddy", "WorkBuddy", ("workbuddy",)),
-    AgentFamily("kimi", "Kimi", ("kimi-code", "kimi-desktop")),
+    AgentFamily("kimi", "Kimi Code", ("kimi-code",)),
     AgentFamily("claude", "Claude Code", ("claude-code",)),
 )
 
@@ -87,34 +87,11 @@ def detect_clients(
     kimi_code_skills = Path(
         environ.get("KIMI_CODE_SKILLS_DIR", root / ".config" / "agents" / "skills")
     )
-    kimi_desktop_skills = Path(
-        environ.get(
-            "KIMI_DESKTOP_SKILLS_DIR",
-            root
-            / "Library"
-            / "Application Support"
-            / "kimi-desktop"
-            / "daimon-share"
-            / "daimon"
-            / "skills",
-        )
-    )
-    kimi_desktop_home = (
-        root
-        / "Library"
-        / "Application Support"
-        / "kimi-desktop"
-    )
     kimi_code_detected = (
         "KIMI_CODE_SKILLS_DIR" in environ
         or (root / ".kimi-code").exists()
         or kimi_code_skills.exists()
         or shutil.which("kimi") is not None
-    )
-    kimi_desktop_detected = (
-        "KIMI_DESKTOP_SKILLS_DIR" in environ
-        or kimi_desktop_home.exists()
-        or kimi_desktop_skills.exists()
     )
     claude_home = Path(environ.get("CLAUDE_HOME", root / ".claude"))
     return [
@@ -138,13 +115,6 @@ def detect_clients(
             "Kimi Code",
             kimi_code_skills,
             kimi_code_detected,
-        ),
-        AgentClient(
-            "kimi-desktop",
-            "kimi",
-            "Kimi Desktop",
-            kimi_desktop_skills,
-            kimi_desktop_detected,
         ),
         AgentClient(
             "claude-code",

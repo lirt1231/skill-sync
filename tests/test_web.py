@@ -141,6 +141,58 @@ class WebUiTest(unittest.TestCase):
         imports.assert_called_once_with(config_path=None)
         status.assert_not_called()
 
+    def test_managed_view_reuses_cli_read_models_without_other_view_reads(self):
+        variants = {
+            "variant_count": 1,
+            "valid": True,
+            "variants": [{"skill": "alpha", "target": "kimi"}],
+            "issues": [],
+        }
+        deployments = {
+            "skills": [{"name": "alpha", "clients": []}],
+            "operations": [],
+            "recovery_required": False,
+        }
+        sessions = {"sessions": [{"session_id": "session-1", "skill": "alpha"}]}
+        with mock.patch(
+            "skill_sync.web.core.is_initialized", return_value=True
+        ), mock.patch(
+            "skill_sync.web.variant_source.list_variants", return_value=variants
+        ) as list_variants, mock.patch(
+            "skill_sync.web.core.deploy_status", return_value=deployments
+        ) as deploy_status, mock.patch(
+            "skill_sync.web.core.list_edit_sessions", return_value=sessions
+        ) as list_sessions, mock.patch(
+            "skill_sync.web.core.status"
+        ) as status, mock.patch(
+            "skill_sync.web.core.sync_preview"
+        ) as preview, mock.patch(
+            "skill_sync.web.core.doctor"
+        ) as doctor:
+            value = _state(None, views=("managed",))
+
+        self.assertEqual(value["loaded_views"], ["managed"])
+        self.assertIs(value["managed"]["variants"], variants)
+        self.assertIs(value["managed"]["deployments"], deployments)
+        self.assertIs(value["managed"]["sessions"], sessions)
+        list_variants.assert_called_once_with(config_path=None)
+        deploy_status.assert_called_once_with(config_path=None)
+        list_sessions.assert_called_once_with(config_path=None)
+        status.assert_not_called()
+        preview.assert_not_called()
+        doctor.assert_not_called()
+
+    def test_uninitialized_managed_view_has_stable_empty_models(self):
+        with mock.patch(
+            "skill_sync.web.core.is_initialized", return_value=False
+        ), mock.patch("skill_sync.web.variant_source.list_variants") as variants:
+            value = _state(None, views=("managed",))
+
+        self.assertEqual(value["managed"]["variants"]["variants"], [])
+        self.assertEqual(value["managed"]["deployments"]["skills"], [])
+        self.assertEqual(value["managed"]["sessions"]["sessions"], [])
+        variants.assert_not_called()
+
     def test_summary_and_agents_share_one_diagnosis_and_never_fetch(self):
         diagnosis = {
             "agents": [],

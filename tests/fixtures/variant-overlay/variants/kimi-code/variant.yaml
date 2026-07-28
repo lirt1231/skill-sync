@@ -1,4 +1,4 @@
 version: 1
-target: kimi-desktop
+target: kimi-code
 mode: overlay
 delete: references/family.md

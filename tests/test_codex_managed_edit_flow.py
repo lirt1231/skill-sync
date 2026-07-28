@@ -95,7 +95,6 @@ class CodexManagedEditFlowTest(unittest.TestCase):
             "CODEX_HOME": str(self.codex_home),
             "WORKBUDDY_HOME": str(self.root / "missing-workbuddy"),
             "KIMI_CODE_SKILLS_DIR": str(self.root / "missing-kimi-code"),
-            "KIMI_DESKTOP_SKILLS_DIR": str(self.root / "missing-kimi-desktop"),
             "CLAUDE_HOME": str(self.root / "missing-claude"),
         }
 

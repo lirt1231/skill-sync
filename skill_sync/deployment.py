@@ -15,8 +15,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from skill_sync.hash import hash_skill_dir, is_ignored_path, is_link_or_reparse
+from skill_sync.agents import AGENT_FAMILIES
+from skill_sync.hash import (
+    hash_portable_skill_dir,
+    hash_skill_dir,
+    hash_skill_files,
+    hash_skill_files_with_modes,
+    is_ignored_path,
+    is_link_or_reparse,
+    portable_skill_file_mode,
+)
 from skill_sync.local_lock import local_file_lock
+from skill_sync.variant_overlay import materialize_variant_overlay
+from skill_sync.variant_resolution import (
+    VARIANT_RESOLVER_VERSION,
+    LayeredVariantResolution,
+    resolution_hash_for_layers,
+)
 
 
 PROVENANCE_FILE = ".skill-sync-provenance.json"
@@ -187,6 +202,91 @@ def render_base_deployment(
                 _remove_tree(temp_root)
 
 
+def render_layered_deployment(
+    resolution: LayeredVariantResolution,
+    store: str | Path,
+    logical_skill: str,
+) -> Deployment:
+    """Atomically render one immutable Base/Variant client resolution."""
+
+    if type(resolution) is not LayeredVariantResolution:
+        raise TypeError("resolution must be a LayeredVariantResolution")
+    _validate_identifier(logical_skill, "logical Skill name")
+    store_path = Path(store)
+    if is_link_or_reparse(store_path) or is_link_or_reparse(store_path.parent):
+        raise ValueError(
+            f"deployment store must not be a symlink or reparse point: {store_path}"
+        )
+    expected = expected_layered_provenance(logical_skill, resolution)
+    destination = deployment_path(
+        store_path,
+        logical_skill,
+        resolution.resolution_hash,
+    )
+    lock_path = (
+        store_path
+        / ".locks"
+        / f"{resolution.resolution_hash.removeprefix('sha256:')}.lock"
+    )
+    with local_file_lock(lock_path):
+        existing = verify_deployment(destination, expected_provenance=expected)
+        if existing.ok:
+            return Deployment(destination, existing.provenance or expected, False)
+        if destination.exists() or destination.is_symlink():
+            raise ValueError(
+                "refusing to overwrite an invalid content-addressed deployment: "
+                f"{destination} ({existing.state}: {existing.reason or 'verification failed'})"
+            )
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temp_root = Path(
+            tempfile.mkdtemp(prefix=f".{logical_skill}.variant-tmp-", dir=destination.parent)
+        )
+        staged = temp_root / logical_skill
+        try:
+            materialize_variant_overlay(resolution.overlay_plan, staged)
+            if hash_skill_dir(staged) != expected["rendered_hash"]:
+                raise ValueError("layered deployment content hash mismatch")
+            if hash_portable_skill_dir(staged) != expected["output_hash"]:
+                raise ValueError("layered deployment portable output hash mismatch")
+            (staged / PROVENANCE_FILE).write_bytes(_pretty_json(expected))
+            _make_read_only(staged)
+            staged.chmod(stat.S_IMODE(staged.stat().st_mode) | stat.S_IWUSR)
+            try:
+                os.rename(staged, destination)
+            except OSError as exc:
+                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise
+                winner = verify_deployment(
+                    destination,
+                    expected_provenance=expected,
+                )
+                if winner.ok:
+                    return Deployment(
+                        destination,
+                        winner.provenance or expected,
+                        False,
+                    )
+                raise ValueError(
+                    "a concurrent layered deployment winner failed verification: "
+                    f"{winner.state}: {winner.reason or 'verification failed'}"
+                ) from exc
+            destination.chmod(stat.S_IMODE(destination.stat().st_mode) & ~0o222)
+            verified = verify_deployment(
+                destination,
+                expected_provenance=expected,
+            )
+            if not verified.ok:
+                raise ValueError(
+                    "installed layered deployment failed verification: "
+                    f"{verified.reason or verified.state}"
+                )
+            return Deployment(destination, expected, True)
+        finally:
+            if temp_root.exists():
+                _remove_tree(temp_root)
+
+
 def verify_deployment(
     path: str | Path,
     *,
@@ -218,12 +318,22 @@ def verify_deployment(
             "invalid provenance fields",
         )
 
-    recomputed_resolution = resolution_hash(
-        provenance["logical_skill"],
-        provenance["source_hash"],
-        provenance["target_client"],
-        resolver_version=provenance["resolver_version"],
-    )
+    if provenance["schema_version"] == 1:
+        recomputed_resolution = resolution_hash(
+            provenance["logical_skill"],
+            provenance["source_hash"],
+            provenance["target_client"],
+            resolver_version=provenance["resolver_version"],
+        )
+    else:
+        recomputed_resolution = resolution_hash_for_layers(
+            target_client=provenance["target_client"],
+            family=provenance["family"],
+            layers=tuple(
+                (layer["role"], layer["target"], layer["content_hash"])
+                for layer in provenance["layers"]
+            ),
+        )
     if recomputed_resolution != provenance["resolution_hash"]:
         return DeploymentVerification(
             "tampered", deployment, provenance, "resolution hash does not match provenance"
@@ -251,15 +361,37 @@ def verify_deployment(
             provenance,
             f"rendered hash mismatch: expected {provenance['rendered_hash']}, got {actual_hash}",
         )
+    if provenance["schema_version"] == 2:
+        try:
+            actual_output_hash = _hash_rendered_portable_content(deployment)
+        except (OSError, ValueError) as exc:
+            return DeploymentVerification(
+                "tampered",
+                deployment,
+                provenance,
+                f"cannot hash portable deployment output: {exc}",
+            )
+        if actual_output_hash != provenance["output_hash"]:
+            return DeploymentVerification(
+                "tampered",
+                deployment,
+                provenance,
+                "portable output hash does not match provenance",
+            )
     if expected_provenance is not None:
-        for key in (
+        expected_keys = (
+            "schema_version",
             "logical_skill",
             "source_hash",
             "resolution_hash",
             "resolver_version",
+            "rendered_hash",
             "target_client",
             "applied_layers",
-        ):
+        )
+        if expected_provenance.get("schema_version") == 2:
+            expected_keys += ("output_hash", "family", "layers")
+        for key in expected_keys:
             if provenance.get(key) != expected_provenance.get(key):
                 return DeploymentVerification(
                     "stale", deployment, provenance, f"provenance mismatch for {key}"
@@ -338,20 +470,102 @@ def expected_provenance(
     }
 
 
+def expected_layered_provenance(
+    logical_skill: str,
+    resolution: LayeredVariantResolution,
+) -> dict[str, Any]:
+    """Return portable schema-v2 provenance for a layered resolution."""
+
+    _validate_identifier(logical_skill, "logical Skill name")
+    base_files = resolution.overlay_plan.layers[0].files
+    source_hash = hash_skill_files(
+        (entry.relative_path, entry.content) for entry in base_files
+    )
+    rendered_hash = hash_skill_files(
+        (entry.relative_path, entry.content)
+        for entry in resolution.overlay_plan.files
+    )
+    layers = [
+        {
+            "role": layer.role,
+            "target": layer.target,
+            "content_hash": layer.content_hash,
+        }
+        for layer in resolution.layers
+    ]
+    return {
+        "schema_version": 2,
+        "logical_skill": logical_skill,
+        "source_hash": source_hash,
+        "resolution_hash": resolution.resolution_hash,
+        "resolver_version": resolution.resolver_version,
+        "rendered_hash": rendered_hash,
+        "output_hash": resolution.output_hash,
+        "target_client": resolution.target_client,
+        "family": resolution.family,
+        "applied_layers": [
+            layer["role"]
+            if layer["target"] is None
+            else f"{layer['role']}:{layer['target']}"
+            for layer in layers
+        ],
+        "layers": layers,
+    }
+
+
 def _hash_rendered_content(deployment: Path) -> str:
+    with _rendered_content_snapshot(deployment) as snapshot:
+        return hash_skill_dir(snapshot)
+
+
+def _hash_rendered_portable_content(deployment: Path) -> str:
+    with _rendered_content_snapshot(deployment) as snapshot:
+        files = []
+        for path in sorted(snapshot.rglob("*")):
+            if path.is_file():
+                content = path.read_bytes()
+                files.append(
+                    (
+                        path.relative_to(snapshot).as_posix(),
+                        content,
+                        portable_skill_file_mode(content),
+                    )
+                )
+        return hash_skill_files_with_modes(files)
+
+
+def _rendered_content_snapshot(deployment: Path):
     _assert_no_reparse_tree(deployment)
     manifest = deployment / PROVENANCE_FILE
     if manifest.is_symlink():
         raise ValueError(f"provenance must not be a symlink: {manifest}")
-    with tempfile.TemporaryDirectory(prefix="skill-sync-verify-") as temp_dir:
+    temporary = tempfile.TemporaryDirectory(prefix="skill-sync-verify-")
+    try:
+        temp_dir = temporary.name
         snapshot = Path(temp_dir) / deployment.name
+
         def ignore(directory: str, names: list[str]) -> set[str]:
             if Path(directory) == deployment and PROVENANCE_FILE in names:
                 return {PROVENANCE_FILE}
             return set()
 
         shutil.copytree(deployment, snapshot, ignore=ignore)
-        return hash_skill_dir(snapshot)
+        return _TemporarySnapshot(temporary, snapshot)
+    except Exception:
+        temporary.cleanup()
+        raise
+
+
+@dataclass
+class _TemporarySnapshot:
+    temporary: tempfile.TemporaryDirectory[str]
+    path: Path
+
+    def __enter__(self) -> Path:
+        return self.path
+
+    def __exit__(self, *args: object) -> None:
+        self.temporary.cleanup()
 
 
 def _assert_no_reparse_tree(root: Path) -> None:
@@ -378,7 +592,8 @@ def _valid_provenance_shape(value: dict[str, Any]) -> bool:
     )
     if not all(isinstance(value.get(key), str) for key in string_fields):
         return False
-    if value.get("schema_version") != 1:
+    schema_version = value.get("schema_version")
+    if schema_version not in {1, 2}:
         return False
     try:
         _validate_identifier(value["logical_skill"], "logical Skill name")
@@ -388,9 +603,77 @@ def _valid_provenance_shape(value: dict[str, Any]) -> bool:
         _validate_sha256(value["rendered_hash"], "rendered hash")
     except ValueError:
         return False
-    return bool(value["resolver_version"]) and value.get("applied_layers") == list(
-        APPLIED_LAYERS
+    if not value["resolver_version"]:
+        return False
+    if schema_version == 1:
+        return value.get("applied_layers") == list(APPLIED_LAYERS)
+    if value["resolver_version"] != VARIANT_RESOLVER_VERSION:
+        return False
+    family = value.get("family")
+    output_hash = value.get("output_hash")
+    layers = value.get("layers")
+    if not isinstance(family, str) or not isinstance(layers, list) or not layers:
+        return False
+    try:
+        _validate_identifier(family, "Agent family")
+        _validate_sha256(output_hash, "output hash")
+    except ValueError:
+        return False
+    normalized_layers: list[tuple[str, str | None, str]] = []
+    for index, layer in enumerate(layers):
+        if not isinstance(layer, dict) or set(layer) != {
+            "role",
+            "target",
+            "content_hash",
+        }:
+            return False
+        role = layer.get("role")
+        target = layer.get("target")
+        content_hash = layer.get("content_hash")
+        if not isinstance(role, str) or (
+            target is not None and not isinstance(target, str)
+        ):
+            return False
+        if index == 0:
+            if role != "base" or target is not None:
+                return False
+        elif role not in {"family", "client", "family-client"} or target is None:
+            return False
+        try:
+            if target is not None:
+                _validate_identifier(target, "Variant target")
+            _validate_sha256(content_hash, "layer content hash")
+        except ValueError:
+            return False
+        normalized_layers.append((role, target, content_hash))
+    applied_layers = [
+        role if target is None else f"{role}:{target}"
+        for role, target, _ in normalized_layers
+    ]
+    if value.get("applied_layers") != applied_layers:
+        return False
+    registered_family = next(
+        (
+            registered.id
+            for registered in AGENT_FAMILIES
+            if value["target_client"] in registered.client_ids
+        ),
+        None,
     )
+    if registered_family != family:
+        return False
+    variant_layers = tuple(
+        (role, target) for role, target, _ in normalized_layers[1:]
+    )
+    if family == value["target_client"]:
+        return variant_layers in {(), (("family-client", family),)}
+    allowed = (
+        (),
+        (("family", family),),
+        (("client", value["target_client"]),),
+        (("family", family), ("client", value["target_client"])),
+    )
+    return variant_layers in allowed
 
 
 def _copy_ignore(source_root: Path):

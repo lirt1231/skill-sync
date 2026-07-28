@@ -16,6 +16,7 @@ from skill_sync.core import edit_begin, edit_recover
 from skill_sync.deployment import (
     PROVENANCE_FILE,
     render_base_deployment,
+    render_layered_deployment,
     verify_deployment,
 )
 from skill_sync.edit_session import EditSessionStatus, EditSessionStore
@@ -24,6 +25,7 @@ from skill_sync.errors import SkillSyncError
 from skill_sync.hash import hash_skill_dir
 from skill_sync.linking import create_directory_link
 from skill_sync.registry import save_registry
+from skill_sync.variant_resolution import resolve_variant_for_client
 
 
 CANONICAL_TEXT = (
@@ -226,6 +228,66 @@ class EditRecoveryTest(unittest.TestCase):
         self.assertNotIn("session_id", receipt)
         self.assertNotIn("diff", receipt)
         self.assertNotIn("files", receipt)
+
+    def test_layered_recovery_allows_discard_but_blocks_base_capture(self):
+        variant = self.skills_root.parent / "variants" / "alpha" / "codex"
+        variant.mkdir(parents=True)
+        (variant / "variant.yaml").write_text(
+            "version: 1\ntarget: codex\nmode: overlay\n",
+            encoding="utf-8",
+        )
+        (variant / "client.txt").write_text("client\n", encoding="utf-8")
+        resolution = resolve_variant_for_client(
+            self.skill,
+            variant.parent,
+            "codex",
+        )
+        layered = render_layered_deployment(
+            resolution,
+            self.data_root / "rendered",
+            "alpha",
+        )
+        self.destination.unlink()
+        create_directory_link(layered.path, self.destination)
+        self.deployment = layered.path
+        self.tamper_authored_content()
+
+        preview = edit_recover(
+            "alpha",
+            client="codex",
+            config_path=self.config_path,
+        )
+        self.assertEqual(preview["resolver_version"], "variant-overlay-v2")
+        self.assertEqual(preview["applied_layers"], ["base", "family-client:codex"])
+        self.assertEqual(preview["allowed_actions"], ["discard"])
+
+        with self.assertRaises(SkillSyncError) as raised:
+            edit_recover(
+                "alpha",
+                client="codex",
+                action="capture",
+                config_path=self.config_path,
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "edit_recovery_scoped_capture_unsupported",
+        )
+        self.assertEqual(self.receipts(), [])
+
+        result = edit_recover(
+            "alpha",
+            client="codex",
+            action="discard",
+            config_path=self.config_path,
+        )
+        self.assertEqual(result["status"], "discarded")
+        verification = verify_deployment(self.deployment)
+        self.assertTrue(verification.ok)
+        self.assertEqual(verification.provenance["schema_version"], 2)
+        self.assertEqual(
+            (self.deployment / "client.txt").read_text(encoding="utf-8"),
+            "client\n",
+        )
 
     def test_active_applying_and_needs_recovery_sessions_block_recovery_actions(self):
         self.tamper_authored_content()

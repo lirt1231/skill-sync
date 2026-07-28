@@ -18,8 +18,7 @@
   "forbidden_agent_writes": [
     "$CANONICAL/**",
     "$DEPLOYMENT/**",
-    "$KIMI_CODE_SKILLS_DIR/alpha/**",
-    "$KIMI_DESKTOP_SKILLS_DIR/alpha/**"
+    "$KIMI_CODE_SKILLS_DIR/alpha/**"
   ],
   "forbidden_implicit_actions": [
     "git commit",

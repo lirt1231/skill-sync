@@ -103,8 +103,10 @@ Text mode remains intended for interactive use and keeps its concise output.
 
 ### Create and inspect Variant sources
 
-The complete current model, safety invariants, and migration limits are in
+The complete current model and safety invariants are in
 [Variant Resolution Architecture](docs/architecture/variant-resolution.md).
+Upgrade, rollback, and multi-device procedures are in
+[Registry v3 Migration](docs/registry-v3-migration.md).
 
 Portable client differences live beside the canonical Skill root. With the
 default `~/.agents/skills` root, Variant sources are stored under
@@ -117,7 +119,7 @@ overlay, then inspect it:
 
 ```bash
 skill-sync variant create my-skill --family kimi
-skill-sync variant create my-skill --client kimi-desktop
+skill-sync variant create my-skill --client kimi-code
 skill-sync variant list
 skill-sync variant list --skill my-skill --json
 skill-sync variant validate my-skill
@@ -125,10 +127,12 @@ skill-sync variant validate my-skill
 
 `variant create` atomically creates only a minimal `variant.yaml`; it does not
 copy the Base Skill, resolve an overlay, rebuild a deployment, alter Agent
-links, update the registry, or invoke Git. A minimal overlay with no content
-files is valid. Family and client flags are mutually exclusive and checked
-against the static client registry. An existing target, unsafe path, linked
-source, or case-insensitive name ambiguity is a stop condition.
+links, or invoke Git. It records the target in portable registry schema v3;
+source publication and registry update share one rollback boundary. A minimal
+overlay with no content files is valid. Family and client flags are mutually
+exclusive and checked against the static client registry. An existing target,
+unsafe path, linked source, or case-insensitive name ambiguity is a stop
+condition.
 
 `variant list` and `variant validate` are fully local and read-only. They
 cross-check each discovered or requested Variant Skill against a real,
@@ -145,9 +149,9 @@ Inspect one resolved client view, or compare it with the authored Base, without
 creating a rendered directory:
 
 ```bash
-skill-sync resolve my-skill --client kimi-desktop --dry-run
+skill-sync resolve my-skill --client kimi-code --dry-run
 skill-sync resolve my-skill --client codex --dry-run --json
-skill-sync diff my-skill --base --client kimi-desktop
+skill-sync diff my-skill --base --client kimi-code
 skill-sync diff my-skill --base --client claude-code --json
 ```
 
@@ -163,12 +167,18 @@ metadata-only when that budget is exhausted.
 Neither command materializes a deployment, changes source/config/registry
 state, invokes Git, fetches, commits, or pushes.
 
-Through roadmap 7.6, Variant support is limited to local source management and
-read-only inspection. Normal `sync`, `pull`, `push`, `link`, deployment, Web,
-and Base edit-session flows do not yet synchronize, deploy, or edit Variant
-sources. There is no `resolve --output` or `variant delete` command. Treat these
-as explicit migration limits until the later registry, multi-device,
-deployment, and scoped-edit commits land.
+Variant support includes local source management, read-only resolution
+inspection, transactional family/client edit sessions, content-addressed
+layered deployments, and portable multi-device synchronization. Creating or
+first publishing a Variant lazily upgrades the portable registry to schema v3
+and records sorted target intent. Existing v1/v2 registries remain unchanged
+until that point. A v3 `push` packages only registry-declared Variant targets;
+`pull` reconstructs them below the receiving machine's locally configured
+portable root. `preview` and `status` report Base and Variant sync units
+separately. Different units can merge during `sync`, while simultaneous local
+and remote changes to the same unit stop before fast-forward or source writes.
+No sync path automatically pushes local changes. Web Variant views are not yet
+implemented, and there is no `resolve --output` or `variant delete` command.
 
 Before migrating existing Agent links away from editable canonical sources,
 preview every affected Skill/client pair, perform the migration, and inspect
@@ -233,13 +243,35 @@ skill-sync edit impact <session-id>
 skill-sync edit apply <session-id>
 ```
 
-`diff` shows authored file changes. `validate` rejects unsafe paths, links,
-invalid `SKILL.md` content, and stale or damaged session data. `impact` is a
-read-only preview of the concrete clients whose rendered deployments need to
-change; do not apply when it reports `Blocked: yes`. `apply` rechecks the
-baseline and workspace, replaces the canonical Base transactionally, rebuilds
-only affected enabled and detected client deployments, verifies them, and
-switches their Agent links as one operation.
+To prepare an isolated authored Variant-layer workspace, choose exactly one
+registered family or concrete client:
+
+```bash
+skill-sync edit begin my-skill --family kimi --actor kimi-code
+skill-sync edit begin my-skill --client codex --actor codex
+```
+
+An existing Variant session contains only that authored overlay layer, never a
+copy of Base or a resolved deployment. If the Variant does not exist, the
+baseline and workspace contain only a minimal `variant.yaml`; begin and abort
+do not create the canonical Variant source. `edit diff` reports both the
+authored-layer diff and each affected client's resolved diff, `edit validate`
+checks the overlay in client context, and `edit impact` distinguishes Base,
+Family, and Client blast radius. Use
+`edit diff <session-id> --resolved-client <id>` to limit a Family preview to
+one affected concrete client.
+
+`diff` shows authored file changes and, for a Variant scope, resolved client
+changes. `validate` rejects unsafe paths, links, invalid Base `SKILL.md` content,
+and invalid Variant manifests or overlays. `impact` is a read-only preview of
+the concrete clients whose resolved output would change; do not apply when it
+reports `Blocked: yes`. `apply` rechecks the authored-layer baseline and
+workspace, replaces or first publishes exactly that Base/Family/Client source
+transactionally, rebuilds only affected enabled and detected client
+deployments, verifies them, and switches their Agent links as one operation.
+A Base edit preserves applicable Variant layers; a Family edit such as `kimi`
+affects Kimi Code; an exact Client edit affects only that client. Unaffected
+clients are neither rebuilt nor relinked.
 
 Use these inspection and cancellation commands when needed:
 
@@ -298,16 +330,18 @@ Then choose exactly one explicit action:
 # Preserve the authored changes in a new active Base edit session.
 skill-sync edit recover my-skill --client codex --capture
 
-# Discard the authored changes and rebuild the deployment from canonical Base.
+# Discard the authored changes and rebuild from current canonical layers.
 skill-sync edit recover my-skill --client codex --discard
 ```
 
 `--capture` does not apply the tampered files directly. It copies safe authored
 content into a new writable workspace; continue with `edit diff`, `validate`,
 `impact`, and `apply` using the returned session ID. `--discard` quarantines
-the tampered deployment, rebuilds it from canonical content, and preserves the
-existing verified Agent link. Both actions write a local recovery receipt but
-perform no Git operation.
+the tampered deployment, rebuilds it from current canonical Base/Variant
+content, and preserves the existing verified Agent link. Capturing a layered
+deployment is blocked until a scoped recovery workflow can attribute changes to
+one authored layer; its preview offers `discard` only. Both supported actions
+write a local recovery receipt but perform no Git operation.
 
 Capture and discard fail closed when another unfinished session or ambiguous
 receipt/recovery state exists. They recover one tampered concrete-client
@@ -365,7 +399,7 @@ repository, so it does not need to be selected again on each computer.
 
 - Codex: `${CODEX_HOME:-~/.codex}/skills`
 - WorkBuddy: `${WORKBUDDY_HOME:-~/.workbuddy}/skills`
-- Kimi: detects Kimi Code at `$KIMI_CODE_SKILLS_DIR` or `~/.config/agents/skills`, and Kimi Desktop at `$KIMI_DESKTOP_SKILLS_DIR` or `~/Library/Application Support/kimi-desktop/daimon-share/daimon/skills`
+- Kimi Code: `$KIMI_CODE_SKILLS_DIR` or `~/.config/agents/skills`
 - Claude Code: `${CLAUDE_HOME:-~/.claude}/skills`
 
 On macOS/Linux the links are symbolic links. On Windows the tool first tries a directory symbolic link and falls back to a directory junction. Windows `.lnk` shortcuts are intentionally unsupported.

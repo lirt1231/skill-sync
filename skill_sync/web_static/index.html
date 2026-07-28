@@ -8,8 +8,12 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+  <section id="initial-loading" class="initial-loading" role="status" aria-live="polite">
+    <i class="ri-loader-4-line" aria-hidden="true"></i>
+    <strong>正在读取本地状态…</strong>
+  </section>
   <section id="setup" class="setup hidden" aria-labelledby="setup-title">
-    <div class="setup-brand"><span class="brand-mark"><i class="ri-triangle-line"></i></span><strong>Skill Sync</strong></div>
+    <div class="setup-brand"><span class="brand-mark"><i class="ri-triangle-line" aria-hidden="true"></i></span><strong>Skill Sync</strong></div>
     <h1 id="setup-title">让你的 Skills 跟着你走</h1>
     <p>连接一个私有 Git 仓库，在所有 Agent 之间安全同步。</p>
     <form id="setup-form">
@@ -38,31 +42,36 @@
         <div class="sync-strip">
           <div class="health-icon"><i class="ri-check-line"></i></div>
           <div><strong id="sync-label">一切正常</strong><p id="sync-summary"></p></div>
-          <button id="sync" class="primary"><i class="ri-loop-right-line"></i><span>立即同步</span></button>
+          <div class="sync-strip-actions">
+            <button id="repair-all" class="secondary-action"><i class="ri-tools-line"></i><span>一键修复</span></button>
+            <button id="sync" class="primary"><i class="ri-loop-right-line"></i><span>立即同步</span></button>
+          </div>
         </div>
         <div id="issue-list" class="issue-list hidden"></div>
         <section class="library-surface">
+          <div id="status-tabs" class="status-tabs" role="group" aria-label="按同步状态查看">
+            <button id="status-synced" class="status-tab active" type="button" aria-pressed="true"><span>已同步</span><b id="status-synced-count">0</b></button>
+            <button id="status-changed" class="status-tab" type="button" aria-pressed="false"><span>本地待推送</span><b id="status-changed-count">0</b></button>
+            <button id="status-local" class="status-tab" type="button" aria-pressed="false"><span>没有加入同步</span><b id="status-local-count">0</b></button>
+          </div>
           <div class="table-tools">
             <label id="search-wrap" class="search-wrap"><i class="ri-search-line"></i><input id="search" type="search" placeholder="搜索名称或 description" aria-label="搜索 Skill"></label>
             <div class="inventory-filters" role="group" aria-label="筛选 Skill">
-              <label class="filter-control"><span>同步状态</span><select id="sync-filter" aria-label="按同步状态筛选"></select></label>
               <label class="filter-control"><span>来源</span><select id="source-filter" aria-label="按来源筛选"></select></label>
               <label class="filter-control"><span>Agent</span><select id="agent-filter" aria-label="按 Agent 筛选"></select></label>
               <button id="clear-filters" type="button">清除筛选</button>
             </div>
             <span id="visible-count" class="visible-count" aria-live="polite"></span>
           </div>
-          <div class="skill-table-head"><input id="select-all-checkbox" type="checkbox" aria-label="全选可见项"><span>技能名称</span><span>Agent 覆盖</span><span>状态</span><span></span></div>
+          <div class="skill-table-head"><input id="select-all-checkbox" type="checkbox" aria-label="全选可见项"><span>Skill / 来源</span><span>客户端覆盖</span><span>状态</span><span></span></div>
           <div id="skill-list" class="skill-list"></div>
         </section>
         <div id="selection-bar" class="selection-bar hidden">
           <strong><span id="selection-count">0</span> 项已选择</strong>
           <button id="select-selected"><i class="ri-loop-right-line"></i><span>更新同步</span></button>
-          <button id="deselect-selected" class="hidden" tabindex="-1">取消同步</button>
           <div class="copy-control"><button id="copy-selected"><i class="ri-file-copy-line"></i>复制到</button><select id="copy-agent" aria-label="复制目标 Agent"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="workbuddy">WorkBuddy</option></select></div>
           <details class="more-menu"><summary><i class="ri-more-line"></i>更多</summary><div><button id="link-selected">修复链接</button><button id="delete-selected" class="danger">删除所选</button></div></details>
           <button id="clear-selection" class="icon-button" aria-label="取消选择"><i class="ri-close-line"></i></button>
-          <button id="select-all" class="visually-hidden">全选可见项</button>
         </div>
       </section>
 
@@ -82,15 +91,24 @@
       </section>
     </main>
 
-    <aside id="detail-drawer" class="detail-drawer hidden" role="dialog" aria-modal="true" aria-labelledby="detail-name" tabindex="-1">
+    <aside id="detail-drawer" class="detail-drawer hidden" aria-labelledby="detail-name">
       <button id="close-detail" class="icon-button drawer-close" aria-label="关闭详情"><i class="ri-close-line"></i></button>
       <div class="detail-icon"><i class="ri-file-text-line"></i></div>
       <h2 id="detail-name"></h2><p id="detail-status" class="detail-status"></p>
       <p id="detail-description" class="detail-description"></p>
-      <section><h3>概览</h3><dl><div><dt>来源</dt><dd>全局库</dd></div><div><dt>同步状态</dt><dd id="detail-sync"></dd></div></dl></section>
-      <section><h3>Agent 覆盖</h3><div id="detail-agents"></div></section>
+      <section><h3>概览</h3><dl><div><dt>来源</dt><dd>全局库</dd></div><div><dt>同步状态</dt><dd id="detail-sync"></dd></div><div><dt>内容版本</dt><dd><code id="detail-hash"></code></dd></div></dl></section>
+      <section><h3>客户端差异</h3><div id="detail-variants" class="detail-stack"></div></section>
+      <section>
+        <div class="detail-section-heading"><h3>编辑会话</h3><button id="detail-edit-start" type="button"><i class="ri-edit-line"></i>开始编辑</button></div>
+        <div id="detail-sessions" class="detail-stack"></div>
+      </section>
+      <section><h3>客户端部署</h3><div id="detail-deployments" class="deployment-matrix"></div></section>
+      <section><h3>客户端覆盖</h3><div id="detail-agents"></div></section>
       <section><h3>位置</h3><code id="detail-path"></code></section>
-      <button id="detail-backup">创建本地备份</button>
+      <div class="detail-actions">
+        <button id="detail-repair" class="primary hidden"><i class="ri-tools-line"></i>一键修复部署</button>
+        <button id="detail-backup">创建本地备份</button>
+      </div>
     </aside>
   </div>
   <section id="mutation-layer" class="mutation-layer hidden" aria-hidden="true">
@@ -109,12 +127,36 @@
       <footer class="mutation-actions">
         <button id="mutation-cancel" type="button">取消</button>
         <button id="mutation-retry" type="button" class="hidden">重新规划</button>
+        <button id="mutation-partial" type="button" class="primary hidden">只修复可安全处理的客户端</button>
         <button id="mutation-confirm" type="button" class="primary">确认执行</button>
+      </footer>
+    </article>
+  </section>
+  <section id="edit-layer" class="mutation-layer hidden" aria-hidden="true">
+    <div class="mutation-backdrop"></div>
+    <article id="edit-dialog" class="mutation-dialog edit-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-title" tabindex="-1">
+      <button id="edit-close" class="icon-button mutation-close" type="button" aria-label="关闭编辑会话操作"><i class="ri-close-line"></i></button>
+      <p id="edit-status" class="mutation-status"></p>
+      <h2 id="edit-title">开始托管编辑</h2>
+      <p id="edit-summary" class="mutation-summary"></p>
+      <fieldset id="edit-scope" class="edit-scope">
+        <legend>修改范围</legend>
+        <label><input type="radio" name="edit-scope" value="base" checked><span><strong>全部客户端</strong><small>修改 Base，共享给所有客户端</small></span></label>
+        <label><input type="radio" name="edit-scope" value="family"><span><strong>客户端系列</strong><small>修改一个系列共用的差异层</small></span></label>
+        <label><input type="radio" name="edit-scope" value="client"><span><strong>单个客户端</strong><small>只修改一个具体客户端</small></span></label>
+        <label id="edit-target-wrap" class="edit-target hidden"><span id="edit-target-label">目标</span><select id="edit-target"></select></label>
+      </fieldset>
+      <div id="edit-confirm-details" class="edit-confirm-details hidden"></div>
+      <section id="edit-result" class="mutation-result hidden" aria-live="polite"></section>
+      <footer class="mutation-actions">
+        <button id="edit-cancel" type="button">取消</button>
+        <button id="edit-confirm" type="button" class="primary">下一步</button>
       </footer>
     </article>
   </section>
   <section id="load-failure" class="load-failure hidden" role="alert"><strong>无法加载 Skill Sync 状态</strong><button id="retry-load">重新加载</button></section>
   <div id="toast" role="status" aria-live="polite"></div>
+  <button id="toast-close" class="toast-close hidden" type="button" aria-label="关闭错误提示"><i class="ri-close-line" aria-hidden="true"></i></button>
   <script src="/app.js"></script>
 </body>
 </html>

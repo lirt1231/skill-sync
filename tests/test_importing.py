@@ -331,35 +331,27 @@ class ImportAgentSkillsTest(unittest.TestCase):
                 link_skills(agent_names=["codex"], config_path=self.config_path)
             self.assertEqual(enable_agent_sync("codex", config_path=self.config_path)["enabled"], "codex")
 
-    def test_kimi_link_uses_all_detected_skill_directories_and_accepts_split_targets(self):
+    def test_kimi_link_uses_kimi_code_directory_and_accepts_client_target(self):
         destination = self.write_skill(self.global_root, "alpha")
         code_root = self.root / "kimi-code" / "skills"
-        desktop_root = self.root / "kimi-desktop" / "skills"
         save_registry(self.repo / "registry.yaml", {
             "version": 2,
             "skills": {
                 "alpha": {
                     "selected": True,
                     "display_name": "alpha",
-                    "targets": "kimi-code,kimi-desktop",
+                    "targets": "kimi-code",
                 }
             },
         })
         clients = [
             AgentClient("kimi-code", "kimi", "Kimi Code", code_root, True),
-            AgentClient(
-                "kimi-desktop", "kimi", "Kimi Desktop", desktop_root, True
-            ),
         ]
 
         with mock.patch("skill_sync.core.detect_clients", return_value=clients):
             result = link_skills(agent_names=["kimi"], config_path=self.config_path)
 
-        self.assertEqual(len(result["links"]), 2)
+        self.assertEqual(len(result["links"]), 1)
         code_target = (code_root / "alpha").resolve()
-        desktop_target = (desktop_root / "alpha").resolve()
         self.assertNotEqual(code_target, destination.resolve())
-        self.assertNotEqual(desktop_target, destination.resolve())
-        self.assertNotEqual(code_target, desktop_target)
         self.assertTrue((code_target / ".skill-sync-provenance.json").is_file())
-        self.assertTrue((desktop_target / ".skill-sync-provenance.json").is_file())

@@ -5,7 +5,10 @@ from pathlib import Path
 from unittest import mock
 
 from skill_sync.config import empty_config, save_config
+from skill_sync.edit_session import EditSessionStore
 from skill_sync.errors import SkillSyncError
+from skill_sync.hash import hash_skill_dir
+from skill_sync.registry import load_registry, save_registry
 
 try:
     from skill_sync import variant_source
@@ -22,17 +25,43 @@ class VariantSourceTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.skills_root = self.root / "portable" / "skills"
         self.variants_root = self.root / "portable" / "variants"
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
         self.config_path = self.root / "config.json"
         config = empty_config()
         config["skills_root"] = str(self.skills_root)
+        config["data_root"] = str(self.root / "data")
+        config["sync_repo_path"] = str(self.repo)
         save_config(self.config_path, config)
         self.make_skill("alpha")
+        save_registry(
+            self.repo / "registry.yaml",
+            {
+                "version": 2,
+                "skills": {
+                    "alpha": {
+                        "selected": True,
+                        "display_name": "alpha",
+                        "targets": "codex,workbuddy,kimi,claude",
+                    }
+                },
+            },
+        )
 
     def make_skill(self, name: str) -> Path:
         skill = self.skills_root / name
         skill.mkdir(parents=True)
         (skill / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
         (skill / "base-only.txt").write_text("base\n", encoding="utf-8")
+        registry_path = self.repo / "registry.yaml"
+        if registry_path.exists():
+            registry = load_registry(registry_path)
+            registry["skills"][name] = {
+                "selected": True,
+                "display_name": name,
+                "targets": "codex,workbuddy,kimi,claude",
+            }
+            save_registry(registry_path, registry)
         return skill
 
     def make_variant(self, skill: str, target: str = "kimi") -> Path:
@@ -73,8 +102,11 @@ class VariantSourceTest(unittest.TestCase):
         self.assertEqual(result["skill"], "alpha")
         self.assertEqual(result["scope"], "family")
         self.assertEqual(result["target"], "kimi")
-        self.assertEqual(result["affected_clients"], ["kimi-code", "kimi-desktop"])
+        self.assertEqual(result["affected_clients"], ["kimi-code"])
         self.assertEqual(result["resolution_order"], ["base", "family:kimi", "client-specific"])
+        registry = load_registry(self.repo / "registry.yaml")
+        self.assertEqual(registry["version"], 3)
+        self.assertEqual(registry["skills"]["alpha"]["variants"], "kimi")
         self.assertEqual(self.snapshot(self.skills_root / "alpha"), base_before)
         self.assertEqual(self.config_path.read_bytes(), config_before)
 
@@ -82,21 +114,55 @@ class VariantSourceTest(unittest.TestCase):
         result = variant_source.create_variant(
             "alpha",
             scope="client",
-            target="kimi-desktop",
+            target="kimi-code",
             config_path=self.config_path,
         )
 
         self.assertEqual(result["scope"], "client")
         self.assertEqual(result["family"], "kimi")
-        self.assertEqual(result["affected_clients"], ["kimi-desktop"])
+        self.assertEqual(result["affected_clients"], ["kimi-code"])
         self.assertEqual(
             result["resolution_order"],
-            ["base", "family:kimi", "client:kimi-desktop"],
+            ["base", "family:kimi", "client:kimi-code"],
         )
+        self.assertEqual(
+            load_registry(self.repo / "registry.yaml")["skills"]["alpha"]["variants"],
+            "kimi-code",
+        )
+
+    def test_create_refuses_an_unfinished_edit_session_for_the_skill(self):
+        store = EditSessionStore(self.root / "data")
+        source = self.skills_root / "alpha"
+        metadata, _ = store.begin(
+            logical_skill="alpha",
+            source=source,
+            baseline_hash=hash_skill_dir(source),
+        )
+
+        with self.assertRaises(SkillSyncError) as raised:
+            variant_source.create_variant(
+                "alpha",
+                scope="family",
+                target="kimi",
+                config_path=self.config_path,
+            )
+
+        self.assertEqual(raised.exception.code, "active_edit_session")
+        self.assertEqual(raised.exception.details["session_id"], metadata.session_id)
+        self.assertFalse((self.variants_root / "alpha" / "kimi").exists())
+
+        store.abort(metadata.session_id)
+        created = variant_source.create_variant(
+            "alpha",
+            scope="family",
+            target="kimi",
+            config_path=self.config_path,
+        )
+        self.assertTrue(Path(created["path"]).is_dir())
 
     def test_family_and_client_names_are_validated_against_their_own_registry(self):
         cases = (
-            ("family", "kimi-desktop"),
+            ("family", "kimi-code"),
             ("client", "kimi"),
             ("family", "mystery"),
             ("client", "mystery"),
@@ -133,6 +199,26 @@ class VariantSourceTest(unittest.TestCase):
                 "alpha", scope="family", target="kimi", config_path=self.config_path
             )
         self.assertEqual(manifest.read_bytes(), before)
+
+    def test_create_rolls_back_source_when_registry_upgrade_fails(self):
+        registry_before = (self.repo / "registry.yaml").read_bytes()
+
+        with mock.patch.object(
+            variant_source,
+            "save_registry",
+            side_effect=OSError("registry write failed"),
+        ):
+            with self.assertRaises(SkillSyncError) as raised:
+                variant_source.create_variant(
+                    "alpha",
+                    scope="family",
+                    target="kimi",
+                    config_path=self.config_path,
+                )
+
+        self.assertEqual(raised.exception.code, "variant_registry_update_failed")
+        self.assertFalse((self.variants_root / "alpha" / "kimi").exists())
+        self.assertEqual((self.repo / "registry.yaml").read_bytes(), registry_before)
 
         self.make_skill("beta")
         with mock.patch.object(
@@ -222,7 +308,7 @@ class VariantSourceTest(unittest.TestCase):
 
     def test_list_and_validate_are_deterministic_read_only_and_accept_empty_overlay(self):
         variant_source.create_variant(
-            "alpha", scope="client", target="kimi-desktop", config_path=self.config_path
+            "alpha", scope="client", target="kimi-code", config_path=self.config_path
         )
         variant_source.create_variant(
             "alpha", scope="family", target="kimi", config_path=self.config_path
@@ -232,7 +318,7 @@ class VariantSourceTest(unittest.TestCase):
         listed = variant_source.list_variants(skill="alpha", config_path=self.config_path)
         validated = variant_source.validate_variants("alpha", config_path=self.config_path)
 
-        self.assertEqual([item["target"] for item in listed["variants"]], ["kimi", "kimi-desktop"])
+        self.assertEqual([item["target"] for item in listed["variants"]], ["kimi", "kimi-code"])
         self.assertTrue(validated["valid"])
         self.assertEqual(validated["variant_count"], 2)
         self.assertEqual(validated["issues"], [])

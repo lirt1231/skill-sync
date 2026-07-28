@@ -3,7 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from skill_sync.variant import VariantManifest, load_variant_manifest
+from skill_sync.variant import (
+    VariantManifest,
+    build_minimal_variant_manifest,
+    load_variant_manifest,
+)
 
 
 class VariantManifestTest(unittest.TestCase):
@@ -32,6 +36,14 @@ class VariantManifestTest(unittest.TestCase):
                 delete=("references/claude-tools.md",),
             ),
         )
+
+    def test_builds_the_canonical_minimal_overlay_manifest(self):
+        self.assertEqual(
+            build_minimal_variant_manifest("kimi-code"),
+            b"version: 1\ntarget: kimi-code\nmode: overlay\n",
+        )
+        with self.assertRaisesRegex(ValueError, "Unknown variant target"):
+            build_minimal_variant_manifest("mystery")
 
     def test_loads_multiple_delete_paths_in_deterministic_order(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -83,7 +95,7 @@ class VariantManifestTest(unittest.TestCase):
             manifest_path = self.write_manifest(
                 Path(tmp_dir),
                 "version: 1\ntarget: kimi\nmode: overlay\n",
-                target="kimi-desktop",
+                target="kimi-code",
             )
 
             with self.assertRaisesRegex(ValueError, "directory"):

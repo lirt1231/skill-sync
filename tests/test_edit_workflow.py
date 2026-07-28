@@ -8,7 +8,7 @@ from unittest import mock
 
 import skill_sync.edit_session as edit_session_module
 from skill_sync.config import empty_config, save_config
-from skill_sync.core import edit_abort, edit_begin
+from skill_sync.core import edit_abort, edit_begin, edit_session_paths
 from skill_sync.edit_session import EditSessionStatus, EditSessionStore
 from skill_sync.errors import SkillSyncError
 from skill_sync.hash import hash_skill_dir
@@ -81,6 +81,17 @@ class EditWorkflowTest(unittest.TestCase):
         self.assertEqual((baseline / "SKILL.md").read_text(), "# alpha\n")
         self.assertEqual((workspace / "SKILL.md").read_text(), "# changed in workspace\n")
         self.assertEqual((self.skill / "SKILL.md").read_text(), "# changed directly\n")
+
+    def test_session_status_returns_stable_absolute_workspace_paths(self):
+        started = edit_begin("alpha", config_path=self.config_path)
+
+        status = edit_session_paths(
+            started["session_id"], config_path=self.config_path
+        )
+
+        self.assertEqual(status["baseline_path"], started["baseline_path"])
+        self.assertEqual(status["workspace_path"], started["workspace_path"])
+        self.assertTrue(Path(status["workspace_path"]).is_absolute())
 
     @unittest.skipIf(os.name == "nt", "POSIX mode bits are not portable to Windows")
     def test_begin_makes_baseline_private_read_only_and_workspace_private_writable(self):

@@ -36,24 +36,24 @@ class VariantResolutionTests(unittest.TestCase):
         resolution = resolve_variant_for_client(
             self.base,
             self.variants,
-            "kimi-desktop",
+            "kimi-code",
         )
 
         self.assertIsInstance(resolution, LayeredVariantResolution)
         self.assertEqual(resolution.resolver_version, VARIANT_RESOLVER_VERSION)
-        self.assertEqual(resolution.target_client, "kimi-desktop")
+        self.assertEqual(resolution.target_client, "kimi-code")
         self.assertEqual(resolution.family, "kimi")
         self.assertEqual(
             [(layer.role, layer.target) for layer in resolution.layers],
             [
                 ("base", None),
                 ("family", "kimi"),
-                ("client", "kimi-desktop"),
+                ("client", "kimi-code"),
             ],
         )
         self.assertEqual(
             resolution.applied_variant_targets,
-            ("kimi", "kimi-desktop"),
+            ("kimi", "kimi-code"),
         )
         self.assertEqual(resolution.layers[1].delete, ("references/remove.md",))
         self.assertEqual(resolution.layers[2].delete, ("references/family.md",))
@@ -61,7 +61,7 @@ class VariantResolutionTests(unittest.TestCase):
             entry.relative_path: entry.content
             for entry in resolution.overlay_plan.files
         }
-        self.assertEqual(files["SKILL.md"], b"# Kimi Desktop\n")
+        self.assertEqual(files["SKILL.md"], b"# Kimi Code\n")
         self.assertNotIn("references/family.md", files)
         self.assertNotIn("references/remove.md", files)
 
@@ -107,7 +107,7 @@ class VariantResolutionTests(unittest.TestCase):
         )
 
     def test_hashes_are_deterministic_and_machine_paths_are_not_an_input(self) -> None:
-        first = resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
+        first = resolve_variant_for_client(self.base, self.variants, "kimi-code")
         copied_root = self.root / "other-machine"
         copied_base = copied_root / "skills" / "demo"
         copied_variants = copied_root / "variants" / "demo"
@@ -117,7 +117,7 @@ class VariantResolutionTests(unittest.TestCase):
         second = resolve_variant_for_client(
             copied_base,
             copied_variants,
-            "kimi-desktop",
+            "kimi-code",
         )
 
         self.assertEqual(
@@ -129,82 +129,127 @@ class VariantResolutionTests(unittest.TestCase):
         self.assertNotEqual(first.layers[0].source_path, second.layers[0].source_path)
 
     def test_changing_one_client_variant_changes_only_that_client_resolution(self) -> None:
-        desktop_before = resolve_variant_for_client(
-            self.base,
-            self.variants,
-            "kimi-desktop",
-        )
-        code_before = resolve_variant_for_client(
+        exact_before = resolve_variant_for_client(
             self.base,
             self.variants,
             "kimi-code",
         )
-
-        desktop_skill = self.variants / "kimi-desktop" / "SKILL.md"
-        desktop_skill.write_text("# Kimi Desktop changed\n", encoding="utf-8")
-
-        desktop_after = resolve_variant_for_client(
+        unaffected_before = resolve_variant_for_client(
             self.base,
             self.variants,
-            "kimi-desktop",
+            "codex",
         )
-        code_after = resolve_variant_for_client(
+
+        client_skill = self.variants / "kimi-code" / "SKILL.md"
+        client_skill.write_text("# Kimi Code changed\n", encoding="utf-8")
+
+        exact_after = resolve_variant_for_client(
             self.base,
             self.variants,
             "kimi-code",
+        )
+        unaffected_after = resolve_variant_for_client(
+            self.base,
+            self.variants,
+            "codex",
         )
 
         self.assertNotEqual(
-            desktop_before.resolution_hash,
-            desktop_after.resolution_hash,
+            exact_before.resolution_hash,
+            exact_after.resolution_hash,
         )
-        self.assertNotEqual(desktop_before.output_hash, desktop_after.output_hash)
-        self.assertEqual(code_before.resolution_hash, code_after.resolution_hash)
-        self.assertEqual(code_before.output_hash, code_after.output_hash)
+        self.assertNotEqual(exact_before.output_hash, exact_after.output_hash)
+        self.assertEqual(unaffected_before.resolution_hash, unaffected_after.resolution_hash)
+        self.assertEqual(unaffected_before.output_hash, unaffected_after.output_hash)
         self.assertEqual(
-            [layer.content_hash for layer in desktop_before.layers[:2]],
-            [layer.content_hash for layer in desktop_after.layers[:2]],
+            [layer.content_hash for layer in exact_before.layers[:2]],
+            [layer.content_hash for layer in exact_after.layers[:2]],
         )
         self.assertNotEqual(
-            desktop_before.layers[2].content_hash,
-            desktop_after.layers[2].content_hash,
+            exact_before.layers[2].content_hash,
+            exact_after.layers[2].content_hash,
         )
+
+    def test_workspace_override_uses_manifest_target_instead_of_directory_name(self) -> None:
+        workspace = self.root / "edit-sessions" / "session-id" / "workspace"
+        shutil.copytree(self.variants / "kimi", workspace)
+        (workspace / "SKILL.md").write_text("# Proposed Kimi\n", encoding="utf-8")
+        shutil.rmtree(self.variants / "kimi-code")
+
+        current = resolve_variant_for_client(
+            self.base,
+            self.variants,
+            "kimi-code",
+        )
+        proposed = resolve_variant_for_client(
+            self.base,
+            self.variants,
+            "kimi-code",
+            override_target="kimi",
+            override_root=workspace,
+        )
+
+        self.assertNotEqual(current.resolution_hash, proposed.resolution_hash)
+        self.assertEqual(proposed.layers[1].target, "kimi")
+        self.assertEqual(proposed.layers[1].source_path, workspace.absolute())
+        self.assertEqual(
+            next(
+                entry.content
+                for entry in proposed.overlay_plan.files
+                if entry.relative_path == "SKILL.md"
+            ),
+            b"# Proposed Kimi\n",
+        )
+
+    def test_workspace_override_must_affect_the_requested_client(self) -> None:
+        workspace = self.root / "workspace"
+        shutil.copytree(self.variants / "kimi", workspace)
+
+        with self.assertRaisesRegex(ValueError, "does not affect client"):
+            resolve_variant_for_client(
+                self.base,
+                self.variants,
+                "codex",
+                override_target="kimi",
+                override_root=workspace,
+            )
 
     def test_target_client_is_part_of_resolution_hash(self) -> None:
-        shutil.rmtree(self.variants / "kimi-desktop")
+        shutil.rmtree(self.variants / "kimi-code")
+        shutil.rmtree(self.variants / "kimi")
 
         code = resolve_variant_for_client(self.base, self.variants, "kimi-code")
-        desktop = resolve_variant_for_client(
+        claude = resolve_variant_for_client(
             self.base,
             self.variants,
-            "kimi-desktop",
+            "claude-code",
         )
 
         self.assertEqual(
             [layer.content_hash for layer in code.layers],
-            [layer.content_hash for layer in desktop.layers],
+            [layer.content_hash for layer in claude.layers],
         )
-        self.assertEqual(code.output_hash, desktop.output_hash)
-        self.assertNotEqual(code.resolution_hash, desktop.resolution_hash)
+        self.assertEqual(code.output_hash, claude.output_hash)
+        self.assertNotEqual(code.resolution_hash, claude.resolution_hash)
 
     def test_ignored_noise_does_not_change_layer_or_resolution_hash(self) -> None:
-        before = resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
-        (self.variants / "kimi-desktop" / ".DS_Store").write_bytes(b"noise")
-        cache = self.variants / "kimi-desktop" / "__pycache__"
+        before = resolve_variant_for_client(self.base, self.variants, "kimi-code")
+        (self.variants / "kimi-code" / ".DS_Store").write_bytes(b"noise")
+        cache = self.variants / "kimi-code" / "__pycache__"
         cache.mkdir()
         (cache / "cache.pyc").write_bytes(b"noise")
 
-        after = resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
+        after = resolve_variant_for_client(self.base, self.variants, "kimi-code")
 
         self.assertEqual(before.layers, after.layers)
         self.assertEqual(before.output_hash, after.output_hash)
         self.assertEqual(before.resolution_hash, after.resolution_hash)
 
     def test_reserved_base_manifest_is_not_a_layer_hash_input(self) -> None:
-        before = resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
+        before = resolve_variant_for_client(self.base, self.variants, "kimi-code")
         (self.base / "variant.yaml").write_text("not a Base input\n", encoding="utf-8")
 
-        after = resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
+        after = resolve_variant_for_client(self.base, self.variants, "kimi-code")
 
         self.assertNotIn(
             "variant.yaml",
@@ -218,7 +263,7 @@ class VariantResolutionTests(unittest.TestCase):
         resolution = resolve_variant_for_client(
             self.base,
             self.variants,
-            "kimi-desktop",
+            "kimi-code",
         )
         destination = self.root / "rendered" / "demo"
 
@@ -230,10 +275,10 @@ class VariantResolutionTests(unittest.TestCase):
     def test_host_chmod_does_not_change_portable_resolution_identity(self) -> None:
         script = self.base / "scripts" / "shared.sh"
         script.chmod(0o644)
-        before = resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
+        before = resolve_variant_for_client(self.base, self.variants, "kimi-code")
 
         script.chmod(0o755)
-        after = resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
+        after = resolve_variant_for_client(self.base, self.variants, "kimi-code")
 
         before_file = next(
             entry
@@ -277,7 +322,7 @@ class VariantResolutionTests(unittest.TestCase):
             resolution = resolve_variant_for_client(
                 self.base,
                 self.variants,
-                "kimi-desktop",
+                "kimi-code",
             )
 
         self.assertEqual(skill_file.read_bytes(), original_content)
@@ -295,11 +340,11 @@ class VariantResolutionTests(unittest.TestCase):
         )
 
     def test_manifest_semantics_follow_exact_snapshot_during_forced_aba(self) -> None:
-        manifest_file = self.variants / "kimi-desktop" / "variant.yaml"
+        manifest_file = self.variants / "kimi-code" / "variant.yaml"
         original_content = manifest_file.read_bytes()
         snapshot_content = (
             b"version: 1\n"
-            b"target: kimi-desktop\n"
+            b"target: kimi-code\n"
             b"mode: overlay\n"
             b"delete: references/base.md\n"
         )
@@ -308,7 +353,7 @@ class VariantResolutionTests(unittest.TestCase):
 
         def snapshot_with_manifest_aba(root: Path):
             nonlocal client_reads
-            if root == self.variants / "kimi-desktop":
+            if root == self.variants / "kimi-code":
                 if client_reads == 0:
                     manifest_file.write_bytes(snapshot_content)
                 result = original_snapshot(root)
@@ -325,7 +370,7 @@ class VariantResolutionTests(unittest.TestCase):
             resolution = resolve_variant_for_client(
                 self.base,
                 self.variants,
-                "kimi-desktop",
+                "kimi-code",
             )
 
         self.assertEqual(manifest_file.read_bytes(), original_content)
@@ -347,10 +392,10 @@ class VariantResolutionTests(unittest.TestCase):
 
         def plan_then_add_client(*args, **kwargs):
             plan = original_plan(*args, **kwargs)
-            client = self.variants / "kimi-code"
+            client = self.variants / "claude-code"
             client.mkdir()
             (client / "variant.yaml").write_text(
-                "version: 1\ntarget: kimi-code\nmode: overlay\n",
+                "version: 1\ntarget: claude-code\nmode: overlay\n",
                 encoding="utf-8",
             )
             return plan
@@ -360,14 +405,14 @@ class VariantResolutionTests(unittest.TestCase):
             side_effect=plan_then_add_client,
         ):
             with self.assertRaisesRegex(ValueError, "selection changed"):
-                resolve_variant_for_client(self.base, self.variants, "kimi-code")
+                resolve_variant_for_client(self.base, self.variants, "claude-code")
 
     def test_rejects_selected_variant_replaced_during_resolution(self) -> None:
         original_plan = variant_resolution_module.plan_variant_overlay
 
         def plan_then_replace_client(*args, **kwargs):
             plan = original_plan(*args, **kwargs)
-            client = self.variants / "kimi-desktop"
+            client = self.variants / "kimi-code"
             replacement = self.root / "replacement"
             shutil.copytree(client, replacement)
             shutil.rmtree(client)
@@ -379,7 +424,7 @@ class VariantResolutionTests(unittest.TestCase):
             side_effect=plan_then_replace_client,
         ):
             with self.assertRaisesRegex(ValueError, "selection changed"):
-                resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
+                resolve_variant_for_client(self.base, self.variants, "kimi-code")
 
     def test_rejects_case_ambiguity_observed_by_final_selection_scan(self) -> None:
         initial_scan = variant_resolution_module._scan_variant_targets(self.variants)
@@ -399,10 +444,10 @@ class VariantResolutionTests(unittest.TestCase):
             side_effect=(initial_scan, ambiguous_scan),
         ):
             with self.assertRaisesRegex(ValueError, "case-insensitive"):
-                resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
+                resolve_variant_for_client(self.base, self.variants, "kimi-code")
 
     def test_resolution_read_model_is_immutable(self) -> None:
-        resolution = resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
+        resolution = resolve_variant_for_client(self.base, self.variants, "kimi-code")
 
         with self.assertRaises(dataclasses.FrozenInstanceError):
             resolution.provenance.target_client = "kimi-code"  # type: ignore[misc]
@@ -421,7 +466,7 @@ class VariantResolutionTests(unittest.TestCase):
         (self.variants / "kimi").rename(self.variants / "KIMI")
 
         with self.assertRaisesRegex(ValueError, "case-insensitive"):
-            resolve_variant_for_client(self.base, self.variants, "kimi-desktop")
+            resolve_variant_for_client(self.base, self.variants, "kimi-code")
 
 
 if __name__ == "__main__":

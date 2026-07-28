@@ -4,8 +4,9 @@ from pathlib import Path
 from unittest import mock
 
 from skill_sync.agents import AgentClient, AgentTarget
-from skill_sync.deployment import render_base_deployment
+from skill_sync.deployment import render_base_deployment, render_layered_deployment
 from skill_sync.ownership import OwnershipResult, inspect_ownership
+from skill_sync.variant_resolution import resolve_variant_for_client
 
 
 def make_skill(skills_root: Path, name: str) -> Path:
@@ -116,6 +117,62 @@ class OwnershipInspectionTest(unittest.TestCase):
         self.assertEqual(cached.role, "deployment")
         self.assertEqual(cached.state, "managed-deployment")
         self.assertTrue(cached.referenced)
+
+    def test_layered_agent_link_is_healthy_and_variant_changes_make_it_stale(self):
+        variant = self.skills_root.parent / "variants" / "alpha" / "codex"
+        variant.mkdir(parents=True)
+        (variant / "variant.yaml").write_text(
+            "version: 1\ntarget: codex\nmode: overlay\n",
+            encoding="utf-8",
+        )
+        (variant / "codex.txt").write_text("codex\n", encoding="utf-8")
+        resolution = resolve_variant_for_client(
+            self.alpha,
+            variant.parent,
+            "codex",
+        )
+        rendered_root = self.root / "data" / "rendered"
+        deployed = render_layered_deployment(resolution, rendered_root, "alpha")
+        destination = self.codex_root / "alpha"
+        destination.parent.mkdir(parents=True)
+        destination.symlink_to(deployed.path, target_is_directory=True)
+
+        healthy = self.inspect(destination, rendered_root=rendered_root)
+        self.assertTrue(healthy.healthy)
+        self.assertEqual(healthy.state, "managed-deployment")
+
+        (variant / "codex.txt").write_text("changed\n", encoding="utf-8")
+        stale = self.inspect(destination, rendered_root=rendered_root)
+        self.assertFalse(stale.healthy)
+        self.assertEqual(stale.state, "stale-render")
+
+    def test_new_variant_makes_existing_base_deployment_stale(self):
+        rendered_root = self.root / "data" / "rendered"
+        deployed = render_base_deployment(
+            self.alpha,
+            rendered_root,
+            "alpha",
+            "codex",
+        )
+        destination = self.codex_root / "alpha"
+        destination.parent.mkdir(parents=True)
+        destination.symlink_to(deployed.path, target_is_directory=True)
+
+        healthy = self.inspect(destination, rendered_root=rendered_root)
+        self.assertTrue(healthy.healthy)
+
+        variant = self.skills_root.parent / "variants" / "alpha" / "codex"
+        variant.mkdir(parents=True)
+        (variant / "variant.yaml").write_text(
+            "version: 1\ntarget: codex\nmode: overlay\n",
+            encoding="utf-8",
+        )
+        (variant / "codex.txt").write_text("codex\n", encoding="utf-8")
+
+        stale = self.inspect(destination, rendered_root=rendered_root)
+        self.assertFalse(stale.healthy)
+        self.assertEqual(stale.state, "stale-render")
+        self.assertTrue(stale.migration_required)
 
     def test_tampered_and_stale_deployments_fail_closed(self):
         rendered_root = self.root / "data" / "rendered"
@@ -251,11 +308,11 @@ class OwnershipInspectionTest(unittest.TestCase):
 
     def test_legacy_target_extra_directories_are_inspected(self):
         primary = self.root / "kimi-code" / "skills"
-        desktop = self.root / "kimi-desktop" / "skills"
-        destination = desktop / "alpha"
+        secondary = self.root / "secondary" / "skills"
+        destination = secondary / "alpha"
         destination.parent.mkdir(parents=True)
         destination.symlink_to(self.alpha, target_is_directory=True)
-        target = AgentTarget("kimi", "Kimi", primary, True, (desktop,))
+        target = AgentTarget("kimi", "Kimi", primary, True, (secondary,))
 
         result = inspect_ownership(
             destination,

@@ -1,8 +1,7 @@
 # Claude Code and Kimi Managed Edit Verification
 
 Date: 2026-07-16  
-Clients: Claude Code (`claude-code`), Kimi Code (`kimi-code`), and Kimi Desktop
-(`kimi-desktop`)
+Clients: Claude Code (`claude-code`) and Kimi Code (`kimi-code`)
 
 ## Scope
 
@@ -11,11 +10,10 @@ Skill directory semantics in an isolated home directory. They do not change
 the user's current global Skills or live Agent links.
 
 The local machine audit also confirmed that the live `skill-sync-manager`
-deployment is a healthy managed link in all three directories:
+deployment is a healthy managed link in both directories:
 
 - `~/.claude/skills/skill-sync-manager`
 - `~/.config/agents/skills/skill-sync-manager`
-- `~/Library/Application Support/kimi-desktop/daimon-share/daimon/skills/skill-sync-manager`
 
 ## Reproduced sequence
 
@@ -27,10 +25,9 @@ Every client fixture executes the same contract:
 4. Run `edit diff`, `edit validate`, and `edit impact`.
 5. Run the explicit `edit apply` action.
 
-Claude Code verifies one concrete deployment. Each Kimi run installs both
-Kimi Code and Kimi Desktop endpoints, starts from one concrete client path,
-and verifies that both endpoints stay unchanged before apply and switch to
-their own verified deployments after apply.
+Each run starts from one concrete client path and verifies that its endpoint
+stays unchanged before apply and switches to a verified deployment after
+apply.
 
 ## Verified boundaries
 

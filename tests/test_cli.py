@@ -315,7 +315,11 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(stderr, "")
         begin.assert_called_once_with(
-            "alpha", actor="codex", config_path="/tmp/config.json"
+            "alpha",
+            scope="base",
+            target=None,
+            actor="codex",
+            config_path="/tmp/config.json",
         )
         self.assertEqual(
             json.loads(stdout),
@@ -328,6 +332,94 @@ class CliTest(unittest.TestCase):
                 "errors": [],
             },
         )
+
+    def test_edit_begin_dispatches_family_and_client_scopes(self):
+        result = {
+            "session_id": "4f92500f-832f-40f7-a417-c474f0425ce0",
+            "skill": "alpha",
+            "scope": "family",
+            "target": "kimi",
+            "status": "active",
+            "actor": None,
+            "baseline_hash": "sha256:" + "a" * 64,
+            "baseline_path": "/data/edit-sessions/id/baseline",
+            "workspace_path": "/data/edit-sessions/id/workspace",
+            "affected_clients": ["kimi-code"],
+            "layer_baseline": {"state": "absent", "hash": None},
+        }
+        for option, scope, target in (
+            ("--family", "family", "kimi"),
+            ("--client", "client", "kimi-code"),
+        ):
+            with self.subTest(option=option), mock.patch.object(
+                cli.core, "edit_begin", return_value={**result, "scope": scope, "target": target}
+            ) as begin:
+                code, stdout, stderr = run_cli(
+                    ["edit", "begin", "alpha", option, target, "--json"]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            begin.assert_called_once_with(
+                "alpha",
+                scope=scope,
+                target=target,
+                actor=None,
+                config_path=None,
+            )
+            self.assertEqual(json.loads(stdout)["result"]["target"], target)
+
+    def test_edit_begin_requires_exactly_one_scope(self):
+        parser = cli._build_parser()
+        for arguments in (
+            ["edit", "begin", "alpha"],
+            ["edit", "begin", "alpha", "--base", "--client", "codex"],
+        ):
+            stderr = io.StringIO()
+            with (
+                self.subTest(arguments=arguments),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                parser.parse_args(arguments)
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("skill-sync edit begin", stderr.getvalue())
+
+    def test_edit_diff_dispatches_resolved_client_filter(self):
+        session_id = "4f92500f-832f-40f7-a417-c474f0425ce0"
+        result = {
+            "session_id": session_id,
+            "skill": "alpha",
+            "scope": "family",
+            "target": "kimi",
+            "status": "active",
+            "changed": False,
+            "summary": {"added": 0, "modified": 0, "deleted": 0, "total": 0},
+            "files": [],
+            "resolved_diffs": [],
+        }
+        with mock.patch.object(cli.core, "edit_diff", return_value=result) as diff:
+            code, stdout, stderr = run_cli(
+                [
+                    "--config",
+                    "/tmp/config.json",
+                    "edit",
+                    "diff",
+                    session_id,
+                    "--resolved-client",
+                    "kimi-code",
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        diff.assert_called_once_with(
+            session_id,
+            resolved_client="kimi-code",
+            config_path="/tmp/config.json",
+        )
+        self.assertEqual(json.loads(stdout)["result"], result)
 
     def test_edit_abort_dispatches_and_prints_human_summary(self):
         session_id = "4f92500f-832f-40f7-a417-c474f0425ce0"
@@ -449,7 +541,7 @@ class CliTest(unittest.TestCase):
                             "action": "migrate",
                         },
                         {
-                            "client": "kimi-desktop",
+                            "client": "kimi-code",
                             "agent": "kimi",
                             "destination": "/kimi/alpha",
                             "deployment_path": "/data/rendered/hash/alpha",
@@ -471,7 +563,7 @@ class CliTest(unittest.TestCase):
         preview.assert_called_once_with(config_path="/tmp/config.json")
         self.assertIn("alpha", stdout)
         self.assertIn("codex [codex]", stdout)
-        self.assertIn("kimi-desktop [kimi]", stdout)
+        self.assertIn("kimi-code [kimi]", stdout)
         self.assertIn("direct-source-link -> migrate", stdout)
         self.assertIn("/data/rendered/hash/alpha", stdout)
 

@@ -174,6 +174,11 @@ class InstalledEditCliTest(unittest.TestCase):
                 detail = self.run_cli("edit", command, "--help")
                 self.assertEqual(detail.returncode, 0, detail.stderr)
                 self.assertIn(f"skill-sync edit {command}", detail.stdout)
+                if command == "begin":
+                    for option in ("--base", "--family", "--client"):
+                        self.assertIn(option, detail.stdout)
+                if command == "diff":
+                    self.assertIn("--resolved-client", detail.stdout)
 
     def test_installed_wheel_exposes_documented_variant_resolution_help(self) -> None:
         resolve = self.run_cli("resolve", "--help")

@@ -45,6 +45,18 @@ def known_variant_targets() -> frozenset[str]:
     )
 
 
+def build_minimal_variant_manifest(target: str) -> bytes:
+    """Return the canonical minimal overlay manifest for one known target."""
+
+    content = f"version: 1\ntarget: {target}\nmode: overlay\n".encode("utf-8")
+    parse_variant_manifest_bytes(
+        content,
+        directory_target=target,
+        expected_target=target,
+    )
+    return content
+
+
 def load_variant_manifest(
     path: str | Path,
     *,

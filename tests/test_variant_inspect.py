@@ -91,26 +91,26 @@ class VariantInspectTest(unittest.TestCase):
             deleted=("shared.txt",),
         )
         self.make_variant(
-            "kimi-desktop",
-            files={"SKILL.md": "desktop\n", "client.txt": "client\n"},
+            "kimi-code",
+            files={"SKILL.md": "code\n", "client.txt": "client\n"},
         )
 
         result = variant_inspect.resolve_variant_dry_run(
-            "alpha", client="kimi-desktop", config_path=self.config_path
+            "alpha", client="kimi-code", config_path=self.config_path
         )
 
         self.assertEqual(result["skill"], "alpha")
-        self.assertEqual(result["client"], "kimi-desktop")
+        self.assertEqual(result["client"], "kimi-code")
         self.assertEqual(result["family"], "kimi")
         self.assertEqual(result["mode"], "dry-run")
         self.assertEqual(
             [(item["role"], item["target"]) for item in result["layers"]],
-            [("base", None), ("family", "kimi"), ("client", "kimi-desktop")],
+            [("base", None), ("family", "kimi"), ("client", "kimi-code")],
         )
         files = {item["path"]: item for item in result["files"]}
         self.assertEqual(list(files), ["SKILL.md", "client.txt", "family.txt"])
         self.assertEqual(files["SKILL.md"]["source_role"], "client")
-        self.assertEqual(files["SKILL.md"]["source_target"], "kimi-desktop")
+        self.assertEqual(files["SKILL.md"]["source_target"], "kimi-code")
         self.assertRegex(result["output_hash"], r"^sha256:[0-9a-f]{64}$")
         self.assertRegex(result["resolution_hash"], r"^sha256:[0-9a-f]{64}$")
 

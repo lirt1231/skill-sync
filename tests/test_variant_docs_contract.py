@@ -15,6 +15,7 @@ from skill_sync import cli
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 README = PROJECT_ROOT / "README.md"
 ARCHITECTURE = PROJECT_ROOT / "docs" / "architecture" / "variant-resolution.md"
+MIGRATION = PROJECT_ROOT / "docs" / "registry-v3-migration.md"
 ROADMAP = (
     PROJECT_ROOT
     / "docs"
@@ -71,7 +72,7 @@ class VariantDocsContractTest(unittest.TestCase):
             for line in block.splitlines()
             if line.strip().startswith("skill-sync ")
         ]
-        self.assertEqual(len(commands), 9)
+        self.assertEqual(len(commands), 15)
         parser = cli._build_parser()
         for command in commands:
             with self.subTest(command=command):
@@ -81,6 +82,7 @@ class VariantDocsContractTest(unittest.TestCase):
     def test_docs_state_safety_budgets_and_current_migration_limits(self):
         readme = README.read_text(encoding="utf-8")
         architecture = ARCHITECTURE.read_text(encoding="utf-8")
+        migration = MIGRATION.read_text(encoding="utf-8")
         roadmap = ROADMAP.read_text(encoding="utf-8")
 
         for text in (readme, architecture):
@@ -97,16 +99,27 @@ class VariantDocsContractTest(unittest.TestCase):
             "variant_source_changed",
             "ambiguity introduced during the read transaction",
             "diff_omitted=total_size_limit",
-            "no Variant-aware registry schema",
-            "no Variant-aware deployment cache rebuild",
-            "no Family/Client edit-session scope",
+            "registry schema v3",
+            "schema-v2",
+            "transactional scoped edit workflow",
             "no Web Variant badges",
         )
         for term in required_architecture_terms:
             with self.subTest(term=term):
                 self.assertIn(term, architecture)
 
-        self.assertIn("Implemented through 7.6", roadmap)
+        for term in (
+            "Reading, validating, resolving, previewing, or deploying",
+            "sync never",
+            "pushes automatically",
+            "Do not point a v1/v2 client at a v3 repository",
+            "Remove every Skill's `variants` field",
+            "deployment relinking",
+        ):
+            with self.subTest(migration_term=term):
+                self.assertIn(term, migration)
+
+        self.assertIn("implemented through 8.4", roadmap)
         self.assertIn("Planned, not implemented", roadmap)
         self.assertIn("resolve <skill> --client <id> --dry-run", roadmap)
         self.assertIn("resolve <skill> --client <id> --output <path>", roadmap)

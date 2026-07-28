@@ -157,6 +157,35 @@ def state(repo: Path, branch: str = "main", *, fetch_remote: bool = True) -> Git
     return GitState(clean=clean, ahead=ahead, behind=behind, diverged=ahead > 0 and behind > 0)
 
 
+def remote_changed_paths(repo: Path, branch: str = "main") -> tuple[str, ...]:
+    """Return paths changed between local HEAD and the cached remote branch."""
+
+    _require_origin(repo)
+    output = run_git(
+        repo,
+        [
+            "diff",
+            "--name-only",
+            "--no-renames",
+            f"HEAD..origin/{branch}",
+            "--",
+        ],
+        read_only=True,
+    )
+    return tuple(path for path in output.splitlines() if path)
+
+
+def read_remote_file(repo: Path, path: str, branch: str = "main") -> str:
+    """Read one UTF-8 text file from the cached remote branch."""
+
+    _require_origin(repo)
+    return run_git(
+        repo,
+        ["show", f"origin/{branch}:{path}"],
+        read_only=True,
+    ) + "\n"
+
+
 def _ensure_clean(repo: Path) -> None:
     if not is_clean(repo):
         raise GitError("sync repository is dirty")

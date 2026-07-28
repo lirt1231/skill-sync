@@ -70,6 +70,8 @@ class MaterializedVariantOverlay:
 def plan_variant_overlay(
     base_root: str | Path,
     variant_roots: Iterable[str | Path] = (),
+    *,
+    variant_target_names: Iterable[str] | None = None,
 ) -> VariantOverlayPlan:
     """Snapshot Base plus caller-ordered variant layers without writing state.
 
@@ -80,6 +82,13 @@ def plan_variant_overlay(
 
     base = Path(base_root)
     variants = tuple(Path(root) for root in variant_roots)
+    targets = (
+        tuple(root.name for root in variants)
+        if variant_target_names is None
+        else tuple(variant_target_names)
+    )
+    if len(targets) != len(variants):
+        raise ValueError("variant target names must match the Variant root count")
     resolved: dict[str, VariantOverlayFile] = {}
 
     base_snapshot = _stable_source_snapshot(base)
@@ -100,7 +109,7 @@ def plan_variant_overlay(
         resolved[source_file.relative_path.casefold()] = source_file
     _validate_resolved_paths(resolved.values())
 
-    for variant in variants:
+    for variant, target in zip(variants, targets):
         variant_snapshot = _stable_source_snapshot(variant)
         manifest_file = next(
             (
@@ -114,8 +123,8 @@ def plan_variant_overlay(
             raise ValueError(f"Variant source is missing {VARIANT_MANIFEST_FILE}: {variant}")
         manifest = parse_variant_manifest_bytes(
             manifest_file.content,
-            directory_target=variant.name,
-            expected_target=variant.name,
+            directory_target=target,
+            expected_target=target,
         )
         for deleted_path in manifest.delete:
             deleted_identity = deleted_path.casefold()

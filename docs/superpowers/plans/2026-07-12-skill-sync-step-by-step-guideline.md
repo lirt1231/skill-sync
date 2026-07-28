@@ -76,7 +76,7 @@ commit 级拆分，不再以“一个 Step 一个大 commit”为执行单位。
 3. 核对 README 描述的命令都真实存在。
 4. 核对 CLI、Web API、测试和文档对 Agent 名称的使用一致：
    `codex`、`workbuddy`、`kimi`、`claude`。
-5. 验证当前实际链接：Codex、WorkBuddy、Kimi Code、Kimi Desktop、Claude。
+5. 验证当前实际链接：Codex、WorkBuddy、Kimi Code、Claude。
 6. 验证 `pipx` 构建包含 Web UI 静态资源。
 
 ### 测试
@@ -153,8 +153,8 @@ skill-sync --help
 
 ### 目标
 
-保留用户看到的 Kimi 家族，同时让后台独立识别 Kimi Code 和 Kimi
-Desktop，为具体客户端变体和 ownership 查询打基础。
+保留用户看到的 Kimi 家族，同时让后台识别 Kimi Code 具体客户端，为客户端变体和
+ownership 查询打基础。
 
 ### 任务
 
@@ -165,7 +165,6 @@ Desktop，为具体客户端变体和 ownership 查询打基础。
    - `codex`；
    - `workbuddy`；
    - `kimi-code`；
-   - `kimi-desktop`；
    - `claude-code`。
 3. 每个 client adapter 声明：
    - family；
@@ -182,15 +181,12 @@ Desktop，为具体客户端变体和 ownership 查询打基础。
 5. 内部将 family 展开成检测到的 clients。
 6. `doctor --json` 同时返回 family 汇总和 client 明细。
 7. 保持 registry v2 中 `targets: ...,kimi,...` 不变。
-8. 旧的 `kimi-code,kimi-desktop` target 值继续迁移为 `kimi` family。
+8. 旧的 `kimi-code` target 值继续迁移为 `kimi` family。
 
 ### 测试
 
 - 只安装 Kimi Code。
-- 只安装 Kimi Desktop。
-- 同时安装两者。
-- 一个 client linked、另一个 missing 时 family 为 `partial`。
-- family enable/disable 正确作用于两个 clients。
+- family enable/disable 正确作用于 Kimi Code。
 - macOS 带空格路径和 Windows home 路径。
 
 ### 完成标准
@@ -247,7 +243,7 @@ skill-sync managed list [--client id] [--json]
 
 - 通过 Codex 链接查询。
 - 通过 WorkBuddy 链接查询。
-- 通过 Kimi Code/Desktop 查询同一 Skill。
+- 通过 Kimi Code 查询同一 Skill。
 - 通过 canonical `SKILL.md` 查询。
 - 通过 `scripts/foo.py` 查询。
 - 项目中存在同名但未托管的 Skill。
@@ -449,7 +445,7 @@ CLI 能力存在后，再让 Codex、WorkBuddy 等 Agent 强制遵循新流程�
 - Codex；
 - WorkBuddy；
 - Claude Code；
-- Kimi Code/Desktop 中可可靠测试的客户端。
+- Kimi Code。
 
 验证：
 
@@ -569,7 +565,7 @@ CLI 能力存在后，再让 Codex、WorkBuddy 等 Agent 强制遵循新流程�
 - Base + family。
 - Base + client。
 - Base + family + client。
-- `kimi-desktop` 覆盖 `kimi`。
+- `kimi-code` 覆盖 `kimi`。
 - variant 删除 Base 文件。
 - 同一 shared script 被多个客户端复用。
 - 只有一个 client variant 改变时，其他 deployment hash 不变。
@@ -590,7 +586,7 @@ CLI 能力存在后，再让 Codex、WorkBuddy 等 Agent 强制遵循新流程�
 
 ```bash
 skill-sync edit begin <skill> --base --actor codex
-skill-sync edit begin <skill> --family kimi --actor kimi-desktop
+skill-sync edit begin <skill> --family kimi --actor kimi-code
 skill-sync edit begin <skill> --client codex --actor codex
 ```
 
@@ -616,7 +612,7 @@ skill-sync edit begin <skill> --client codex --actor codex
 ### 完成标准
 
 - Codex-specific 修改不会改变 WorkBuddy deployment。
-- Kimi family 修改同时影响 Kimi Code/Desktop。
+- Kimi family 修改影响 Kimi Code。
 - Base 修改能预览所有客户端影响。
 
 ## 12. Step 9：Registry v3 和多设备 Variant 同步
@@ -650,7 +646,7 @@ skill-sync edit begin <skill> --client codex --actor codex
 | Machine A | Machine B | 必测结果 |
 | --- | --- | --- |
 | Codex | WorkBuddy | 同步 Base，各自渲染 |
-| Kimi Desktop | Kimi Code | family variant 一致 |
+| Kimi Code | Kimi Code | family variant 一致 |
 | Codex | Codex | client variant hash 一致 |
 | 修改 Base | 修改同一 Base | conflict stop |
 | 修改 Codex variant | 修改 Kimi variant | 可安全合并不同单元 |
@@ -913,7 +909,7 @@ Batch B 完成后，产品具备“多设备同步 + 多 Agent Client 适配管�
 | 6.1 | `require managed checks before skill edits` | 更新 `skill-sync-manager`：先 check，再 begin/diff/validate/impact/apply；记录最低 CLI 版本 | 管理 Skill 不引用不存在命令，旧 CLI 给出升级提示 |
 | 6.2 | `verify managed edits from codex` | 只加入 Codex 真实流程 fixture/记录和必要兼容修复 | Codex 不写 deployment/canonical、不隐式 push |
 | 6.3 | `verify managed edits from workbuddy` | 只加入 WorkBuddy 真实流程和必要兼容修复 | 与 Codex 相同的完整闭环 |
-| 6.4 | `verify managed edits from remaining clients` | Claude、Kimi Code/Desktop 的兼容验证；独立 adapter bug 另拆 fix commit | 每个可测 client 有明确结果和限制说明 |
+| 6.4 | `verify managed edits from remaining clients` | Claude、Kimi Code 的兼容验证；独立 adapter bug 另拆 fix commit | 每个可测 client 有明确结果和限制说明 |
 
 ### Step 6B：Web UI 快速稳定化
 
@@ -975,18 +971,40 @@ python -m venv <venv>
 | Commit | 建议 message | 该 commit 只完成什么 | 额外验收 |
 | --- | --- | --- | --- |
 | 8.1 | `add scoped edit session metadata` | session 增加 Base/Family/Client scope 和 layer baseline；不改变 begin | 旧 Base session 兼容读取、非法 scope fail closed |
+| 8.2-pre | `serialize variant creation with edit sessions` | Variant create 与 begin 统一 deployment → Skill 锁顺序；提取最小 manifest builder 和 locked begin primitive；不开放 scoped CLI | active session 阻止 create；create/begin 竞争不会产生 absent session + canonical Variant |
 | 8.2 | `add family and client edit begin` | scoped begin、缺失 variant 的最小 overlay workspace | 不复制完整 Base，Kimi family 展开正确 |
 | 8.3 | `add scoped edit diff and impact` | source-layer diff、resolved diff、scope impact | Base/Family/Client 影响矩阵 golden tests |
 | 8.4 | `add transactional scoped edit apply` | 只替换目标 layer并重建受影响 deployments | Codex-only 不改变 WorkBuddy，family 同时影响两个 Kimi |
 | 8.5 | `teach manager skill to choose edit scope` | 管理 Skill scope 规则和真实 Agent 验证 | 有歧义时询问，不自动扩大影响范围 |
 
-当前检查点：8.1 已实现并通过验收；下一小提交是 8.2。新建 session 使用严格
-metadata schema v2；metadata 模型可显式记录 Base/Family/Client target scope，
-以及目标 authored layer 在 begin 时为 present/absent 和对应 hash。既有 schema v1
-Base session 会在
-内存中归一化为 present Base layer，读取和状态转换仍保持 v1 原始字段，不发生静默
-迁移。8.1 没有改变 `edit begin` 的 Base-only CLI 行为，也没有创建 Variant、修改
-workspace、diff、impact 或 apply 逻辑。
+当前检查点：8.1、8.2-pre、8.2、8.3、8.4 和 8.5 已实现并通过验收；下一小提交是
+9.1。新建
+session 使用严格 metadata schema v2，并显式记录 Base/Family/Client target scope，
+以及目标 authored layer 在 begin 时为 present/absent 和对应 hash。既有 schema v1 Base
+session 会在内存中归一化为 present Base layer，读取和状态转换仍保持 v1 原始字段，
+不发生静默迁移。
+
+`edit begin` 现在要求且只允许 `--base`、`--family <id>`、`--client <id>` 之一。
+现有 Variant 的 baseline/workspace 只复制目标 authored layer；缺失 Variant 只在
+machine-local session 中生成最小 `variant.yaml`，不提前创建 canonical source，也不
+复制 Base。Variant create 与 begin 使用 `deployment lock → per-Skill lock` 的统一
+顺序，active session 和并发 create/begin 不会产生 absent session + canonical
+Variant。8.3 的 scoped `diff` 同时返回 source-layer diff 和受影响 concrete clients
+的 resolved diff，并可用 `--resolved-client` 限定一个 client；`validate` 在实际
+Base/Family/Client 解析链中校验候选 overlay；`impact` 输出 Base/Family/Client
+影响矩阵并在 authored layer baseline 变化后阻断。8.4 的 scoped `edit apply`
+transactionally 替换或首次发布单个 authored Variant layer，只重建并 relink scope
+覆盖且 detected/enabled 的 concrete clients；普通失败会恢复原 layer（或 absent
+状态）和全部旧 links。layered deployment 使用不含绝对 source path 的 schema-v2
+provenance，常规 deploy preview/status/migrate、doctor、ownership 和 Base apply 都按
+当前 Variant chain 解析；无适用 Variant 的 client 继续保持 base-v1 identity。整个
+apply/recovery 路径不访问 Git，不 commit，也不 push。
+
+8.5 已通过托管 Base edit session 更新真实 `skill-sync-manager`：它先选择最小
+authored scope，Base 用于全部 client 的共享变化，Family 只覆盖注册 family，Client
+只覆盖一个 concrete client；scope 有歧义且 blast radius 不同时必须询问，禁止为
+方便自动扩大范围。真实 apply 后 Codex、WorkBuddy、Kimi Code 和 Claude Code
+四端均 readback 为 healthy managed deployment。
 
 ### Step 9：Registry v3 和多设备同步
 
@@ -995,8 +1013,28 @@ workspace、diff、impact 或 apply 逻辑。
 | 9.1 | `add registry v3 variant schema` | v3 读取/写入、v2 只读兼容、首次 variant 升级 | v2 fixtures 不写回，v3 deterministic serialization |
 | 9.2 | `sync portable variant sources` | Git 仓库打包 Base/Variant/registry；排除本机状态 | 无 absolute path、deployment、session、backup、credential |
 | 9.3 | `add variant aware sync conflicts` | Base/Variant 单元级 preview/status/conflict stop | 不同 variant 可合并，同一单元双改停止 |
-| 9.4 | `add multi device resolution fixtures` | 两机器检测矩阵和可重复 resolution hash 测试 | Codex/WorkBuddy、Kimi Code/Desktop、同 client 三组矩阵通过 |
+| 9.4 | `add multi device resolution fixtures` | 两机器检测矩阵和可重复 resolution hash 测试 | Codex/WorkBuddy、跨机器 Kimi Code、同 client 三组矩阵通过 |
 | 9.5 | `document registry v3 migration` | 升级、回退、多设备操作文档；不新增行为 | 新旧机器流程可按文档复现 |
+
+当前检查点：10.1–10.4 已实现并通过自动化验收；下一小提交是 10.5。Registry v3 为每个已选择
+Skill 记录确定排序、逗号分隔的 portable Variant target intent；v1/v2 Base-only
+registry 的读取不会触发迁移。Git 仓库只打包 `skills/<skill>/` 和 registry allowlist
+声明的 `variants/<skill>/<target>/`，不会复制 absolute path、deployment、session、
+backup、credential 或未声明的本机 Variant。preview/status 以 Base/Variant 为独立
+同步单元；不同单元可在 pull 中安全合并，同一单元双改会在 fast-forward 和 authored
+source 写入前停止，直接 pull 仍保持更严格的本地改动拒绝语义。真实两机 fixture
+覆盖 Codex/WorkBuddy Base、跨机器 Kimi Code family Variant、同 Codex client，并验证
+只渲染本机检测到的 deployment 与跨路径 resolution hash。升级、回退和新机器流程见
+`docs/registry-v3-migration.md`。Web 新增按需加载的 managed read model，直接复用 CLI
+的 Variant、deployment 和 edit-session 输出；inventory 显示 source hash 与
+Variant/session/deployment badges，详情按 family 分组但逐 concrete client 展示部署
+状态，Kimi Code 的具体问题不再被 family 汇总掩盖。搜索、筛选、选择、空状态、渐进
+加载、焦点回退及 stale/tampered/source-conflict 矩阵均有自动化测试。desktop 和
+400px 响应式视图已通过 Microsoft Edge 实机截图审计。Web 详情现可按 Base、family
+或 concrete client 创建托管编辑工作区，聚合展示 diff、validate 和 impact，并在明确
+确认后 apply 或 abort。apply 会在服务端重算检查结果并校验 fingerprint；基线变化、
+校验失败、影响阻断、无改动或作用域漂移都会在写入前停止，页面不提供 canonical source
+或 deployment 的直接编辑入口。
 
 ### Step 10：Web UI
 
@@ -1176,13 +1214,13 @@ exit code 4 时 fail closed，并记录最低 Skill Sync 版本为 `0.1.0`。tam
 deployment 只允许先预览，再由用户明确选择 capture 或 discard。
 
 该 Skill 已通过结构校验和独立前向测试，并通过 edit session 应用到 canonical；
-Codex、WorkBuddy、Kimi Code、Kimi Desktop、Claude Code 共 5 个 deployment 已重建并
+Codex、WorkBuddy、Kimi Code、Claude Code 共 4 个 deployment 已重建并
 保持 `linked-render`。对应 `agent-skills` commit 为 `6c737de`，已推送到远程
 `main`。
 
-commits `6.2`–`6.4` 已按编号完成并合并：Codex、WorkBuddy、Claude Code、Kimi
-Code 和 Kimi Desktop 都有独立 v1 fixture、可复现验证记录和隔离 HOME 自动化测试。
-五个流程均强制执行 managed check → begin → diff → validate → impact → apply，Agent
+commits `6.2`–`6.4` 已按编号完成并合并：Codex、WorkBuddy、Claude Code 和 Kimi
+Code 都有独立 v1 fixture、可复现验证记录和隔离 HOME 自动化测试。
+四个流程均强制执行 managed check → begin → diff → validate → impact → apply，Agent
 只写 workspace；apply 前 canonical、旧 deployment 和全部客户端链接保持不变，且
 测试会阻断任何 Git 调用。对应 commits 为 `9308d04`、`e2768fe`、`17bd5ef`。
 
@@ -1245,7 +1283,7 @@ collision 和缺失 `SKILL.md` 全部 fail closed。materialize 在 destination 
 staging、逐文件核验并用 no-replace rename 原子发布，已存在或并发出现的 winner 均保留。
 
 7.2 的 golden fixtures 覆盖 Base only、Base+family、Base+client、Base+family+client、
-`kimi-desktop` 覆盖 `kimi`、目录/文件删除、共享 script 和噪音排除。该 commit 不接
+`kimi-code` 覆盖 `kimi`、目录/文件删除、共享 script 和噪音排除。该 commit 不接
 registry/CLI，不计算 layer/resolution hash，也不写 provenance；这些由 7.3 补齐。
 
 commit `7.4 add variant source management commands` 已完成并 rebase 到 7.2 之后。
@@ -1275,8 +1313,8 @@ source path/identity。immutable provenance 保留本机路径、manifest mode/d
 hash 和 applied target chain，足以解释任意只读解析结果。
 
 7.3 的隔离测试证明：相同 sources 位于不同机器路径时 resolution hash 一致；只修改
-`kimi-desktop` client variant 时，Kimi Code hash 保持不变；target client 即使共享相同
-family output 仍有不同 resolution identity；同 content 的 `0644→0755` chmod 不改变
+`kimi-code` client variant 时，Codex hash 保持不变；target client 即使共享相同
+output 仍有不同 resolution identity；同 content 的 `0644→0755` chmod 不改变
 identity，而 shebang content 在 POSIX/Windows 都规划为 `0755`；content 与 manifest ABA
 下的 hash 和 delete 语义都绑定 exact plan snapshot。materialized output hash 会重新遍历
 实际 destination bytes/effective portable modes 验证，不复用 plan input 代替验收。

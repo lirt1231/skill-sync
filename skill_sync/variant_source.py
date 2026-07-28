@@ -1,7 +1,8 @@
 """Create and inspect portable Variant source directories.
 
 This module manages only ``<skills_root>/../variants`` source data.  It does
-not resolve overlays, update registries, deploy Skills, or open edit sessions.
+not resolve overlays, deploy Skills, or open edit sessions. Creating a Variant
+also records its portable target intent in registry schema v3.
 """
 
 from __future__ import annotations
@@ -15,12 +16,23 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from skill_sync.agents import AGENT_FAMILIES
-from skill_sync.config import default_config_path, load_config
+from skill_sync.config import default_config_path, default_data_root, load_config
 from skill_sync.copying import rename_no_replace
+from skill_sync.edit_session import (
+    ActiveEditSessionError,
+    EditSessionMetadataError,
+    EditSessionStore,
+)
 from skill_sync.errors import SkillSyncError
 from skill_sync.hash import is_link_or_reparse
-from skill_sync.protocol import EXIT_SAFETY
-from skill_sync.variant import VARIANT_MANIFEST_FILE, load_variant_manifest
+from skill_sync.local_lock import local_file_lock
+from skill_sync.protocol import EXIT_CONFLICT, EXIT_SAFETY
+from skill_sync.registry import load_registry, register_variant_target, save_registry
+from skill_sync.variant import (
+    VARIANT_MANIFEST_FILE,
+    build_minimal_variant_manifest,
+    load_variant_manifest,
+)
 from skill_sync.variant_overlay import VariantOverlayLayer, plan_variant_overlay
 
 
@@ -403,62 +415,158 @@ def create_variant(
     """Atomically create the smallest valid overlay manifest for one target."""
 
     _validate_skill_name(skill)
-    family, affected_clients, resolution_order = _target_metadata(scope, target)
+    family, affected_clients, resolution_order = variant_target_metadata(scope, target)
     config = _load_config(config_path)
-    skills_root, root = _configured_roots(config)
-    resolved_skill = _resolve_base_skill(skill, skills_root, root)
-    variant_skill_root = root / resolved_skill
-    destination = variant_skill_root / target
+    data_root = _configured_data_root(config)
+    configured_roots = _configured_roots(config)
+    store = EditSessionStore(data_root)
 
     try:
-        _prepare_real_directory(root, label="Variant root")
-        _reject_case_conflict(root, resolved_skill, label="Variant Skill name")
-        _prepare_real_directory(variant_skill_root, label="Variant Skill root")
-        _reject_case_conflict(variant_skill_root, target, label="Variant target")
-        if destination.exists() or is_link_or_reparse(destination):
-            raise SkillSyncError(
-                f"Variant target already exists: {destination}",
-                code="variant_target_exists",
-                details={"skill": resolved_skill, "target": target, "path": str(destination)},
-            )
-
-        staging_root = Path(
-            tempfile.mkdtemp(prefix=f".{target}.create-", dir=variant_skill_root)
-        )
-        staging = staging_root / target
-        staging.mkdir()
-        try:
-            manifest = staging / VARIANT_MANIFEST_FILE
-            with manifest.open("x", encoding="utf-8") as output:
-                output.write(f"version: 1\ntarget: {target}\nmode: overlay\n")
-                output.flush()
-                os.fsync(output.fileno())
-            load_variant_manifest(manifest, expected_target=target)
-            _fsync_directory(staging)
-            try:
-                rename_no_replace(staging, destination)
-            except FileExistsError:
+        with local_file_lock(data_root / "locks" / "deployment.lock"):
+            locked_config = _load_config(config_path)
+            if _configured_data_root(locked_config) != data_root:
                 raise SkillSyncError(
-                    f"Variant target already exists: {destination}",
-                    code="variant_target_exists",
-                    details={
-                        "skill": resolved_skill,
-                        "target": target,
-                        "path": str(destination),
-                    },
-                ) from None
-            _fsync_directory(variant_skill_root)
-        finally:
-            if staging_root.exists() or staging_root.is_symlink():
-                shutil.rmtree(staging_root, ignore_errors=True)
+                    "skill-sync data root changed while creating Variant",
+                    code="variant_source_changed",
+                    exit_code=EXIT_SAFETY,
+                    details={"skill": skill, "target": target},
+                )
+            if _configured_roots(locked_config) != configured_roots:
+                raise SkillSyncError(
+                    "Variant source roots changed while acquiring mutation locks",
+                    code="variant_source_changed",
+                    exit_code=EXIT_SAFETY,
+                    details={"skill": skill, "target": target},
+                )
+            with store.skill_lock(skill):
+                active = store.unfinished_session_locked(skill)
+                if active is not None:
+                    raise ActiveEditSessionError(skill, active.session_id)
+                return _create_variant_locked(
+                    config=locked_config,
+                    skill=skill,
+                    scope=scope,
+                    target=target,
+                    family=family,
+                    affected_clients=affected_clients,
+                    resolution_order=resolution_order,
+                )
+    except ActiveEditSessionError as exc:
+        raise SkillSyncError(
+            str(exc),
+            code="active_edit_session",
+            exit_code=EXIT_CONFLICT,
+            details={"skill": exc.logical_skill, "session_id": exc.session_id},
+        ) from exc
     except SkillSyncError:
         raise
+    except TimeoutError as exc:
+        raise SkillSyncError(
+            "timed out waiting to create Variant source safely",
+            code="variant_create_locked",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill, "scope": scope, "target": target},
+        ) from exc
+    except EditSessionMetadataError as exc:
+        raise SkillSyncError(
+            f"cannot safely inspect edit sessions before Variant creation: {exc}",
+            code="unsafe_edit_session",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill, "scope": scope, "target": target},
+        ) from exc
     except (OSError, ValueError) as exc:
         raise SkillSyncError(
             f"cannot create Variant source: {exc}",
             code="variant_create_failed",
-            details={"skill": resolved_skill, "scope": scope, "target": target},
+            details={"skill": skill, "scope": scope, "target": target},
         ) from exc
+
+
+def _create_variant_locked(
+    *,
+    config: dict[str, Any],
+    skill: str,
+    scope: str,
+    target: str,
+    family: str,
+    affected_clients: tuple[str, ...],
+    resolution_order: tuple[str, ...],
+) -> dict[str, Any]:
+    skills_root, root = _configured_roots(config)
+    resolved_skill = _resolve_base_skill(skill, skills_root, root)
+    registry_path, registry = _variant_registry(config, resolved_skill)
+    register_variant_target(registry, resolved_skill, target)
+    variant_skill_root = root / resolved_skill
+    destination = variant_skill_root / target
+
+    _prepare_real_directory(root, label="Variant root")
+    _reject_case_conflict(root, resolved_skill, label="Variant Skill name")
+    _prepare_real_directory(variant_skill_root, label="Variant Skill root")
+    _reject_case_conflict(variant_skill_root, target, label="Variant target")
+    if destination.exists() or is_link_or_reparse(destination):
+        raise SkillSyncError(
+            f"Variant target already exists: {destination}",
+            code="variant_target_exists",
+            details={"skill": resolved_skill, "target": target, "path": str(destination)},
+        )
+
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f".{target}.create-", dir=variant_skill_root)
+    )
+    staging = staging_root / target
+    staging.mkdir()
+    try:
+        manifest = staging / VARIANT_MANIFEST_FILE
+        with manifest.open("xb") as output:
+            output.write(build_minimal_variant_manifest(target))
+            output.flush()
+            os.fsync(output.fileno())
+        load_variant_manifest(manifest, expected_target=target)
+        _fsync_directory(staging)
+        try:
+            rename_no_replace(staging, destination)
+        except FileExistsError:
+            raise SkillSyncError(
+                f"Variant target already exists: {destination}",
+                code="variant_target_exists",
+                details={
+                    "skill": resolved_skill,
+                    "target": target,
+                    "path": str(destination),
+                },
+            ) from None
+        _fsync_directory(variant_skill_root)
+        try:
+            save_registry(registry_path, registry)
+        except (OSError, ValueError) as exc:
+            try:
+                shutil.rmtree(destination)
+                _fsync_directory(variant_skill_root)
+            except OSError as rollback_exc:
+                raise SkillSyncError(
+                    "Variant source was published but registry update rollback needs recovery",
+                    code="variant_registry_recovery_required",
+                    exit_code=EXIT_SAFETY,
+                    details={
+                        "skill": resolved_skill,
+                        "target": target,
+                        "variant_path": str(destination),
+                        "registry_path": str(registry_path),
+                    },
+                ) from rollback_exc
+            raise SkillSyncError(
+                "could not record Variant intent in portable registry",
+                code="variant_registry_update_failed",
+                exit_code=EXIT_SAFETY,
+                details={
+                    "skill": resolved_skill,
+                    "target": target,
+                    "registry_path": str(registry_path),
+                },
+            ) from exc
+    finally:
+        if staging_root.exists() or staging_root.is_symlink():
+            shutil.rmtree(staging_root, ignore_errors=True)
 
     return {
         "skill": resolved_skill,
@@ -469,8 +577,47 @@ def create_variant(
         "path": str(destination),
         "manifest_path": str(destination / VARIANT_MANIFEST_FILE),
         "created": True,
+        "registry_version": 3,
+        "registry_path": str(registry_path),
         "resolution_order": list(resolution_order),
     }
+
+
+def _variant_registry(
+    config: dict[str, Any],
+    skill: str,
+) -> tuple[Path, dict[str, Any]]:
+    repo_text = config.get("sync_repo_path")
+    if not isinstance(repo_text, str) or not repo_text:
+        raise SkillSyncError(
+            "skill-sync is not initialized; run init and select the Skill first",
+            code="variant_registry_unavailable",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill},
+        )
+    repo = Path(repo_text).expanduser()
+    registry_path = repo / "registry.yaml"
+    if not registry_path.is_file() or is_link_or_reparse(registry_path):
+        raise SkillSyncError(
+            "portable registry is missing or unsafe",
+            code="variant_registry_unavailable",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill, "registry_path": str(registry_path)},
+        )
+    try:
+        registry = load_registry(registry_path)
+        skills = registry.get("skills")
+        entry = skills.get(skill) if isinstance(skills, dict) else None
+        if not isinstance(entry, dict) or entry.get("selected") is not True:
+            raise ValueError(f"Variant Skill must be selected in registry: {skill}")
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise SkillSyncError(
+            f"cannot load portable Variant registry: {exc}",
+            code="variant_registry_invalid",
+            exit_code=EXIT_SAFETY,
+            details={"skill": skill, "registry_path": str(registry_path)},
+        ) from exc
+    return registry_path, registry
 
 
 def list_variants(
@@ -558,7 +705,19 @@ def _configured_roots(config: dict[str, Any]) -> tuple[Path, Path]:
     return skills_root, skills_root.parent / "variants"
 
 
-def _target_metadata(
+def _configured_data_root(config: dict[str, Any]) -> Path:
+    raw = config.get("data_root") or default_data_root()
+    data_root = Path(raw).expanduser()
+    if not data_root.is_absolute():
+        raise SkillSyncError(
+            "configured data_root must be an absolute path",
+            code="variant_config_invalid",
+            exit_code=EXIT_SAFETY,
+        )
+    return data_root.absolute()
+
+
+def variant_target_metadata(
     scope: str, target: str
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     if scope == "family":

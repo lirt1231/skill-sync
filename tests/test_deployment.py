@@ -10,12 +10,15 @@ from unittest import mock
 from skill_sync.deployment import (
     PROVENANCE_FILE,
     deployment_path,
+    expected_layered_provenance,
     render_base_deployment,
+    render_layered_deployment,
     remove_verified_deployment,
     resolution_hash,
     verify_deployment,
 )
 from skill_sync.hash import hash_skill_dir
+from skill_sync.variant_resolution import resolve_variant_for_client
 
 
 def write(root: Path, relative: str, content: bytes) -> None:
@@ -75,6 +78,105 @@ class DeploymentTest(unittest.TestCase):
                 codex.provenance["resolution_hash"],
                 workbuddy.provenance["resolution_hash"],
             )
+
+    def test_layered_deployment_persists_portable_provenance_and_verifies(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            work = Path(temp_dir)
+            source = self.make_source(work)
+            variants = work / "variants" / "alpha" / "kimi"
+            write(
+                variants,
+                "variant.yaml",
+                b"version: 1\ntarget: kimi\nmode: overlay\n",
+            )
+            write(variants, "family.txt", b"Kimi family\n")
+            resolution = resolve_variant_for_client(
+                source,
+                variants.parent,
+                "kimi-code",
+            )
+
+            first = render_layered_deployment(
+                resolution,
+                work / "rendered",
+                "alpha",
+            )
+            second = render_layered_deployment(
+                resolution,
+                work / "rendered",
+                "alpha",
+            )
+
+            expected = expected_layered_provenance("alpha", resolution)
+            self.assertEqual(first.provenance, expected)
+            self.assertEqual(second.provenance, expected)
+            self.assertTrue(first.created)
+            self.assertFalse(second.created)
+            self.assertEqual(first.path, second.path)
+            self.assertEqual((first.path / "family.txt").read_bytes(), b"Kimi family\n")
+            self.assertTrue(verify_deployment(first.path).ok)
+            self.assertEqual(expected["schema_version"], 2)
+            self.assertEqual(expected["resolver_version"], "variant-overlay-v2")
+            self.assertEqual(
+                expected["applied_layers"],
+                ["base", "family:kimi"],
+            )
+            self.assertNotIn(str(source), json.dumps(expected))
+            self.assertNotIn(str(variants), json.dumps(expected))
+
+    def test_layered_deployment_rejects_tampered_layer_provenance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            work = Path(temp_dir)
+            source = self.make_source(work)
+            resolution = resolve_variant_for_client(
+                source,
+                work / "missing-variants",
+                "codex",
+            )
+            deployed = render_layered_deployment(
+                resolution,
+                work / "rendered",
+                "alpha",
+            )
+            manifest = deployed.path / PROVENANCE_FILE
+            manifest.chmod(0o644)
+            provenance = json.loads(manifest.read_text(encoding="utf-8"))
+            provenance["layers"][0]["content_hash"] = "sha256:" + "0" * 64
+            manifest.write_text(json.dumps(provenance), encoding="utf-8")
+
+            verification = verify_deployment(deployed.path)
+            self.assertEqual(verification.state, "tampered")
+            self.assertIn("resolution hash", verification.reason or "")
+
+    def test_layered_deployment_rejects_malformed_schema_v2_provenance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            work = Path(temp_dir)
+            source = self.make_source(work)
+            variants = work / "variants" / "alpha" / "codex"
+            write(
+                variants,
+                "variant.yaml",
+                b"version: 1\ntarget: codex\nmode: overlay\n",
+            )
+            resolution = resolve_variant_for_client(
+                source,
+                variants.parent,
+                "codex",
+            )
+            deployed = render_layered_deployment(
+                resolution,
+                work / "rendered",
+                "alpha",
+            )
+            manifest = deployed.path / PROVENANCE_FILE
+            manifest.chmod(0o644)
+            provenance = json.loads(manifest.read_text(encoding="utf-8"))
+            provenance["layers"][1]["role"] = "base"
+            manifest.write_text(json.dumps(provenance), encoding="utf-8")
+
+            verification = verify_deployment(deployed.path)
+            self.assertEqual(verification.state, "tampered")
+            self.assertEqual(verification.reason, "invalid provenance fields")
 
     def test_copies_hidden_and_binary_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:

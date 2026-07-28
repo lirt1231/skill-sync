@@ -13,8 +13,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from skill_sync.deployment import expected_provenance, verify_deployment
+from skill_sync.deployment import (
+    expected_layered_provenance,
+    expected_provenance,
+    verify_deployment,
+)
 from skill_sync.hash import hash_skill_dir
+from skill_sync.variant_resolution import (
+    resolve_variant_for_client,
+)
 
 
 @dataclass(frozen=True)
@@ -356,6 +363,29 @@ def _direct_link_health(source: Path, destination: Path) -> str:
     return "missing"
 
 
+def _expected_current_provenance(
+    skill_name: str,
+    source: Path,
+    client_id: str,
+    current_source_hash: str | None,
+) -> dict[str, Any] | None:
+    if current_source_hash is None:
+        return None
+    try:
+        resolution = resolve_variant_for_client(
+            source,
+            source.parent.parent / "variants" / skill_name,
+            client_id,
+        )
+        if resolution.applied_variant_targets:
+            return expected_layered_provenance(skill_name, resolution)
+        return expected_provenance(skill_name, current_source_hash, client_id)
+    except (OSError, ValueError):
+        # An invalid current source chain must classify an otherwise intact
+        # rendered artifact as stale rather than silently trusting old output.
+        return {}
+
+
 def _inspect_endpoint_deployment(
     input_path: str,
     skill_name: str,
@@ -367,10 +397,12 @@ def _inspect_endpoint_deployment(
         current_source_hash = hash_skill_dir(source)
     except (OSError, ValueError):
         current_source_hash = None
-    expected = (
-        None
-        if current_source_hash is None
-        else expected_provenance(skill_name, current_source_hash, endpoint.client_id)
+    initial = verify_deployment(deployment)
+    expected = _expected_current_provenance(
+        skill_name,
+        source,
+        endpoint.client_id,
+        current_source_hash,
     )
     verification = verify_deployment(deployment, expected_provenance=expected)
     provenance = verification.provenance or {}
@@ -457,10 +489,11 @@ def _inspect_deployment_path(
         current_source_hash = hash_skill_dir(source)
     except (OSError, ValueError):
         current_source_hash = None
-    expected = (
-        None
-        if current_source_hash is None
-        else expected_provenance(skill_name, current_source_hash, client_id)
+    expected = _expected_current_provenance(
+        skill_name,
+        source,
+        client_id,
+        current_source_hash,
     )
     if expected is not None:
         verification = verify_deployment(

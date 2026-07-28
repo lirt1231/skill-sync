@@ -88,13 +88,6 @@ class MutationPreviewTest(unittest.TestCase):
                 "kimi-code", "kimi", "Kimi Code", self.root / "kimi-code", False
             ),
             AgentClient(
-                "kimi-desktop",
-                "kimi",
-                "Kimi Desktop",
-                self.root / "kimi-desktop",
-                False,
-            ),
-            AgentClient(
                 "claude-code", "claude", "Claude Code", self.root / "claude", False
             ),
         )
@@ -302,6 +295,33 @@ class MutationPreviewTest(unittest.TestCase):
         self.assertTrue(link_plan["can_execute"])
         self.assertEqual(link_plan["steps"][0]["action"], "noop")
         self.assertFalse(any(link_plan["effects"]["writes"].values()))
+
+    def test_link_conflict_reason_describes_the_protected_agent_destination(self):
+        self.write_skill(self.codex_root, "alpha")
+
+        plan = self.preview("link-repair", {"skills": ["alpha"]})
+
+        codex = next(
+            item for item in plan["targets"]["clients"] if item["client"] == "codex"
+        )
+        self.assertEqual(codex["current_state"], "conflict")
+        self.assertEqual(codex["effect"], "blocked")
+        self.assertEqual(
+            next(
+                item["detail"]
+                for item in plan["conflicts"]
+                if item["client"] == "codex"
+            ),
+            "Agent destination contains unmanaged content.",
+        )
+        self.assertEqual(
+            next(
+                item["destination"]
+                for item in plan["conflicts"]
+                if item["client"] == "codex"
+            ),
+            str(self.codex_root / "alpha"),
+        )
 
     def test_concrete_kimi_request_is_blocked_by_family_disable_in_plan_and_action(self):
         config = json.loads(self.config_path.read_text(encoding="utf-8"))

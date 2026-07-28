@@ -6,7 +6,9 @@ can remain dependency-free while still producing human-readable state.
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -27,6 +29,15 @@ _BOOLEAN_LIKE_TOKENS = frozenset({"true", "false", "True", "False", "TRUE", "FAL
 _YAML_BOOLEAN_WORDS = frozenset({"yes", "no", "on", "off"})
 _NULL_LIKE_TOKENS = frozenset({"null", "Null", "NULL", "~"})
 _SPECIAL_FLOAT_LIKE_TOKENS = frozenset({".nan", ".inf", "+.inf", "-.inf"})
+_PORTABLE_TARGET_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_V3_TOP_LEVEL_ORDER = ("version", "skills")
+_V3_SKILL_FIELD_ORDER = (
+    "selected",
+    "source_platform",
+    "display_name",
+    "targets",
+    "variants",
+)
 
 
 def empty_registry() -> dict[str, Any]:
@@ -88,19 +99,93 @@ def parse_registry_text(text: str) -> dict[str, Any]:
             stack = stack[: level + 1]
 
     _reject_absolute_path_values(root)
+    _validate_registry_schema(root)
     return root
 
 
 def save_registry(path: str | Path, registry: dict[str, Any]) -> None:
     """Write registry data using the normalized constrained YAML subset."""
 
+    registry_path = Path(path)
+    serialized = serialize_registry(registry)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{registry_path.name}.",
+        suffix=".tmp",
+        dir=registry_path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+            output.write(serialized)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, registry_path)
+        _fsync_directory(registry_path.parent)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def serialize_registry(registry: dict[str, Any]) -> str:
+    """Serialize a registry, canonicalizing schema-v3 mapping and Variant order."""
+
     if not isinstance(registry, dict):
         raise ValueError("Registry root must be a mapping")
     _reject_absolute_path_values(registry)
+    _validate_registry_schema(registry)
 
     lines: list[str] = []
-    _append_mapping(lines, registry, level=0)
-    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    normalized = _canonicalize_v3_registry(registry) if registry.get("version") == 3 else registry
+    _append_mapping(lines, normalized, level=0)
+    return "\n".join(lines) + "\n"
+
+
+def registry_variant_targets(registry: dict[str, Any], skill: str) -> tuple[str, ...]:
+    """Return one Skill's portable Variant intent in deterministic order."""
+
+    _validate_registry_schema(registry)
+    skills = registry.get("skills", {})
+    if not isinstance(skills, dict):
+        raise ValueError("Registry skills must be a mapping")
+    entry = skills.get(skill)
+    if entry is None:
+        raise ValueError(f"Skill is not present in registry: {skill}")
+    if not isinstance(entry, dict):
+        raise ValueError(f"Registry Skill entry must be a mapping: {skill}")
+    raw_targets = entry.get("variants")
+    if raw_targets is None:
+        return ()
+    return _parse_variant_targets(raw_targets, skill=skill)
+
+
+def register_variant_target(
+    registry: dict[str, Any],
+    skill: str,
+    target: str,
+) -> bool:
+    """Add Variant intent and lazily upgrade a selected registry to schema v3."""
+
+    _validate_registry_schema(registry)
+    if not isinstance(skill, str) or not skill:
+        raise ValueError("Registry Skill name must be a non-empty string")
+    _validate_variant_target(target, skill=skill)
+    skills = registry.get("skills")
+    if not isinstance(skills, dict):
+        raise ValueError("Registry skills must be a mapping")
+    entry = skills.get(skill)
+    if not isinstance(entry, dict) or entry.get("selected") is not True:
+        raise ValueError(f"Variant Skill must be selected in registry: {skill}")
+
+    existing = set(registry_variant_targets(registry, skill))
+    changed = registry.get("version") != 3 or target not in existing
+    existing.add(target)
+    entry["variants"] = ",".join(sorted(existing))
+    registry["version"] = 3
+    _validate_registry_schema(registry)
+    return changed
 
 
 def _strip_comment(raw_line: str) -> str:
@@ -257,6 +342,98 @@ def _reject_absolute_path_values(value: Any) -> None:
         return
     if isinstance(value, str) and _is_absolute_path_text(value):
         raise ValueError("Registry values must not contain absolute paths")
+
+
+def _validate_registry_schema(registry: dict[str, Any]) -> None:
+    version = registry.get("version")
+    if version not in {1, 2, 3}:
+        raise ValueError("Registry version must be 1, 2, or 3")
+    if version != 3:
+        return
+    skills = registry.get("skills")
+    if not isinstance(skills, dict):
+        raise ValueError("Registry skills must be a mapping")
+    for skill, entry in skills.items():
+        if not isinstance(skill, str) or not skill:
+            raise ValueError("Registry Skill names must be non-empty strings")
+        if not isinstance(entry, dict):
+            raise ValueError(f"Registry Skill entry must be a mapping: {skill}")
+        if "variants" in entry:
+            _parse_variant_targets(entry["variants"], skill=skill)
+
+
+def _parse_variant_targets(value: Any, *, skill: str) -> tuple[str, ...]:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Registry variants must be a non-empty string: {skill}")
+    targets = value.split(",")
+    if any(not target for target in targets):
+        raise ValueError(f"Registry variants contains an empty target: {skill}")
+    for target in targets:
+        _validate_variant_target(target, skill=skill)
+    if len(set(targets)) != len(targets):
+        raise ValueError(f"Registry variants contains duplicate targets: {skill}")
+    return tuple(sorted(targets))
+
+
+def _validate_variant_target(target: Any, *, skill: str) -> None:
+    if not isinstance(target, str) or not _PORTABLE_TARGET_RE.fullmatch(target):
+        raise ValueError(f"Registry Variant target is not portable for {skill}: {target!r}")
+
+
+def _canonicalize_v3_registry(registry: dict[str, Any]) -> dict[str, Any]:
+    skills = registry["skills"]
+    canonical_skills: dict[str, Any] = {}
+    for skill in sorted(skills):
+        entry = skills[skill]
+        canonical_entry = _ordered_mapping(entry, preferred=_V3_SKILL_FIELD_ORDER)
+        if "variants" in canonical_entry:
+            canonical_entry["variants"] = ",".join(
+                _parse_variant_targets(canonical_entry["variants"], skill=skill)
+            )
+        canonical_skills[skill] = {
+            key: _sort_nested_value(value) for key, value in canonical_entry.items()
+        }
+
+    top_level = _ordered_mapping(registry, preferred=_V3_TOP_LEVEL_ORDER)
+    top_level["skills"] = canonical_skills
+    return {
+        key: canonical_skills if key == "skills" else _sort_nested_value(value)
+        for key, value in top_level.items()
+    }
+
+
+def _ordered_mapping(
+    mapping: dict[str, Any],
+    *,
+    preferred: tuple[str, ...],
+) -> dict[str, Any]:
+    ordered: dict[str, Any] = {}
+    for key in preferred:
+        if key in mapping:
+            ordered[key] = mapping[key]
+    for key in sorted(key for key in mapping if key not in ordered):
+        ordered[key] = mapping[key]
+    return ordered
+
+
+def _sort_nested_value(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    return {key: _sort_nested_value(value[key]) for key in sorted(value)}
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
 
 
 def _contains_comment_hazard(text: str) -> bool:

@@ -2,7 +2,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from skill_sync.registry import empty_registry, load_registry, save_registry
+from skill_sync.registry import (
+    empty_registry,
+    load_registry,
+    register_variant_target,
+    registry_variant_targets,
+    save_registry,
+    serialize_registry,
+)
 
 
 class RegistryTest(unittest.TestCase):
@@ -86,6 +93,111 @@ skills:
                     ]
                 ),
             )
+
+    def test_loads_v2_without_rewriting_or_upgrading_it(self):
+        text = "\n".join(
+            [
+                "version: 2",
+                "skills:",
+                "  alpha:",
+                "    selected: true",
+                "    targets: codex,kimi",
+                "",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            registry_path = Path(tmp_dir) / "registry.yaml"
+            registry_path.write_text(text, encoding="utf-8")
+
+            registry = load_registry(registry_path)
+
+            self.assertEqual(registry["version"], 2)
+            self.assertEqual(registry_variant_targets(registry, "alpha"), ())
+            self.assertEqual(registry_path.read_text(encoding="utf-8"), text)
+
+    def test_registering_first_variant_lazily_upgrades_v2_to_v3(self):
+        registry = {
+            "version": 2,
+            "skills": {
+                "alpha": {
+                    "selected": True,
+                    "display_name": "alpha",
+                    "targets": "codex,kimi",
+                }
+            },
+        }
+
+        self.assertTrue(register_variant_target(registry, "alpha", "kimi"))
+        self.assertEqual(registry["version"], 3)
+        self.assertEqual(registry_variant_targets(registry, "alpha"), ("kimi",))
+        self.assertFalse(register_variant_target(registry, "alpha", "kimi"))
+        self.assertTrue(register_variant_target(registry, "alpha", "codex"))
+        self.assertEqual(registry["skills"]["alpha"]["variants"], "codex,kimi")
+
+    def test_v3_serialization_is_deterministic_and_normalizes_variant_order(self):
+        first = {
+            "notes": {"z": 2, "a": 1},
+            "skills": {
+                "zeta": {"variants": "kimi", "selected": True},
+                "alpha": {
+                    "variants": "kimi-code,codex",
+                    "targets": "codex,kimi",
+                    "display_name": "alpha",
+                    "selected": True,
+                },
+            },
+            "version": 3,
+        }
+        second = {
+            "version": 3,
+            "skills": {
+                "alpha": {
+                    "selected": True,
+                    "display_name": "alpha",
+                    "targets": "codex,kimi",
+                    "variants": "codex,kimi-code",
+                },
+                "zeta": {"selected": True, "variants": "kimi"},
+            },
+            "notes": {"a": 1, "z": 2},
+        }
+
+        serialized = serialize_registry(first)
+
+        self.assertEqual(serialized, serialize_registry(second))
+        self.assertEqual(
+            serialized,
+            "\n".join(
+                [
+                    "version: 3",
+                    "skills:",
+                    "  alpha:",
+                    "    selected: true",
+                    "    display_name: alpha",
+                    "    targets: codex,kimi",
+                    "    variants: codex,kimi-code",
+                    "  zeta:",
+                    "    selected: true",
+                    "    variants: kimi",
+                    "notes:",
+                    "  a: 1",
+                    "  z: 2",
+                    "",
+                ]
+            ),
+        )
+
+    def test_v3_rejects_invalid_variant_intent(self):
+        for variants in ("", "kimi,", "kimi,kimi", "Kimi", "../kimi", "/kimi"):
+            with self.subTest(variants=variants):
+                registry = {
+                    "version": 3,
+                    "skills": {
+                        "alpha": {"selected": True, "variants": variants},
+                    },
+                }
+                with self.assertRaisesRegex(ValueError, "variant|Variant|absolute path"):
+                    serialize_registry(registry)
 
     def test_rejects_invalid_indentation(self):
         cases = {

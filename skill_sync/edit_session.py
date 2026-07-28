@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from skill_sync.copying import copy_skill_dir, rename_no_replace
 from skill_sync.hash import is_link_or_reparse
@@ -448,14 +448,45 @@ class EditSessionStore:
         actor: str | None = None,
         workspace_source: str | Path | None = None,
         workspace_hash: str | None = None,
+        target_scope: EditSessionScope | None = None,
+        layer_baseline: EditLayerBaseline | None = None,
+        publication_guard: Callable[[], None] | None = None,
     ) -> tuple[EditSessionMetadata, EditSessionPaths]:
-        """Atomically create a Base snapshot and writable workspace.
+        """Atomically create a snapshot and writable workspace.
 
         The caller hashes the canonical source before entering this method.  A
         different copied hash means the source moved during preparation, so no
         session is published.  The per-Skill lock makes the unfinished-session
         check and final directory publication one operation.
         """
+
+        with self.skill_lock(logical_skill):
+            return self.begin_locked(
+                logical_skill=logical_skill,
+                source=source,
+                baseline_hash=baseline_hash,
+                actor=actor,
+                workspace_source=workspace_source,
+                workspace_hash=workspace_hash,
+                target_scope=target_scope,
+                layer_baseline=layer_baseline,
+                publication_guard=publication_guard,
+            )
+
+    def begin_locked(
+        self,
+        *,
+        logical_skill: str,
+        source: str | Path,
+        baseline_hash: str,
+        actor: str | None = None,
+        workspace_source: str | Path | None = None,
+        workspace_hash: str | None = None,
+        target_scope: EditSessionScope | None = None,
+        layer_baseline: EditLayerBaseline | None = None,
+        publication_guard: Callable[[], None] | None = None,
+    ) -> tuple[EditSessionMetadata, EditSessionPaths]:
+        """Publish a session while the caller holds this Skill's lock."""
 
         source_path = Path(source)
         workspace_source_path = (
@@ -468,59 +499,67 @@ class EditSessionStore:
             logical_skill=logical_skill,
             baseline_hash=baseline_hash,
             actor=actor,
+            target_scope=target_scope,
+            layer_baseline=layer_baseline,
         )
         paths = self.paths(metadata.session_id)
 
-        with self.skill_lock(logical_skill):
-            active = self._unfinished_session(logical_skill)
-            if active is not None:
-                raise ActiveEditSessionError(logical_skill, active.session_id)
+        active = self._unfinished_session(logical_skill)
+        if active is not None:
+            raise ActiveEditSessionError(logical_skill, active.session_id)
 
-            staging = Path(
-                tempfile.mkdtemp(prefix=".begin-", dir=self.root)
+        staging = Path(tempfile.mkdtemp(prefix=".begin-", dir=self.root))
+        try:
+            os.chmod(staging, 0o700)
+            staged_baseline = staging / "baseline"
+            staged_workspace = staging / "workspace"
+            copied_hash = copy_skill_dir(source_path, staged_baseline)
+            if copied_hash != baseline_hash:
+                raise CanonicalSkillChangedError(
+                    "canonical Skill changed while creating the edit baseline"
+                )
+            copied_workspace_hash = copy_skill_dir(
+                staged_baseline if workspace_source is None else workspace_source_path,
+                staged_workspace,
             )
+            if copied_workspace_hash != expected_workspace_hash:
+                raise EditSessionMetadataError(
+                    "edit workspace does not match its expected snapshot"
+                )
+            if publication_guard is not None:
+                publication_guard()
+            _set_snapshot_permissions(staged_baseline, writable=False)
+            _set_snapshot_permissions(staged_workspace, writable=True)
+            _write_json_atomic(
+                staging / EDIT_SESSION_METADATA_FILE,
+                metadata.to_dict(),
+            )
+            rename_no_replace(staging, paths.root)
             try:
-                os.chmod(staging, 0o700)
-                staged_baseline = staging / "baseline"
-                staged_workspace = staging / "workspace"
-                copied_hash = copy_skill_dir(source_path, staged_baseline)
-                if copied_hash != baseline_hash:
-                    raise CanonicalSkillChangedError(
-                        "canonical Skill changed while creating the edit baseline"
-                    )
-                copied_workspace_hash = copy_skill_dir(
-                    staged_baseline if workspace_source is None else workspace_source_path,
-                    staged_workspace,
-                )
-                if copied_workspace_hash != expected_workspace_hash:
-                    raise EditSessionMetadataError(
-                        "edit workspace does not match its expected snapshot"
-                    )
-                _set_snapshot_permissions(staged_baseline, writable=False)
-                _set_snapshot_permissions(staged_workspace, writable=True)
-                _write_json_atomic(
-                    staging / EDIT_SESSION_METADATA_FILE,
-                    metadata.to_dict(),
-                )
-                rename_no_replace(staging, paths.root)
+                _fsync_directory(self.root)
+            except OSError as exc:
                 try:
-                    _fsync_directory(self.root)
-                except OSError as exc:
-                    try:
-                        published = self.load(metadata.session_id)
-                    except (FileNotFoundError, EditSessionMetadataError, OSError):
-                        raise
-                    if published == metadata:
-                        raise EditSessionPublicationRecoveryRequired(
-                            metadata.session_id
-                        ) from exc
+                    published = self.load(metadata.session_id)
+                except (FileNotFoundError, EditSessionMetadataError, OSError):
                     raise
-            except Exception:
-                if staging.exists() and not is_link_or_reparse(staging):
-                    _remove_real_tree(staging)
+                if published == metadata:
+                    raise EditSessionPublicationRecoveryRequired(
+                        metadata.session_id
+                    ) from exc
                 raise
+        except Exception:
+            if staging.exists() and not is_link_or_reparse(staging):
+                _remove_real_tree(staging)
+            raise
 
         return metadata, paths
+
+    def unfinished_session_locked(
+        self, logical_skill: str
+    ) -> EditSessionMetadata | None:
+        """Return an unfinished session while the caller holds this Skill's lock."""
+
+        return self._unfinished_session(logical_skill)
 
     def abort(self, session_id: str) -> EditSessionMetadata:
         """End an active session and remove only its machine-local work trees."""

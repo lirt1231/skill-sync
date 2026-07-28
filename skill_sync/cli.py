@@ -227,9 +227,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "edit",
         help="manage safe Skill edit sessions",
         description=(
-            "Edit managed Base Skills through isolated workspaces. Start with "
-            "managed check, modify only the workspace returned by edit begin, "
-            "then diff, validate, impact, and apply explicitly."
+            "Edit managed Base or Variant source layers through isolated "
+            "workspaces. Start with managed check and modify only the workspace "
+            "returned by edit begin. Scoped downstream operations are enabled "
+            "separately."
         ),
         epilog=(
             "edit apply updates canonical content and affected deployments but never "
@@ -257,15 +258,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     edit_begin_parser = edit_subparsers.add_parser(
         "begin",
-        help="create a Base edit workspace",
-        epilog="example: skill-sync edit begin my-skill --base --actor codex",
+        help="create a Base, family, or client edit workspace",
+        epilog=(
+            "examples: skill-sync edit begin my-skill --base; "
+            "skill-sync edit begin my-skill --family kimi; "
+            "skill-sync edit begin my-skill --client codex"
+        ),
     )
     edit_begin_parser.add_argument("skill", help="selected logical Skill name")
-    edit_begin_parser.add_argument(
+    edit_begin_scope = edit_begin_parser.add_mutually_exclusive_group(required=True)
+    edit_begin_scope.add_argument(
         "--base",
         action="store_true",
-        required=True,
         help="edit the canonical Base Skill",
+    )
+    edit_begin_scope.add_argument(
+        "--family",
+        help="edit a registered Agent-family Variant layer",
+    )
+    edit_begin_scope.add_argument(
+        "--client",
+        help="edit a registered concrete-client Variant layer",
     )
     edit_begin_parser.add_argument("--actor", help="client or Agent starting the edit")
     edit_begin_parser.add_argument("--json", action="store_true", help="print JSON output")
@@ -283,16 +296,20 @@ def _build_parser() -> argparse.ArgumentParser:
         protocol_command="edit abort",
     )
     edit_diff_parser = edit_subparsers.add_parser(
-        "diff", help="show changes in an active Base edit workspace"
+        "diff", help="show authored-layer and resolved client changes"
     )
     edit_diff_parser.add_argument("session_id", help="edit session UUID")
+    edit_diff_parser.add_argument(
+        "--resolved-client",
+        help="limit a scoped session's resolved diff to one affected client",
+    )
     edit_diff_parser.add_argument("--json", action="store_true", help="print JSON output")
     edit_diff_parser.set_defaults(
         handler=_handle_edit_diff,
         protocol_command="edit diff",
     )
     edit_validate_parser = edit_subparsers.add_parser(
-        "validate", help="validate an active Base edit workspace"
+        "validate", help="validate an active Base or Variant edit workspace"
     )
     edit_validate_parser.add_argument("session_id", help="edit session UUID")
     edit_validate_parser.add_argument(
@@ -303,7 +320,7 @@ def _build_parser() -> argparse.ArgumentParser:
         protocol_command="edit validate",
     )
     edit_impact_parser = edit_subparsers.add_parser(
-        "impact", help="preview Base deployment impact"
+        "impact", help="preview Base, family, or client deployment impact"
     )
     edit_impact_parser.add_argument("session_id", help="edit session UUID")
     edit_impact_parser.add_argument("--json", action="store_true", help="print JSON output")
@@ -487,7 +504,15 @@ def _handle_preview(args: argparse.Namespace) -> Any:
     result = core.sync_preview(skill_names=args.skills, config_path=args.config, fetch_remote=False)
     if args.json:
         return result
-    return f"Next action: {result['action']}\n{result['summary']}"
+    lines = [f"Next action: {result['action']}", result["summary"]]
+    for unit in result.get("units", []):
+        if unit["state"] == "current":
+            continue
+        label = unit["skill"] + "/" + (
+            "Base" if unit["kind"] == "base" else f"Variant:{unit['target']}"
+        )
+        lines.append(f"- {label}: {unit['state']}")
+    return "\n".join(lines)
 
 
 def _handle_pull(args: argparse.Namespace) -> str:
@@ -710,16 +735,28 @@ def _handle_variant_validate(args: argparse.Namespace) -> Any:
 
 
 def _handle_edit_begin(args: argparse.Namespace) -> Any:
+    if args.base:
+        scope, target = "base", None
+    elif args.family is not None:
+        scope, target = "family", args.family
+    else:
+        scope, target = "client", args.client
     result = core.edit_begin(
         args.skill,
+        scope=scope,
+        target=target,
         actor=args.actor,
         config_path=args.config,
     )
     if args.json:
         return result
+    scope_label = scope.title() + (f":{target}" if target else "")
     return "\n".join(
         (
-            f"Edit session: {result['session_id']} ({result['skill']}, Base)",
+            (
+                f"Edit session: {result['session_id']} "
+                f"({result['skill']}, {scope_label})"
+            ),
             f"Baseline: {result['baseline_hash']}",
             f"Workspace: {result['workspace_path']}",
         )
@@ -734,27 +771,43 @@ def _handle_edit_abort(args: argparse.Namespace) -> Any:
 
 
 def _handle_edit_diff(args: argparse.Namespace) -> Any:
-    result = core.edit_diff(args.session_id, config_path=args.config)
+    result = core.edit_diff(
+        args.session_id,
+        resolved_client=args.resolved_client,
+        config_path=args.config,
+    )
     if args.json:
         return result
-    lines = [f"Edit diff: {result['session_id']} ({result['skill']}, Base)"]
+    scope = result["scope"].title()
+    if result.get("target"):
+        scope += f":{result['target']}"
+    lines = [f"Edit diff: {result['session_id']} ({result['skill']}, {scope})"]
     if not result["changed"]:
-        lines.append("No changes.")
-        return "\n".join(lines)
-    summary = result["summary"]
-    lines.append(
-        f"Summary: {summary['added']} added, {summary['modified']} modified, "
-        f"{summary['deleted']} deleted"
-    )
-    for item in result["files"]:
-        lines.append(f"- {item['change']} {item['kind']}: {item['path']}")
         lines.append(
-            f"  hashes: {item['old_hash'] or 'none'} -> {item['new_hash'] or 'none'}; "
-            f"bytes: {item['old_size'] if item['old_size'] is not None else 'none'} -> "
-            f"{item['new_size'] if item['new_size'] is not None else 'none'}"
+            "No authored-layer changes."
+            if result.get("resolved_diffs")
+            else "No changes."
         )
-        if item["kind"] == "text" and item["diff"]:
-            lines.append(item["diff"].rstrip("\n"))
+    else:
+        summary = result["summary"]
+        lines.append(
+            f"Summary: {summary['added']} added, {summary['modified']} modified, "
+            f"{summary['deleted']} deleted"
+        )
+        for item in result["files"]:
+            lines.append(f"- {item['change']} {item['kind']}: {item['path']}")
+            lines.append(
+                f"  hashes: {item['old_hash'] or 'none'} -> {item['new_hash'] or 'none'}; "
+                f"bytes: {item['old_size'] if item['old_size'] is not None else 'none'} -> "
+                f"{item['new_size'] if item['new_size'] is not None else 'none'}"
+            )
+            if item["kind"] == "text" and item["diff"]:
+                lines.append(item["diff"].rstrip("\n"))
+    for resolved in result.get("resolved_diffs", []):
+        lines.append(
+            f"Resolved {resolved['client']}: "
+            f"{resolved['summary']['total']} changed files"
+        )
     return "\n".join(lines)
 
 
@@ -763,8 +816,11 @@ def _handle_edit_validate(args: argparse.Namespace) -> Any:
     if args.json:
         return result
     state = "valid" if result["valid"] else "invalid"
+    scope = result["scope"].title()
+    if result.get("target"):
+        scope += f":{result['target']}"
     lines = [
-        f"Validation: {state} ({result['session_id']}, {result['skill']}, Base)",
+        f"Validation: {state} ({result['session_id']}, {result['skill']}, {scope})",
         f"Workspace: {result['workspace_hash'] or 'unsafe'}",
         f"Changes: {'yes' if result['changed'] else 'no'}",
         f"Issues: {len(result['issues'])}",
@@ -780,8 +836,11 @@ def _handle_edit_impact(args: argparse.Namespace) -> Any:
     result = core.edit_impact(args.session_id, config_path=args.config)
     if args.json:
         return result
+    scope = result["scope"].title()
+    if result.get("target"):
+        scope += f":{result['target']}"
     lines = [
-        f"Impact: {result['session_id']} ({result['skill']}, Base)",
+        f"Impact: {result['session_id']} ({result['skill']}, {scope})",
         f"Stale baseline: {'yes' if result['stale_baseline'] else 'no'}",
         (
             f"Blocked: {'yes' if result['blocked'] else 'no'}"
@@ -805,11 +864,15 @@ def _handle_edit_apply(args: argparse.Namespace) -> Any:
     result = core.edit_apply(args.session_id, config_path=args.config)
     if args.json:
         return result
+    scope = result["scope"].title()
+    if result.get("target"):
+        scope += f":{result['target']}"
+    previous = result.get("previous_hash") or result.get("previous_layer")
     return "\n".join(
         (
-            f"Applied edit session: {result['session_id']} ({result['skill']}, Base)",
-            f"Canonical: {result['previous_hash']} -> {result['applied_hash']}",
-            f"Backup: {result['backup_path']}",
+            f"Applied edit session: {result['session_id']} ({result['skill']}, {scope})",
+            f"Canonical: {previous} -> {result['applied_hash']}",
+            f"Backup: {result['backup_path'] or 'not-required (layer was absent)'}",
             f"Receipt: {result['receipt_path']}",
             (
                 f"Deployments rebuilt: {'yes' if result['deployments_rebuilt'] else 'no'}; "
@@ -968,6 +1031,9 @@ def _format_status(result: dict[str, Any]) -> str:
         lines.append(
             f"- {skill['name']} [{skill['platform']}] {change_label}: {skill['local_path']}"
         )
+        for unit in skill.get("units", []):
+            label = "Base" if unit["kind"] == "base" else f"Variant:{unit['target']}"
+            lines.append(f"  - {label}: {unit['state']}")
     return "\n".join(lines)
 
 

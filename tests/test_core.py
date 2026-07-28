@@ -145,6 +145,27 @@ class CoreWorkflowTest(unittest.TestCase):
         self.assertEqual(Path(result["sync_repo_path"]), sync_repo)
         return remote, sync_repo, self.config_path
 
+    def init_global_from_remote(
+        self,
+        *,
+        config_path: Path | None = None,
+        sync_repo: Path | None = None,
+        skills_root: Path | None = None,
+    ) -> tuple[Path, Path, Path, Path]:
+        _, remote = create_remote_with_registry(self.work)
+        target_config = self.config_path if config_path is None else config_path
+        target_repo = self.work / "sync" if sync_repo is None else sync_repo
+        target_skills = self.work / "global" / "skills" if skills_root is None else skills_root
+        init_sync(
+            str(remote),
+            sync_dir=target_repo,
+            platform=None,
+            skills_root=target_skills,
+            config_path=target_config,
+        )
+        configure_identity(target_repo)
+        return remote, target_repo, target_config, target_skills
+
     def select_default_skill(self, name: str, text: str | None = None) -> Path:
         skill = make_skill(self.skill_root, name, text)
         select_skills(
@@ -160,7 +181,6 @@ class CoreWorkflowTest(unittest.TestCase):
             ("codex", "codex", "Codex"),
             ("workbuddy", "workbuddy", "WorkBuddy"),
             ("kimi-code", "kimi", "Kimi Code"),
-            ("kimi-desktop", "kimi", "Kimi Desktop"),
             ("claude-code", "claude", "Claude Code"),
         )
         return [
@@ -529,56 +549,7 @@ class CoreWorkflowTest(unittest.TestCase):
         )
         self.assertEqual(
             [client["name"] for client in result["clients"]],
-            ["codex", "workbuddy", "kimi-code", "kimi-desktop", "claude-code"],
-        )
-
-    def test_doctor_reports_kimi_desktop_as_concrete_client_and_legacy_family(self):
-        self.init_from_remote()
-        self.select_default_skill("alpha")
-        clients = self.detected_clients("kimi-desktop")
-
-        with mock.patch.object(core_module, "detect_clients", return_value=clients):
-            result = core_module.doctor(config_path=self.config_path)
-
-        kimi = next(agent for agent in result["agents"] if agent["name"] == "kimi")
-        self.assertTrue(kimi["detected"])
-        self.assertEqual(kimi["skills_dirs"], [str(clients[3].skills_dir)])
-        self.assertEqual(
-            result["client_matrix"],
-            [
-                {
-                    "skill": "alpha",
-                    "client": "kimi-desktop",
-                    "agent": "kimi",
-                    "state": "missing",
-                }
-            ],
-        )
-
-    def test_doctor_aggregates_both_kimi_clients_without_changing_family_matrix(self):
-        self.init_from_remote()
-        source = self.select_default_skill("alpha")
-        clients = self.detected_clients("kimi-code", "kimi-desktop")
-        core_module.create_directory_link(source, clients[2].skills_dir / "alpha")
-
-        with mock.patch.object(core_module, "detect_clients", return_value=clients):
-            result = core_module.doctor(config_path=self.config_path)
-
-        kimi = next(agent for agent in result["agents"] if agent["name"] == "kimi")
-        self.assertEqual(
-            kimi["skills_dirs"],
-            [str(clients[2].skills_dir), str(clients[3].skills_dir)],
-        )
-        self.assertEqual(
-            result["matrix"],
-            [{"skill": "alpha", "agent": "kimi", "state": "partial"}],
-        )
-        self.assertEqual(
-            {
-                row["client"]: row["state"]
-                for row in result["client_matrix"]
-            },
-            {"kimi-code": "direct-source-link", "kimi-desktop": "missing"},
+            ["codex", "workbuddy", "kimi-code", "claude-code"],
         )
 
     def test_managed_check_inspects_agent_path_without_fetching_or_mutating(self):
@@ -812,6 +783,424 @@ class CoreWorkflowTest(unittest.TestCase):
             hash_skill_dir(skill),
         )
 
+    def test_push_packages_only_registry_declared_portable_variant_sources(self):
+        _, repo, config_path, skills_root = self.init_global_from_remote()
+        skill = make_skill(skills_root, "alpha", "# alpha\n")
+        select_skills(
+            ["alpha"],
+            platform=None,
+            config_path=config_path,
+            skill_dir=skills_root,
+        )
+        created = core_module.variant_source.create_variant(
+            "alpha",
+            scope="family",
+            target="kimi",
+            config_path=config_path,
+        )
+        write_file(Path(created["path"]), "family.txt", "family\n")
+        undeclared = skills_root.parent / "variants" / "alpha" / "claude-code"
+        write_file(
+            undeclared,
+            "variant.yaml",
+            "version: 1\ntarget: claude-code\nmode: overlay\n",
+        )
+        write_file(undeclared, "local-only.txt", "local\n")
+        config = load_config(config_path)
+        config["data_root"] = str(self.work / "machine-state")
+        save_config(config_path, config)
+        write_file(self.work / "machine-state", "deployments/private/receipt.json", "{}\n")
+        write_file(self.work / "machine-state", "sessions/private/metadata.json", "{}\n")
+        write_file(self.work / "machine-state", "backups/private/data.txt", "private\n")
+
+        result = push(config_path=config_path, message="publish portable variants")
+
+        self.assertEqual(result["pushed"], ["alpha"])
+        self.assertEqual(
+            [(item["skill"], item["target"]) for item in result["pushed_variants"]],
+            [("alpha", "kimi")],
+        )
+        self.assertEqual(
+            read_file(repo, "variants/alpha/kimi/family.txt"),
+            "family\n",
+        )
+        self.assertFalse((repo / "variants" / "alpha" / "claude-code").exists())
+        tracked = set(run_git(repo, ["ls-files"]).splitlines())
+        self.assertEqual(
+            tracked,
+            {
+                "registry.yaml",
+                "skills/alpha/SKILL.md",
+                "variants/alpha/kimi/family.txt",
+                "variants/alpha/kimi/variant.yaml",
+            },
+        )
+        repository_text = "\n".join(
+            (repo / path).read_text(encoding="utf-8")
+            for path in sorted(tracked)
+        )
+        self.assertNotIn(str(skill), repository_text)
+        self.assertNotIn(str(self.work / "machine-state"), repository_text)
+        baselines = load_config(config_path)["skills"]["alpha"]["variant_baselines"]
+        self.assertEqual(set(baselines), {"kimi"})
+
+    def test_pull_reconstructs_registry_declared_variants_on_fresh_machine(self):
+        remote, _, first_config, first_skills = self.init_global_from_remote()
+        make_skill(first_skills, "alpha", "# alpha\n")
+        select_skills(
+            ["alpha"],
+            platform=None,
+            config_path=first_config,
+            skill_dir=first_skills,
+        )
+        created = core_module.variant_source.create_variant(
+            "alpha",
+            scope="client",
+            target="codex",
+            config_path=first_config,
+        )
+        write_file(Path(created["path"]), "client.txt", "codex\n")
+        pushed = push(config_path=first_config, message="publish codex variant")
+
+        second_config = self.work / "second-config.json"
+        second_repo = self.work / "second-sync"
+        second_skills = self.work / "second-global" / "skills"
+        init_sync(
+            str(remote),
+            sync_dir=second_repo,
+            platform=None,
+            skills_root=second_skills,
+            config_path=second_config,
+        )
+        configure_identity(second_repo)
+
+        result = pull(config_path=second_config)
+
+        destination = second_skills.parent / "variants" / "alpha" / "codex"
+        self.assertEqual(result["pulled"], ["alpha"])
+        self.assertEqual(
+            [(item["skill"], item["target"]) for item in result["pulled_variants"]],
+            [("alpha", "codex")],
+        )
+        self.assertEqual(read_file(destination, "client.txt"), "codex\n")
+        self.assertEqual(
+            result["pulled_variants"][0]["hash"],
+            pushed["pushed_variants"][0]["hash"],
+        )
+        second_baselines = load_config(second_config)["skills"]["alpha"][
+            "variant_baselines"
+        ]
+        self.assertEqual(
+            second_baselines["codex"],
+            pushed["pushed_variants"][0]["hash"],
+        )
+
+    def test_push_stops_when_registry_declared_variant_source_is_missing(self):
+        _, repo, config_path, skills_root = self.init_global_from_remote()
+        make_skill(skills_root, "alpha", "# alpha\n")
+        select_skills(
+            ["alpha"],
+            platform=None,
+            config_path=config_path,
+            skill_dir=skills_root,
+        )
+        created = core_module.variant_source.create_variant(
+            "alpha",
+            scope="client",
+            target="codex",
+            config_path=config_path,
+        )
+        shutil.rmtree(created["path"])
+
+        with self.assertRaisesRegex(SkillSyncError, "codex|source|directory"):
+            push(config_path=config_path, message="must not publish partial variants")
+
+        self.assertFalse((repo / "skills" / "alpha").exists())
+        self.assertFalse((repo / "variants" / "alpha").exists())
+
+    def test_pull_stops_before_overwriting_locally_changed_variant_source(self):
+        remote, _, first_config, first_skills = self.init_global_from_remote()
+        make_skill(first_skills, "alpha", "# alpha\n")
+        select_skills(
+            ["alpha"],
+            platform=None,
+            config_path=first_config,
+            skill_dir=first_skills,
+        )
+        created = core_module.variant_source.create_variant(
+            "alpha",
+            scope="family",
+            target="kimi",
+            config_path=first_config,
+        )
+        write_file(Path(created["path"]), "family.txt", "remote\n")
+        push(config_path=first_config, message="publish kimi variant")
+
+        second_config = self.work / "second-config.json"
+        second_repo = self.work / "second-sync"
+        second_skills = self.work / "second-global" / "skills"
+        init_sync(
+            str(remote),
+            sync_dir=second_repo,
+            platform=None,
+            skills_root=second_skills,
+            config_path=second_config,
+        )
+        configure_identity(second_repo)
+        pull(config_path=second_config)
+        local_variant = second_skills.parent / "variants" / "alpha" / "kimi"
+        write_file(local_variant, "family.txt", "local changed\n")
+
+        with self.assertRaisesRegex(SkillSyncError, "locally changed Variant"):
+            pull(config_path=second_config)
+
+        self.assertEqual(read_file(local_variant, "family.txt"), "local changed\n")
+        self.assertEqual(read_file(second_skills / "alpha", "SKILL.md"), "# alpha\n")
+
+    def test_registry_v2_push_and_pull_leave_variant_roots_untouched(self):
+        _, repo, config_path, skills_root = self.init_global_from_remote()
+        skill = make_skill(skills_root, "alpha", "# alpha v1\n")
+        select_skills(
+            ["alpha"],
+            platform=None,
+            config_path=config_path,
+            skill_dir=skills_root,
+        )
+        registry_path = repo / "registry.yaml"
+        registry = load_registry(registry_path)
+        registry["version"] = 2
+        registry["skills"]["alpha"]["targets"] = "codex"
+        save_registry(registry_path, registry)
+        local_variant = skills_root.parent / "variants" / "alpha" / "codex"
+        write_file(local_variant, "local-only.txt", "keep\n")
+
+        push(config_path=config_path, message="v2 base only")
+
+        self.assertFalse((repo / "variants").exists())
+        self.assertNotIn(
+            "variant_baselines",
+            load_config(config_path)["skills"]["alpha"],
+        )
+        write_file(skill, "SKILL.md", "# local changed after push\n")
+        config = load_config(config_path)
+        config["skills"]["alpha"]["last_installed_hash"] = hash_skill_dir(skill)
+        save_config(config_path, config)
+
+        pull(config_path=config_path)
+
+        self.assertEqual(read_file(local_variant, "local-only.txt"), "keep\n")
+
+    def test_push_reconciles_removed_registry_variant_target_as_exact_set(self):
+        _, repo, config_path, skills_root = self.init_global_from_remote()
+        make_skill(skills_root, "alpha", "# alpha\n")
+        select_skills(
+            ["alpha"],
+            platform=None,
+            config_path=config_path,
+            skill_dir=skills_root,
+        )
+        for target in ("codex", "kimi-code"):
+            created = core_module.variant_source.create_variant(
+                "alpha",
+                scope="client",
+                target=target,
+                config_path=config_path,
+            )
+            write_file(Path(created["path"]), f"{target}.txt", f"{target}\n")
+        push(config_path=config_path, message="publish two variants")
+        registry_path = repo / "registry.yaml"
+        registry = load_registry(registry_path)
+        registry["skills"]["alpha"]["variants"] = "codex"
+        save_registry(registry_path, registry)
+
+        result = push(config_path=config_path, message="remove kimi-code intent")
+
+        self.assertEqual(
+            [(row["skill"], row["target"]) for row in result["pushed_variants"]],
+            [("alpha", "codex")],
+        )
+        self.assertTrue((repo / "variants" / "alpha" / "codex").is_dir())
+        self.assertFalse((repo / "variants" / "alpha" / "kimi-code").exists())
+        self.assertTrue(
+            (skills_root.parent / "variants" / "alpha" / "kimi-code").is_dir()
+        )
+        self.assertEqual(
+            set(load_config(config_path)["skills"]["alpha"]["variant_baselines"]),
+            {"codex"},
+        )
+
+    def test_filtered_push_does_not_touch_other_skill_variant_set(self):
+        _, repo, config_path, skills_root = self.init_global_from_remote()
+        for skill_name, target in (("alpha", "codex"), ("beta", "kimi")):
+            make_skill(skills_root, skill_name, f"# {skill_name}\n")
+            select_skills(
+                [skill_name],
+                platform=None,
+                config_path=config_path,
+                skill_dir=skills_root,
+            )
+            created = core_module.variant_source.create_variant(
+                skill_name,
+                scope="client" if target == "codex" else "family",
+                target=target,
+                config_path=config_path,
+            )
+            write_file(Path(created["path"]), "value.txt", f"{skill_name} v1\n")
+        push(config_path=config_path, message="publish both variants")
+        beta_repo_variant = repo / "variants" / "beta" / "kimi"
+        beta_hash = hash_skill_dir(beta_repo_variant)
+        write_file(
+            skills_root.parent / "variants" / "beta" / "kimi",
+            "value.txt",
+            "beta local v2\n",
+        )
+        write_file(
+            skills_root.parent / "variants" / "alpha" / "codex",
+            "value.txt",
+            "alpha local v2\n",
+        )
+
+        result = push(
+            config_path=config_path,
+            skill_names=["alpha"],
+            message="publish alpha only",
+        )
+
+        self.assertEqual(
+            [(row["skill"], row["target"]) for row in result["pushed_variants"]],
+            [("alpha", "codex")],
+        )
+        self.assertEqual(hash_skill_dir(beta_repo_variant), beta_hash)
+
+    def test_variant_aware_sync_merges_changes_to_different_units(self):
+        remote, _, first_config, first_skills = self.init_global_from_remote()
+        make_skill(first_skills, "alpha", "# alpha\n")
+        select_skills(
+            ["alpha"],
+            platform=None,
+            config_path=first_config,
+            skill_dir=first_skills,
+        )
+        for target in ("codex", "kimi"):
+            created = core_module.variant_source.create_variant(
+                "alpha",
+                scope="client" if target == "codex" else "family",
+                target=target,
+                config_path=first_config,
+            )
+            write_file(Path(created["path"]), "value.txt", f"{target} v1\n")
+        push(config_path=first_config, message="publish initial variants")
+
+        second_config = self.work / "second-config.json"
+        second_repo = self.work / "second-sync"
+        second_skills = self.work / "second-global" / "skills"
+        init_sync(
+            str(remote),
+            sync_dir=second_repo,
+            platform=None,
+            skills_root=second_skills,
+            config_path=second_config,
+        )
+        configure_identity(second_repo)
+        pull(config_path=second_config)
+
+        first_kimi = first_skills.parent / "variants" / "alpha" / "kimi"
+        write_file(first_kimi, "value.txt", "kimi remote v2\n")
+        push(config_path=first_config, message="update kimi remotely")
+        second_codex = second_skills.parent / "variants" / "alpha" / "codex"
+        write_file(second_codex, "value.txt", "codex local v2\n")
+
+        preview = sync_preview(config_path=second_config, fetch_remote=True)
+
+        self.assertEqual(preview["action"], "pull")
+        units = {(row["kind"], row.get("target")): row for row in preview["units"]}
+        self.assertTrue(units[("variant", "codex")]["changed_local"])
+        self.assertFalse(units[("variant", "codex")]["changed_remote"])
+        self.assertFalse(units[("variant", "kimi")]["changed_local"])
+        self.assertTrue(units[("variant", "kimi")]["changed_remote"])
+
+        result = sync(config_path=second_config)
+
+        self.assertEqual(read_file(second_codex, "value.txt"), "codex local v2\n")
+        self.assertEqual(
+            read_file(
+                second_skills.parent / "variants" / "alpha" / "kimi",
+                "value.txt",
+            ),
+            "kimi remote v2\n",
+        )
+        self.assertEqual(
+            [(row["skill"], row["target"]) for row in result["preserved_variants"]],
+            [("alpha", "codex")],
+        )
+        refreshed = status(config_path=second_config, fetch_remote=False)
+        refreshed_units = {
+            (row["kind"], row.get("target")): row
+            for row in refreshed["skills"][0]["units"]
+        }
+        self.assertTrue(refreshed_units[("variant", "codex")]["changed_local"])
+        self.assertFalse(refreshed_units[("variant", "kimi")]["changed_local"])
+        diagnosis = core_module.doctor(
+            config_path=second_config,
+            clients=self.detected_clients(),
+        )
+        doctor_units = {
+            (row["kind"], row.get("target")): row
+            for row in diagnosis["sync_units"]
+        }
+        self.assertTrue(doctor_units[("variant", "codex")]["changed_local"])
+        self.assertFalse(doctor_units[("variant", "kimi")]["changed_local"])
+
+    def test_variant_aware_sync_stops_same_unit_conflict_before_fast_forward(self):
+        remote, _, first_config, first_skills = self.init_global_from_remote()
+        make_skill(first_skills, "alpha", "# alpha\n")
+        select_skills(
+            ["alpha"],
+            platform=None,
+            config_path=first_config,
+            skill_dir=first_skills,
+        )
+        created = core_module.variant_source.create_variant(
+            "alpha",
+            scope="client",
+            target="codex",
+            config_path=first_config,
+        )
+        write_file(Path(created["path"]), "value.txt", "codex v1\n")
+        push(config_path=first_config, message="publish codex")
+
+        second_config = self.work / "second-config.json"
+        second_repo = self.work / "second-sync"
+        second_skills = self.work / "second-global" / "skills"
+        init_sync(
+            str(remote),
+            sync_dir=second_repo,
+            platform=None,
+            skills_root=second_skills,
+            config_path=second_config,
+        )
+        configure_identity(second_repo)
+        pull(config_path=second_config)
+        old_head = run_git(second_repo, ["rev-parse", "HEAD"])
+        second_codex = second_skills.parent / "variants" / "alpha" / "codex"
+        write_file(second_codex, "value.txt", "codex local v2\n")
+        write_file(Path(created["path"]), "value.txt", "codex remote v2\n")
+        push(config_path=first_config, message="update codex remotely")
+
+        preview = sync_preview(config_path=second_config, fetch_remote=True)
+
+        self.assertEqual(preview["action"], "conflict")
+        conflicts = [row for row in preview["units"] if row["state"] == "conflict"]
+        self.assertEqual(
+            [(row["skill"], row["kind"], row["target"]) for row in conflicts],
+            [("alpha", "variant", "codex")],
+        )
+        with self.assertRaisesRegex(SkillSyncError, "both|conflict"):
+            sync(config_path=second_config)
+
+        self.assertEqual(run_git(second_repo, ["rev-parse", "HEAD"]), old_head)
+        self.assertEqual(read_file(second_codex, "value.txt"), "codex local v2\n")
+
     def test_push_rejects_unrelated_dirty_sync_repo_changes(self):
         self.init_from_remote()
         self.select_default_skill("alpha")
@@ -978,7 +1367,12 @@ class CoreWorkflowTest(unittest.TestCase):
         push(config_path=self.config_path, skill_names=["alpha"])
 
         run_git(source, ["pull", "--ff-only", "origin", "main"])
-        make_commit(source, "remote.txt", "remote\n", "remote change")
+        make_commit(
+            source,
+            "skills/alpha/SKILL.md",
+            "# alpha remote changed\n",
+            "remote base change",
+        )
         run_git(source, ["push", "origin", "HEAD:main"])
         write_file(skill, "local.txt", "local changed\n")
 
@@ -1013,7 +1407,12 @@ class CoreWorkflowTest(unittest.TestCase):
         self.init_from_remote()
         self.select_default_skill("alpha", "# alpha v1\n")
         push(config_path=self.config_path, skill_names=["alpha"])
-        with mock.patch.object(core_module.git, "fetch") as fetch:
+        clients = self.detected_clients("codex")
+        with mock.patch.object(core_module.git, "fetch") as fetch, mock.patch.object(
+            core_module,
+            "detect_clients",
+            return_value=clients,
+        ):
             preview = sync_preview(config_path=self.config_path)
         fetch.assert_not_called()
         self.assertEqual(preview["action"], "noop")
@@ -1023,7 +1422,10 @@ class CoreWorkflowTest(unittest.TestCase):
         self.init_from_remote()
         self.select_default_skill("alpha", "# alpha v1\n")
         push(config_path=self.config_path, skill_names=["alpha"])
-        diagnosis = core_module.doctor(config_path=self.config_path)
+        diagnosis = core_module.doctor(
+            config_path=self.config_path,
+            clients=self.detected_clients("codex"),
+        )
 
         with mock.patch.object(core_module, "doctor") as doctor:
             preview = sync_preview(

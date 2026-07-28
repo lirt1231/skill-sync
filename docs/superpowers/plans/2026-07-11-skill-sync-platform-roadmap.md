@@ -32,7 +32,7 @@ Resolution order:
 
 1. common Base Skill;
 2. Agent-family Variant, such as `kimi`, overrides Base paths;
-3. the exact-client Variant, such as `kimi-desktop`, overrides both.
+3. the exact-client Variant, such as `kimi-code`, overrides both.
 
 ### 2.2 Source files and generated files must be distinguishable
 
@@ -74,7 +74,7 @@ Separate the current Agent target into two concepts:
 
 - **Agent family**: the user-facing product group, such as `kimi`.
 - **Agent client**: a concrete installation endpoint with a stable ID, such as
-  `kimi-code` or `kimi-desktop`.
+  `kimi-code` or `claude-code`.
 
 Initial model:
 
@@ -83,11 +83,9 @@ Initial model:
 | Codex | `codex` | `${CODEX_HOME:-~/.codex}/skills` |
 | WorkBuddy | `workbuddy` | `${WORKBUDDY_HOME:-~/.workbuddy}/skills` |
 | Kimi | `kimi-code` | `$KIMI_CODE_SKILLS_DIR` or `~/.config/agents/skills` |
-| Kimi | `kimi-desktop` | `$KIMI_DESKTOP_SKILLS_DIR` or the Daimon Skill directory |
 | Claude | `claude-code` | `${CLAUDE_HOME:-~/.claude}/skills` |
 
-The UI may still show one Kimi group, but status and variant resolution operate
-on the two concrete clients. A grouped state is derived from its client states.
+The UI shows one Kimi group backed by the Kimi Code client.
 
 ### 3.2 Canonical filesystem layout
 
@@ -103,10 +101,10 @@ on the two concrete clients. A grouped state is derived from its client states.
         ├── kimi/
         │   ├── variant.yaml
         │   └── SKILL.md
-        ├── kimi-desktop/
+        ├── kimi-code/
         │   ├── variant.yaml
         │   ├── SKILL.md
-        │   └── references/desktop.md
+        │   └── references/code.md
         └── codex/
             └── variant.yaml
 ```
@@ -196,7 +194,7 @@ skills:
   meeting-note:
     selected: true
     targets: codex,workbuddy,kimi,claude
-    variants: codex,kimi-desktop
+    variants: codex,kimi-code
 ```
 
 The registry records intent. Detection results, absolute directories, rendered
@@ -296,14 +294,17 @@ as safely unmanaged.
 ### 4.1 Create a client variant
 
 ```bash
-skill-sync variant create meeting-note --client kimi-desktop
+skill-sync variant create meeting-note --client kimi-code
 skill-sync variant validate meeting-note
-skill-sync resolve meeting-note --client kimi-desktop --dry-run
-skill-sync diff meeting-note --base --client kimi-desktop
+skill-sync resolve meeting-note --client kimi-code --dry-run
+skill-sync diff meeting-note --base --client kimi-code
 ```
 
-Through 7.6, create/validate/resolve/diff are local source and inspection
-commands. `preview`, `sync`, and `link` are not yet Variant-aware.
+Through 9.1, create/validate/resolve/diff remain local source and inspection
+commands. Deployment preview/migrate, `link`, doctor, ownership, and managed
+Base/Family/Client edit apply resolve local Variants. Creating or first
+publishing a Variant records portable target intent in registry v3; `sync`,
+`pull`, `push`, and Web flows are not yet Variant source-aware.
 
 ### 4.2 Inspect a resolved Skill
 
@@ -388,10 +389,10 @@ For Codex-specific tool vocabulary or behavior:
 skill-sync edit begin meeting-note --client codex --actor codex
 ```
 
-For behavior shared by both Kimi clients:
+For behavior shared by the Kimi family:
 
 ```bash
-skill-sync edit begin meeting-note --family kimi --actor kimi-desktop
+skill-sync edit begin meeting-note --family kimi --actor kimi-code
 ```
 
 Scope selection rules for `skill-sync-manager`:
@@ -419,7 +420,7 @@ restart behavior.
 
 ### 5.1 Variant commands
 
-Implemented through 7.6:
+Variant inspection commands implemented through 8.4:
 
 - `variant list [--skill name] [--json]`
 - `variant create <skill> --family|--client <id>`
@@ -524,7 +525,6 @@ Replace the current family-only matrix with a grouped matrix:
 ```text
 Skill          Codex   WorkBuddy   Kimi                  Claude
 meeting-note   base    base        Code: family          client
-                                    Desktop: client
 ```
 
 Each cell shows:
@@ -602,8 +602,8 @@ Deliverables:
 Acceptance criteria:
 
 - Existing users see no link changes after upgrade.
-- `kimi` remains one user-facing family while doctor can report Code and
-  Desktop clients independently.
+- `kimi` remains one user-facing family while doctor reports Kimi Code as its
+  concrete client.
 - No machine-specific absolute path is written to the private repository.
 
 ## Phase 1: Variant resolver MVP
@@ -624,52 +624,41 @@ Deliverables:
 - Path-first managed ownership inspector with stable JSON states.
 - Link engine integration for resolved client outputs.
 - Update `skill-sync-manager` after the ownership and edit commands exist so it
-  requires `managed check` before every Skill modification.
+  requires `managed check` before every Skill modification and chooses the
+  smallest unambiguous Base/Family/Client authored scope.
 - Hashing, path traversal, symlink, atomic build, and cleanup tests.
 
-Implementation checkpoint: commits 7.1 through 7.6 now provide the strict
-`variant.yaml` parser, registry-independent file overlay core, read-only
-layered resolution provenance, Variant source list/create/validate commands,
-read-only resolve/Base-to-client diff commands, and a current-state architecture
-contract with explicit migration limits. The resolver derives the
-registered family from an exact client ID, selects Base → family → exact-client
-sources, applies a shared family/client target only once when the IDs coincide,
-and records immutable ordered layer metadata. Every source layer has a
-deterministic mode-aware hash over the exact immutable bytes and normalized
-file modes used by the overlay plan. Modes use host-independent content
-semantics: immutable bytes beginning with a `#!` shebang become `0755`; every
-other regular file becomes `0644`. Host `st_mode` is never a resolution input,
-so chmod-only differences across macOS and Windows do not change output
-identity. The same planned mode is materialized, with exact staged-mode verification on POSIX and
-content-semantic verification on Windows. Variant manifest semantics are parsed
-directly from the captured `variant.yaml` bytes stored in that layer, so the
-hashed input and applied delete behavior cannot diverge during a race. The
-resolution hash length-prefixes resolver version, exact client, family,
-ordered layer roles/targets, and layer hashes. Local source paths and
-filesystem identities remain explanation/safety evidence but are deliberately
-excluded from the portable hash. Applicable target names plus directory
-identities are rescanned before return; appearance, removal, replacement, or
-case ambiguity fails closed. Resolve and diff use that same immutable overlay
-plan for both sides, expose the shared JSON v1 envelope, and keep binary or
-large-file changes metadata-only. Text unified-diff input is bounded per change
-and across one command, with later paths deterministically reduced to metadata.
-Configured source-root identities are pinned before validation and rechecked
-against the immutable resolution plan, so ancestor replacement fails closed.
-The commands do not materialize output, invoke Git, fetch, update the registry,
-or mutate a source. Registry integration, rendered provenance files,
-deployment/cache mutation, and scoped edit sessions remain later commits and
-must not be inferred from these read-only APIs.
+Implementation checkpoint: commits 7.1 through 8.4 provide the strict
+`variant.yaml` parser, registry-independent immutable overlay core, portable
+mode-aware resolution hashes, Variant source list/create/validate,
+resolve/Base-to-client diff, scoped Base/Family/Client edit sessions, and
+transactional local deployment apply. The resolver derives the registered
+family from an exact client ID, selects Base → family → exact-client sources,
+and applies a shared family/client target only once when the IDs coincide.
+Source paths and filesystem identities remain local safety evidence and are
+excluded from portable hashes and schema-v2 deployment provenance.
+
+Scoped apply replaces or first publishes exactly one authored Variant layer,
+rebuilds only scope-affected detected/enabled clients, and transactionally swaps
+their Agent links. Base apply preserves applicable Variant layers. Ordinary
+failure restores the previous or absent source-layer state and old links;
+ambiguous durability moves the session and receipt to recovery-required state.
+Normal deployment preview/status/migrate, `link`, doctor, and ownership checks
+resolve current local Variants. Base-only clients retain schema-v1 deployment
+identity, while clients with an applicable Variant use schema-v2 layered
+provenance. These local workflows never invoke Git, commit, or push.
 
 The implemented model and its non-goals are maintained in
 [`docs/architecture/variant-resolution.md`](../../architecture/variant-resolution.md).
-Through 7.6 the CLI does not provide `resolve --output` or `variant delete`, and
-normal sync/link/deployment/edit/Web flows are not yet Variant-aware.
+Through 9.1 the CLI does not provide `resolve --output` or `variant delete`.
+Registry v3 target intent is implemented; Variant Git packaging/sync conflicts,
+fresh-machine Variant reconstruction, and Web Variant flows remain later work.
 
 Acceptance criteria:
 
 - One Skill can produce different Codex and Claude `SKILL.md` files while
   sharing scripts and references from the base.
-- `kimi-desktop` overrides `kimi`, and `kimi` overrides base.
+- `kimi-code` overrides `kimi`, and `kimi` overrides base.
 - Editing a base file invalidates every applicable rendered output.
 - Editing a client variant invalidates only affected outputs.
 - Repeated resolution produces the same output hash.
@@ -861,7 +850,7 @@ Acceptance criteria:
 
 ### 8.4 Real-machine smoke tests
 
-- macOS: Codex, WorkBuddy, Kimi Code/Desktop, Claude Code.
+- macOS: Codex, WorkBuddy, Kimi Code, Claude Code.
 - Windows: at least Codex and Claude Code using junction fallback.
 - Second machine: clone, sync, resolve, and compare output hashes.
 
@@ -877,9 +866,8 @@ Acceptance criteria:
    rendered deployments after an explicit preview.
 7. Removing the last applicable variant rebuilds a base-only deployment; it
    does not restore a writable direct-to-base Agent link.
-8. Legacy `kimi-code` and `kimi-desktop` registry target names continue to
-   migrate to the `kimi` family, while remaining valid client IDs for variant
-   resolution.
+8. A legacy `kimi-code` registry deployment target migrates to the `kimi`
+   family while remaining a valid client ID for Variant resolution.
 
 ## 10. Explicit Non-goals for the Near Term
 
