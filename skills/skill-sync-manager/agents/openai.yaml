@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Sync Manager"
+  short_description: "Safely inspect, edit, recover, and sync Agent Skills"
+  default_prompt: "Use $skill-sync-manager to configure Skill Sync or safely inspect, modify, recover, and synchronize my managed Agent Skills."

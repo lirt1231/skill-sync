@@ -10,6 +10,8 @@ class ReleaseReadinessTest(unittest.TestCase):
         for relative in (
             "README.md",
             "LICENSE",
+            "skills/skill-sync-manager/SKILL.md",
+            "skills/skill-sync-manager/agents/openai.yaml",
             "SECURITY.md",
             "CONTRIBUTING.md",
             "CHANGELOG.md",
@@ -46,6 +48,26 @@ class ReleaseReadinessTest(unittest.TestCase):
         self.assertIn('license = { file = "LICENSE" }', metadata)
         self.assertIn('License :: OSI Approved :: MIT License', metadata)
         self.assertIn("[MIT License](LICENSE)", readme)
+
+    def test_repository_manager_skill_matches_the_public_install_contract(self):
+        skill = (ROOT / "skills/skill-sync-manager/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertTrue(skill.startswith("---\nname: skill-sync-manager\n"))
+        self.assertIn("skill-sync managed check", skill)
+        self.assertIn("skill-sync edit begin", skill)
+        self.assertIn("skill-sync edit recover", skill)
+        self.assertIn("kimi-code", skill)
+        self.assertNotIn("kimi-desktop", skill)
+        self.assertIn(
+            "github.com/lirt1231/skill-sync/tree/main/skills/skill-sync-manager",
+            skill,
+        )
+        self.assertIn("Use $skill-installer", readme)
+        self.assertIn("Use $skill-sync-manager", readme)
+        self.assertIn("skill-sync import --agent codex skill-sync-manager", readme)
 
     def test_public_files_do_not_contain_local_home_paths(self):
         for relative in (

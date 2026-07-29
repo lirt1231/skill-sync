@@ -16,6 +16,8 @@ minor releases may contain breaking changes when they are documented here.
   Agent launch, and asynchronous local session deletion.
 - Local Web UI with mutation previews, confirmations, inventory filters, link
   repair, import, backup, deployment inspection, and managed editing.
+- Version-controlled `skill-sync-manager` Agent Skill with guided installation,
+  private repository setup, ownership checks, recovery, and safe updates.
 
 ### Security
 

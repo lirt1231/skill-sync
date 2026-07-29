@@ -75,6 +75,113 @@ The same commands work in macOS/Linux shells and Windows PowerShell. Install
 Python 3.10+, Git, and pipx first. On Windows, if `skill-sync` is not found
 after installation, run `pipx ensurepath` and open a new PowerShell window.
 
+## Install the manager Skill
+
+This repository includes
+[`skill-sync-manager`](skills/skill-sync-manager/SKILL.md), an Agent Skill that
+teaches Codex, WorkBuddy, Kimi Code, and Claude Code to configure Skill Sync,
+check path ownership before edits, use managed workspaces, recover damaged
+deployments, and synchronize only after explicit confirmation.
+
+The CLI and manager Skill are separate installations. Installing the Python
+package provides `skill-sync`; installing the manager Skill lets an Agent use
+that CLI safely on the user's behalf.
+
+### Install with Codex
+
+Ask Codex to install only the manager Skill from this repository:
+
+```text
+Use $skill-installer to install the Skill at
+https://github.com/lirt1231/skill-sync/tree/main/skills/skill-sync-manager.
+Do not install any other Skill from the repository. Tell me when I need to
+restart Codex.
+```
+
+The Codex installer places it under `${CODEX_HOME:-~/.codex}/skills`. Restart
+Codex so the new Skill is discovered. Then configure Skill Sync and move that
+first copy into the canonical managed root:
+
+```bash
+skill-sync init --repo git@github.com:YOUR_ACCOUNT/agent-skills.git
+skill-sync import --agent codex skill-sync-manager
+skill-sync push --skill skill-sync-manager --message "Add skill-sync-manager"
+skill-sync link --skill skill-sync-manager
+skill-sync doctor --json
+```
+
+Use an empty or existing **private** repository for `agent-skills`; do not pass
+this public tool repository to `skill-sync init`. Skip `init` on a machine that
+is already configured. Run `import` only for the first Codex-local copy: if
+`~/.agents/skills/skill-sync-manager` already exists, inspect it with
+`skill-sync managed check skill-sync-manager --json` instead of overwriting it.
+
+After setup, invoke it explicitly when needed:
+
+```text
+Use $skill-sync-manager to diagnose my Skill Sync setup and explain the next
+safe action. Do not mutate, sync, or push until I confirm the preview.
+```
+
+### Install from another Agent or manually
+
+Kimi Code, WorkBuddy, Claude Code, or another filesystem-capable Agent can use
+the same repository without Codex's `$skill-installer`. Give it this prompt:
+
+```text
+Install the Skill Sync CLI from https://github.com/lirt1231/skill-sync with
+pipx. Then clone the repository into a temporary directory and install only
+skills/skill-sync-manager as ~/.agents/skills/skill-sync-manager. Stop and show
+me the existing state if that destination already exists; never overwrite it.
+Ask me for the URL of a separate private Git repository for my Skill data, run
+skill-sync init with that private repository, select skill-sync-manager, push
+it, link it to every detected Agent, and finish with skill-sync doctor --json.
+Never use the public skill-sync tool repository as my Skill data repository.
+```
+
+The equivalent first-install commands, after placing the repository copy at
+`~/.agents/skills/skill-sync-manager`, are:
+
+```bash
+skill-sync init --repo git@github.com:YOUR_ACCOUNT/agent-skills.git
+skill-sync select skill-sync-manager
+skill-sync push --skill skill-sync-manager --message "Add skill-sync-manager"
+skill-sync link --skill skill-sync-manager
+skill-sync doctor --json
+```
+
+On an already initialized machine, skip `init`. `link` exposes the canonical
+copy to every detected and enabled client, including Kimi Code at
+`$KIMI_CODE_SKILLS_DIR` or `~/.config/agents/skills`. Initial bootstrap may copy
+into an absent canonical destination; upgrades must never overwrite it in
+place. Restart or open a new Agent session after linking so the manager Skill
+is discovered.
+
+### Update the manager Skill
+
+First upgrade the CLI, then ask an Agent to update the managed Skill through an
+isolated Base edit session:
+
+```bash
+pipx upgrade agent-skill-sync
+```
+
+```text
+Use $skill-sync-manager to update the managed skill-sync-manager Skill from
+https://github.com/lirt1231/skill-sync/tree/main/skills/skill-sync-manager.
+Check ownership first, edit only a new Base session workspace, and show me the
+diff, validation, and impact before asking whether to apply. Do not sync or
+push until I separately confirm it.
+```
+
+Verify installation and links with:
+
+```bash
+skill-sync version
+skill-sync managed check skill-sync-manager --json
+skill-sync doctor --json
+```
+
 ## Quick start
 
 ```bash
