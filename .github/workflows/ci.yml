@@ -57,7 +57,7 @@ jobs:
           release-venv/bin/python -m pip install --no-index --no-deps dist/*.whl
           release-venv/bin/skill-sync version
           release-venv/bin/skill-sync web --help
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel
           path: dist/*.whl
