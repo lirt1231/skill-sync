@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip setuptools wheel
+      - name: Run tests
+        run: python -m unittest discover -s tests
+      - name: Check JavaScript syntax
+        run: node --check skill_sync/web_static/app.js
+      - name: Check patch formatting
+        run: git diff --check
+
+  build:
+    name: Build and install wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip setuptools wheel
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --no-build-isolation --wheel-dir dist .
+      - name: Install wheel in an isolated environment
+        run: |
+          python -m venv release-venv
+          release-venv/bin/python -m pip install --no-index --no-deps dist/*.whl
+          release-venv/bin/skill-sync version
+          release-venv/bin/skill-sync web --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+          if-no-files-found: error

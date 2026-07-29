@@ -12,6 +12,29 @@ authors = [
   { name = "lijiaming" },
 ]
 dependencies = []
+keywords = ["agents", "skills", "codex", "claude", "kimi", "developer-tools"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.urls]
+Homepage = "https://github.com/lirt1231/skill-sync"
+Documentation = "https://github.com/lirt1231/skill-sync#readme"
+Issues = "https://github.com/lirt1231/skill-sync/issues"
+Source = "https://github.com/lirt1231/skill-sync"
+Changelog = "https://github.com/lirt1231/skill-sync/blob/main/CHANGELOG.md"
 
 [project.scripts]
 skill-sync = "skill_sync.cli:main"

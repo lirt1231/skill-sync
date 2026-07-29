@@ -1,12 +1,47 @@
 # Skill Sync
 
-Synchronize selected user-authored Agent Skills across devices. Managed Skills have one canonical local copy under `~/.agents/skills`; Codex, WorkBuddy, Kimi, and Claude Code consume them through directory links.
+[![CI](https://github.com/lirt1231/skill-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/lirt1231/skill-sync/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)
+
+Synchronize selected user-authored Agent Skills across devices and expose one
+managed source to Codex, WorkBuddy, Kimi Code, and Claude Code.
+
+> **Technical preview:** Skill Sync is pre-1.0 software that manages local
+> files, Git repositories, and Agent links. Keep an independent backup and
+> review every mutation plan before confirming it.
+
+## What it does
+
+- Keeps one canonical local Skill under `~/.agents/skills`.
+- Synchronizes only explicitly selected Skills through your own private Git
+  repository.
+- Creates verified links or Windows junctions for detected Agent clients.
+- Supports Base, Agent-family, and exact-client variants without duplicating
+  unchanged files.
+- Provides a local Web UI for diagnosis, repair, import, managed editing, and
+  explicit synchronization.
+
+The public `skill-sync` tool repository and your private Skill data repository
+are different repositories. Skill content, credentials, edit sessions,
+deployments, backups, and local machine paths are not stored in this project.
+
+## Platform status
+
+| Capability | macOS | Linux | Windows |
+| --- | --- | --- | --- |
+| CLI synchronization and local Web UI | Verified | Automated tests | Automated tests; real-machine smoke pending |
+| Agent links | Symbolic links | Symbolic links | Symbolic link or directory junction |
+| Open Codex/Kimi Code edit session | Supported | Not yet supported | Not yet supported |
+
+Detected Skill targets are Codex, WorkBuddy, Kimi Code, and Claude Code. Agent
+installation paths vary by client; run `skill-sync doctor --json` before the
+first mutation.
 
 ## Requirements
 
 - Python 3.10+
 - Git
-- A private Git repository
+- An empty or existing private Git repository for your Skill data
 
 ## Install skill-sync
 
@@ -15,14 +50,14 @@ Install directly from the tool's Git repository with
 isolated environment and makes it available from any directory:
 
 ```bash
-pipx install "git+https://github.com/YOUR_NAME/skill-sync.git"
+pipx install "git+https://github.com/lirt1231/skill-sync.git"
 skill-sync version
 ```
 
-For a private repository over SSH:
+Install the tool over SSH instead when preferred:
 
 ```bash
-pipx install "git+ssh://git@github.com/YOUR_NAME/skill-sync.git"
+pipx install "git+ssh://git@github.com/lirt1231/skill-sync.git"
 ```
 
 Upgrade an existing installation after the tool repository changes:
@@ -38,13 +73,17 @@ after installation, run `pipx ensurepath` and open a new PowerShell window.
 ## Quick start
 
 ```bash
-./skill-sync init --repo git@github.com:YOUR_NAME/agent-skills.git
-./skill-sync scan
-./skill-sync select skill-sync-manager my-skill
-./skill-sync push --message "Add my Skills"
-./skill-sync link
-./skill-sync web
+skill-sync init --repo git@github.com:YOUR_ACCOUNT/agent-skills.git
+skill-sync scan
+skill-sync select my-skill
+skill-sync push --message "Add my Skills"
+skill-sync link
+skill-sync web
 ```
+
+The repository passed to `init` contains your Skill data and should normally be
+private. Opening the Web UI does not fetch the network; synchronization remains
+an explicit action.
 
 ## Daily use
 
@@ -65,6 +104,16 @@ The equivalent CLI inspection command is:
 skill-sync preview
 skill-sync preview --json
 ```
+
+### Edit through Codex or Kimi Code
+
+On macOS, a Skill detail page can create an isolated managed workspace and open
+it in an installed Codex or Kimi Code terminal session. The Agent receives the
+exact Skill, scope, workspace path, safety boundaries, and completion workflow.
+It cannot apply, synchronize, commit, or push the result on the user's behalf.
+
+After editing, return to Skill Sync, select **Check Changes**, review the diff,
+validation, and client impact, then explicitly apply or discard the session.
 
 ### Machine-readable CLI output
 
@@ -177,8 +226,9 @@ until that point. A v3 `push` packages only registry-declared Variant targets;
 portable root. `preview` and `status` report Base and Variant sync units
 separately. Different units can merge during `sync`, while simultaneous local
 and remote changes to the same unit stop before fast-forward or source writes.
-No sync path automatically pushes local changes. Web Variant views are not yet
-implemented, and there is no `resolve --output` or `variant delete` command.
+No sync path automatically pushes local changes. The Web UI does not yet expose
+tamper capture/discard recovery, and there is no `resolve --output` or
+`variant delete` command.
 
 Before migrating existing Agent links away from editable canonical sources,
 preview every affected Skill/client pair, perform the migration, and inspect
@@ -385,8 +435,8 @@ and asks for browser confirmation before the request.
 On another computer:
 
 ```bash
-pipx install "git+ssh://git@github.com/YOUR_NAME/skill-sync.git"
-skill-sync init --repo git@github.com:YOUR_NAME/agent-skills.git
+pipx install "git+ssh://git@github.com/lirt1231/skill-sync.git"
+skill-sync init --repo git@github.com:YOUR_ACCOUNT/agent-skills.git
 skill-sync sync
 skill-sync doctor
 ```
@@ -410,8 +460,8 @@ On macOS/Linux the links are symbolic links. On Windows the tool first tries a d
 py -m pip install --user pipx
 py -m pipx ensurepath
 # Open a new PowerShell window after ensurepath.
-pipx install "git+ssh://git@github.com/YOUR_NAME/skill-sync.git"
-skill-sync init --repo git@github.com:YOUR_NAME/agent-skills.git
+pipx install "git+ssh://git@github.com/lirt1231/skill-sync.git"
+skill-sync init --repo git@github.com:YOUR_ACCOUNT/agent-skills.git
 skill-sync sync
 skill-sync web
 ```
@@ -425,3 +475,7 @@ configured.
 Skill Sync never overwrites a real directory in an Agent Skill location. Run `skill-sync doctor --json` to inspect conflicts, broken links, and missing canonical Skills. Git divergence and simultaneous local/remote changes stop for manual resolution.
 
 The Web UI only binds to a loopback address and requires a per-process token for mutations.
+
+See [SECURITY.md](SECURITY.md) for the local trust model and private reporting
+instructions. Development setup and safety requirements are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md).
