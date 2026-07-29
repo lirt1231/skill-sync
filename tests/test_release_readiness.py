@@ -9,6 +9,7 @@ class ReleaseReadinessTest(unittest.TestCase):
     def test_public_repository_metadata_and_community_files_exist(self):
         for relative in (
             "README.md",
+            "LICENSE",
             "SECURITY.md",
             "CONTRIBUTING.md",
             "CHANGELOG.md",
@@ -34,6 +35,17 @@ class ReleaseReadinessTest(unittest.TestCase):
         self.assertIn('[project.urls]', metadata)
         self.assertIn('Homepage = "https://github.com/lirt1231/skill-sync"', metadata)
         self.assertIn('Development Status :: 3 - Alpha', metadata)
+
+    def test_mit_license_matches_package_metadata(self):
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        metadata = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertTrue(license_text.startswith("MIT License\n"))
+        self.assertIn("Copyright (c) 2026 lijiaming", license_text)
+        self.assertIn('license = { file = "LICENSE" }', metadata)
+        self.assertIn('License :: OSI Approved :: MIT License', metadata)
+        self.assertIn("[MIT License](LICENSE)", readme)
 
     def test_public_files_do_not_contain_local_home_paths(self):
         for relative in (

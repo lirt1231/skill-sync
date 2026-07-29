@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/lirt1231/skill-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/lirt1231/skill-sync/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Synchronize selected user-authored Agent Skills across devices and expose one
 managed source to Codex, WorkBuddy, Kimi Code, and Claude Code.
@@ -483,3 +484,7 @@ The Web UI only binds to a loopback address and requires a per-process token for
 See [SECURITY.md](SECURITY.md) for the local trust model and private reporting
 instructions. Development setup and safety requirements are documented in
 [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+Skill Sync is released under the [MIT License](LICENSE).
