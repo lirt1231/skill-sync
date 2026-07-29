@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import ntpath
 import os
 import stat
 import struct
@@ -269,7 +270,7 @@ def validate_relative_path(path: str) -> TreeIssue | None:
         or any("\\" in part or ":" in part for part in parts)
         or any(any(ord(character) < 32 for character in part) for part in parts)
         or any(
-            part.endswith((" ", ".")) or PureWindowsPath(part).is_reserved()
+            part.endswith((" ", ".")) or _is_reserved_windows_path(part)
             for part in parts
         )
         or PureWindowsPath(path).is_absolute()
@@ -281,6 +282,13 @@ def validate_relative_path(path: str) -> TreeIssue | None:
         path,
         "path is not a safe portable relative path",
     )
+
+
+def _is_reserved_windows_path(path: str) -> bool:
+    checker = getattr(ntpath, "isreserved", None)
+    if checker is not None:
+        return checker(path)
+    return PureWindowsPath(path).is_reserved()
 
 
 def _validate_frontmatter(text: str, *, logical_skill: str) -> list[TreeIssue]:

@@ -303,37 +303,31 @@ def _read_regular_file_snapshot(path: Path) -> tuple[bytes, int]:
     finally:
         os.close(descriptor)
 
-    identity_before = (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-        stat.S_IMODE(before.st_mode) & 0o777,
-    )
-    identity_after = (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-        stat.S_IMODE(after.st_mode) & 0o777,
-    )
+    identity_before = _file_snapshot_identity(before)
+    identity_after = _file_snapshot_identity(after)
     try:
         current = os.lstat(path)
     except OSError as exc:
         raise ValueError(f"Overlay file changed while reading: {path}") from exc
-    identity_current = (
-        current.st_dev,
-        current.st_ino,
-        current.st_size,
-        current.st_mtime_ns,
-        current.st_ctime_ns,
-        stat.S_IMODE(current.st_mode) & 0o777,
-    )
+    identity_current = _file_snapshot_identity(current)
     if identity_before != identity_after or identity_after != identity_current:
         raise ValueError(f"Overlay file changed while reading: {path}")
     return content, portable_skill_file_mode(content)
+
+
+def _file_snapshot_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+    if os.name == "nt":
+        return identity
+    return identity + (
+        metadata.st_ctime_ns,
+        stat.S_IMODE(metadata.st_mode) & 0o777,
+    )
 
 
 def _validate_resolved_paths(files: Iterable[VariantOverlayFile]) -> None:
@@ -474,5 +468,5 @@ def _path_identity(path: Path) -> tuple[int, int, int, int] | None:
         metadata.st_dev,
         metadata.st_ino,
         stat.S_IFMT(metadata.st_mode),
-        metadata.st_ctime_ns,
+        metadata.st_mtime_ns if os.name == "nt" else metadata.st_ctime_ns,
     )

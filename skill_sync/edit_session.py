@@ -992,7 +992,7 @@ def _assert_real_directory(path: Path, label: str) -> None:
 
 
 def _set_snapshot_permissions(root: Path, *, writable: bool) -> None:
-    """Keep session copies private; only the workspace is owner-writable."""
+    """Keep session copies private and baseline contents owner-read-only."""
 
     _assert_real_directory(root, "edit session snapshot")
     for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
@@ -1005,7 +1005,10 @@ def _set_snapshot_permissions(root: Path, *, writable: bool) -> None:
             raise EditSessionMetadataError(
                 f"edit session snapshot contains a non-regular path: {path}"
             )
-    os.chmod(root, 0o700 if writable else 0o500)
+    # The session lifecycle must be able to atomically rename the snapshot root
+    # on every supported filesystem. Its contents remain read-only for a
+    # baseline; permissions are not treated as a tamper-proof security boundary.
+    os.chmod(root, 0o700)
 
 
 def _remove_real_tree(root: Path) -> None:

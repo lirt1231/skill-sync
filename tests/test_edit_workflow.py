@@ -99,7 +99,7 @@ class EditWorkflowTest(unittest.TestCase):
         baseline = Path(result["baseline_path"])
         workspace = Path(result["workspace_path"])
 
-        self.assertEqual(stat.S_IMODE(baseline.stat().st_mode), 0o500)
+        self.assertEqual(stat.S_IMODE(baseline.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE((baseline / "SKILL.md").stat().st_mode), 0o400)
         self.assertEqual(stat.S_IMODE((baseline / "scripts" / "run.sh").stat().st_mode), 0o500)
         self.assertEqual(stat.S_IMODE(workspace.stat().st_mode), 0o700)

@@ -45,7 +45,12 @@ class WebUiTest(unittest.TestCase):
             {"name": "beta", "path": "/skills/beta", "description": "Beta description", "selected": False, "external": False},
         ]), mock.patch("skill_sync.web.core.scan_import_candidates", return_value=[
             {"name": "legacy", "agent": "codex", "path": "/codex/legacy", "state": "importable"}
-        ]):
+        ]), mock.patch("skill_sync.web._managed_state", return_value={
+            "variants": {"variants": []},
+            "deployments": {"skills": []},
+            "sessions": {"sessions": []},
+            "edit_agents": {},
+        }):
             value = _state(None)
         status.assert_called_once_with(config_path=None, fetch_remote=False)
         self.assertEqual(value["status"]["skills"][0]["agents"]["codex"], "linked")
