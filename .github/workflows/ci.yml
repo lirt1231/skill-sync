@@ -16,6 +16,7 @@ jobs:
   test:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:

@@ -395,7 +395,7 @@ def _path_identity(path: Path) -> tuple[int, int, int, int] | None:
         metadata.st_dev,
         metadata.st_ino,
         stat.S_IFMT(metadata.st_mode),
-        metadata.st_ctime_ns,
+        metadata.st_mtime_ns if os.name == "nt" else metadata.st_ctime_ns,
     )
 
 

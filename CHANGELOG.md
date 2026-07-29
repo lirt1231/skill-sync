@@ -26,6 +26,8 @@ minor releases may contain breaking changes when they are documented here.
 ### Known limitations
 
 - Opening Codex or Kimi Code edit sessions is currently macOS-only.
+- Windows support is experimental and its CI matrix remains non-blocking while
+  filesystem identity, junction, and recovery behavior is completed.
 - Web tamper capture/discard recovery and guided conflict resolution are not yet
   implemented.
 - Push-time secret scanning is planned but not yet available.

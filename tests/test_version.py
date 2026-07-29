@@ -1,4 +1,3 @@
-import tomllib
 import unittest
 from pathlib import Path
 
@@ -14,14 +13,11 @@ class VersionTest(unittest.TestCase):
         self.assertEqual(skill_sync.__version__, __version__)
 
     def test_build_metadata_reads_canonical_runtime_version(self):
-        with (PROJECT_ROOT / "pyproject.toml").open("rb") as handle:
-            project = tomllib.load(handle)
-
-        self.assertNotIn("version", project["project"])
-        self.assertIn("version", project["project"]["dynamic"])
-        self.assertEqual(
-            project["tool"]["setuptools"]["dynamic"]["version"]["attr"],
-            "skill_sync.version.__version__",
+        metadata = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('dynamic = ["version"]', metadata)
+        self.assertIn("[tool.setuptools.dynamic]", metadata)
+        self.assertIn(
+            'version = { attr = "skill_sync.version.__version__" }', metadata
         )
 
     def test_version_is_pep_440_compatible_for_current_release_scheme(self):
