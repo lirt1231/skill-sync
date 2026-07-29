@@ -154,6 +154,7 @@ class WebUiTest(unittest.TestCase):
             "recovery_required": False,
         }
         sessions = {"sessions": [{"session_id": "session-1", "skill": "alpha"}]}
+        edit_agents = {"agents": [{"agent": "codex", "available": True}]}
         with mock.patch(
             "skill_sync.web.core.is_initialized", return_value=True
         ), mock.patch(
@@ -163,6 +164,8 @@ class WebUiTest(unittest.TestCase):
         ) as deploy_status, mock.patch(
             "skill_sync.web.core.list_edit_sessions", return_value=sessions
         ) as list_sessions, mock.patch(
+            "skill_sync.web.core.edit_agent_capabilities", return_value=edit_agents
+        ) as capabilities, mock.patch(
             "skill_sync.web.core.status"
         ) as status, mock.patch(
             "skill_sync.web.core.sync_preview"
@@ -175,9 +178,11 @@ class WebUiTest(unittest.TestCase):
         self.assertIs(value["managed"]["variants"], variants)
         self.assertIs(value["managed"]["deployments"], deployments)
         self.assertIs(value["managed"]["sessions"], sessions)
+        self.assertIs(value["managed"]["edit_agents"], edit_agents)
         list_variants.assert_called_once_with(config_path=None)
         deploy_status.assert_called_once_with(config_path=None)
         list_sessions.assert_called_once_with(config_path=None)
+        capabilities.assert_called_once_with()
         status.assert_not_called()
         preview.assert_not_called()
         doctor.assert_not_called()
@@ -191,6 +196,7 @@ class WebUiTest(unittest.TestCase):
         self.assertEqual(value["managed"]["variants"]["variants"], [])
         self.assertEqual(value["managed"]["deployments"]["skills"], [])
         self.assertEqual(value["managed"]["sessions"]["sessions"], [])
+        self.assertIn("agents", value["managed"]["edit_agents"])
         variants.assert_not_called()
 
     def test_summary_and_agents_share_one_diagnosis_and_never_fetch(self):

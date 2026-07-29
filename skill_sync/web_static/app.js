@@ -9,6 +9,7 @@ let detailSkill = detailTargetFromLocation();
 let detailNeedsFocus = Boolean(detailSkill);
 let detailReturnTarget = null;
 const inventoryFilters = {...restoredUiContext.filters};
+let defaultTabApplied = false;
 const selected = new Set(restoredUiContext.selected);
 const selectedImports = new Set();
 const loadedViews = new Set();
@@ -38,7 +39,7 @@ function stateUrl(views) {
 
 function mergeState(partial) {
   if (!state || state.initialized !== partial.initialized) {
-    state = {initialized: partial.initialized, status: {skills: []}, doctor: {agents: [], matrix: [], issues: []}, managed: {variants: {variants: []}, deployments: {skills: []}, sessions: {sessions: []}}, import_candidates: []};
+    state = {initialized: partial.initialized, status: {skills: []}, doctor: {agents: [], matrix: [], issues: []}, managed: {variants: {variants: []}, deployments: {skills: []}, sessions: {sessions: []}, edit_agents: {agents: []}}, import_candidates: []};
     loadedViews.clear();
   }
   state = {...state, ...partial};
@@ -117,7 +118,7 @@ function operationInfo(path, body) {
     "/api/select": ["select", "正在加入同步…", `已将 ${count} 个 Skill 加入同步`, "加入同步失败"],
     "/api/deselect": ["deselect", "正在取消同步…", `已将 ${count} 个 Skill 取消同步`, "取消同步失败"],
     "/api/link": ["link", "正在修复链接…", `已修复 ${count} 个 Skill 的链接`, "修复链接失败"],
-    "/api/copy": ["copy", "正在复制…", `已复制 ${count} 个 Skill`, "复制 Skill 失败"],
+    "/api/copy": ["copy", "正在复制…", `已复制 ${count} 个 Skill${(body.agents||[]).length?` 到 ${(body.agents||[]).map(clientDisplayName).join("、")}`:""}`, "复制 Skill 失败"],
     "/api/delete": ["delete", "正在删除…", `已删除 ${count} 个全局 Skill`, "删除全局 Skill 失败"],
     "/api/import": [`import:${body.agent}`, "正在导入…", `已从 ${body.agent} 导入 ${count} 个 Skill`, `从 ${body.agent} 导入失败`],
     "/api/agent": [`agent:${body.agent}`, body.enabled ? "正在启用…" : "正在停用…", `${body.agent} 已${body.enabled ? "启用" : "停用"}`, `${body.enabled ? "启用" : "停用"} ${body.agent} 失败`],
@@ -125,6 +126,7 @@ function operationInfo(path, body) {
     "/api/edit/begin": [`edit-begin:${body.skill}`, "正在创建编辑会话…", "编辑会话已创建", "创建编辑会话失败"],
     "/api/edit/apply": [`edit-apply:${body.session_id}`, "正在应用更改…", "编辑更改已安全应用", "应用编辑更改失败"],
     "/api/edit/abort": [`edit-abort:${body.session_id}`, "正在中止编辑会话…", "编辑会话已中止", "中止编辑会话失败"],
+    "/api/edit/delete": [`edit-delete:${body.session_id}`, "正在删除编辑会话…", "编辑会话已删除", "删除编辑会话失败"],
   }[path];
   if (!info) return {key:path, running:"正在处理…", success:"操作已完成", failure:"操作失败"};
   return {key:info[0], running:info[1], success:info[2], failure:info[3]};
@@ -171,7 +173,7 @@ function importOperationBusy() { return isBusy(`import:${activeImportAgent}`); }
 async function getState(announce = true) {
   if (mutationInFlight) return false;
   const view = activeView;
-  return runOperation("refresh", async () => {
+  const task = async () => {
     const generation = ++stateGeneration;
     if (announce && activeToast?.error) dismissToast();
     if (announce) toast(`正在刷新${viewName(view)}…`);
@@ -185,7 +187,11 @@ async function getState(announce = true) {
       toast(`刷新${viewName(view)}失败：${error.message}`, true);
       return false;
     }
-  });
+  };
+  // Silent loads (e.g. the first paint) must not hold the global busy lock,
+  // otherwise "立即同步" is rejected right after the page opens.
+  if (!announce) return task();
+  return runOperation("refresh", task);
 }
 
 async function action(path, body = {}, options = {}) {
@@ -222,7 +228,7 @@ async function action(path, body = {}, options = {}) {
     } catch (error) {
       const unknown = error.message.includes("刷新核验") ? error.message : `${operation.failure}：${error.message}`;
       if(typeof options.captureResult==="function")options.captureResult({ok:false,message:unknown,error:error.message,data:responseData,unknown:error.message.includes("刷新核验")});
-      toast(unknown, true);
+      if(!options.silentError)toast(unknown, true);
       return false;
     }
   }, true);
@@ -303,6 +309,7 @@ function mutationConfirmLabel(operation,request){
 }
 
 function mutationStatusLabel(value){return({ready:"可以执行",blocked:"暂时无法执行",conflict:"部分位置需要先处理"})[value]||value||"正在规划";}
+function mutationRunningTitle(operation){return({sync:"正在同步…",import:"正在导入…",agent:"正在更新 Agent 设置…","link-repair":"正在修复链接…",delete:"正在删除…"})[operation]||"正在执行…";}
 
 function planClientName(item){return clientDisplayName(item?.client||item?.agent||"Agent");}
 function repairablePlanClients(plan){return (plan?.targets?.clients||[]).filter(item=>item.client&&!["blocked","noop"].includes(item.effect));}
@@ -329,7 +336,16 @@ function planSummaryText(pending){
 
 function planTargetText(plan){
   const skills=(plan?.targets?.skills||[]).map(item=>item.name).filter(Boolean);
-  const clients=(plan?.targets?.clients||[]).map(item=>`${planClientName(item)}${item.skill?` / ${item.skill}`:""}`);
+  const clientGroups=new Map();
+  (plan?.targets?.clients||[]).forEach(item=>{
+    const key=item.skill||"";
+    if(!clientGroups.has(key))clientGroups.set(key,[]);
+    clientGroups.get(key).push(planClientName(item));
+  });
+  const clients=[...clientGroups].map(([skill,names])=>{
+    const unique=[...new Set(names)];
+    return skill?`${skill} → ${unique.join("、")}`:unique.join("、");
+  });
   return `<div class="mutation-target-group"><strong>技能 (${skills.length})</strong><span>${skills.length?skills.map(escapeHtml).join("、"):"无直接 Skill 变更"}</span></div><div class="mutation-target-group"><strong>客户端 (${clients.length})</strong><span>${clients.length?clients.map(escapeHtml).join("、"):"无 Agent 链接变更"}</span></div>`;
 }
 
@@ -337,7 +353,11 @@ function planActionLabel(value){return ({"repair-links":"检查部署","build-an
 function planStateLabel(value){return ({"linked-render":"已连接当前版本","stale-render":"链接仍指向旧版本",conflict:"目标位置已有其他内容","wrong-link":"链接指向其他位置","broken-link":"链接已失效","tampered-render":"部署内容被修改","missing-render":"部署文件已丢失",missing:"尚未创建链接"})[value]||value||"";}
 function planStepsHtml(plan){
   const steps=plan?.steps||[];
-  return steps.length?steps.map(step=>`<li><strong>${escapeHtml(planActionLabel(step.action))}</strong>${step.skill?` · ${escapeHtml(step.skill)}`:""}${step.client?` · ${escapeHtml(clientDisplayName(step.client))}`:""}${step.state?` — ${escapeHtml(planStateLabel(step.state))}`:""}</li>`).join(""):'<li>此操作只更新配置，不直接修改 Skill 或 Agent 链接。</li>';
+  if(!steps.length)return '<li>此操作只更新配置，不直接修改 Skill 或 Agent 链接。</li>';
+  const stepText=step=>`<strong>${escapeHtml(planActionLabel(step.action))}</strong>${step.skill?` · ${escapeHtml(step.skill)}`:""}${step.client?` · ${escapeHtml(clientDisplayName(step.client))}`:""}${step.state?` — ${escapeHtml(planStateLabel(step.state))}`:""}`;
+  const active=steps.filter(step=>step.action!=="noop"),skipped=steps.filter(step=>step.action==="noop");
+  const collapsed=skipped.length?`<li class="mutation-steps-collapsed"><details><summary>另有 ${skipped.length} 项无需处理</summary><ul>${skipped.map(step=>`<li>${stepText(step)}</li>`).join("")}</ul></details></li>`:"";
+  return active.map(step=>`<li>${stepText(step)}</li>`).join("")+collapsed;
 }
 
 function findingLabel(item){return ({conflict:"目标位置存在冲突","unsafe-agent-path":"已保护现有内容","wrong-link":"链接指向其他位置","broken-link":"链接已失效","tampered-render":"部署内容被修改","missing-render":"部署文件已丢失","agent-disabled":"Agent 已停用","deployment-recovery-required":"存在未完成的修复操作",blocked:"暂时无法执行"})[item?.code]||"需要处理";}
@@ -404,24 +424,24 @@ function renderMutationDialog(){
   if(!pendingMutation){setMutationLayer(false);return;}
   setMutationLayer(true);
   const pending=pendingMutation,plan=pending.plan,phase=pending.phase;
-  $("#mutation-title").textContent=mutationTitle(pending.operation,pending.request);
+  $("#mutation-title").textContent=phase==="running"?mutationRunningTitle(pending.operation):mutationTitle(pending.operation,pending.request);
   const status=$("#mutation-status");status.className=`mutation-status ${phase==="result"&&!pending.result?.ok?"result-error":phase==="confirm"?(plan?.status||"ready"):phase}`;
   status.textContent=phase==="planning"?"正在生成只读计划…":phase==="revalidating"?"正在重新规划…":phase==="running"?"正在执行…":phase==="result"?(pending.result?.ok?"操作已完成":"操作未完成"):mutationStatusLabel(plan?.status);
-  $("#mutation-summary").textContent=planSummaryText(pending);
+  $("#mutation-summary").textContent=phase==="running"?"正在按下面的计划执行，请稍候，完成后会在此显示结果。":phase==="result"?(pending.result?.ok?"已按下面的计划完成执行。":"执行未完全成功，详细结果见下方。"):planSummaryText(pending);
   $("#mutation-findings").innerHTML=planFindingsHtml(plan);
   $("#mutation-targets").innerHTML=planTargetText(plan);
-  $("#mutation-steps").innerHTML=planStepsHtml(plan);
+  $("#mutation-steps").innerHTML=phase==="running"?'<li class="mutation-steps-loading"><i class="ri-loader-4-line" aria-hidden="true"></i><span>正在执行计划，请稍候…</span></li>':planStepsHtml(plan);
   $("#mutation-effects").innerHTML=planEffectsHtml(plan);
   $("#mutation-recovery").innerHTML=planRecoveryHtml(plan);
   const phrase=deleteConfirmationPhrase(pending),deleteBox=$("#mutation-delete-confirmation");
   deleteBox.classList.toggle("hidden",!phrase||phase!=="confirm");$("#mutation-delete-phrase").textContent=phrase;
   const result=$("#mutation-result");result.className=`mutation-result ${phase==="result"?(pending.result?.ok?"success":"error"):"hidden"}`;result.textContent=phase==="result"?(pending.result?.message||"操作结果未知"):"";
   const working=["planning","revalidating","running"].includes(phase),mutating=phase==="running";
-  $("#mutation-close").disabled=mutating;$("#mutation-cancel").disabled=mutating;$("#mutation-cancel").textContent=phase==="result"?"关闭":"取消";
+  $("#mutation-close").disabled=mutating;$("#mutation-cancel").disabled=mutating;$("#mutation-cancel").textContent=phase==="result"?"完成":"取消";
   $("#mutation-retry").classList.toggle("hidden",phase!=="result"||pending.result?.ok);$("#mutation-retry").textContent=pending.result?.unknown?"关闭并刷新":"重新规划";
   const repairable=repairablePlanClients(plan),showPartial=phase==="confirm"&&pending.operation==="link-repair"&&!plan?.can_execute&&repairable.length>0;
   $("#mutation-partial").classList.toggle("hidden",!showPartial);$("#mutation-partial").disabled=working;$("#mutation-partial").textContent=`先修复可安全处理的 ${repairable.length} 个客户端`;
-  $("#mutation-confirm").classList.toggle("hidden",phase==="result"||(phase==="confirm"&&plan&&!plan.can_execute));$("#mutation-confirm").setAttribute("aria-busy",String(working));$("#mutation-confirm").textContent=working?(phase==="running"?"正在执行…":"正在重新规划…"):mutationConfirmLabel(pending.operation,pending.request);
+  $("#mutation-confirm").classList.toggle("hidden",phase==="result"||(phase==="confirm"&&plan&&!plan.can_execute));$("#mutation-confirm").setAttribute("aria-busy",String(working));$("#mutation-confirm").innerHTML=working?`<i class="ri-loader-4-line" aria-hidden="true"></i><span>${phase==="running"?"正在执行…":"正在重新规划…"}</span>`:mutationConfirmLabel(pending.operation,pending.request);
   updateMutationConfirmState();focusMutationDialog();
 }
 
@@ -515,6 +535,15 @@ function render() {
     $("#sync-summary").textContent = previewSummary(preview.action);
     $("#sync").disabled = ["blocked","conflict"].includes(preview.action);
   }
+  // Visual-state hook: tint the sync strip icon by preview severity (style-only).
+  const strip = document.querySelector(".sync-strip");
+  if (strip) {
+    const stripState = !preview || preview.action === "noop" ? "ok" : ["blocked","conflict"].includes(preview.action) ? "danger" : "warn";
+    strip.classList.remove("sync-ok","sync-warn","sync-danger");
+    strip.classList.add(`sync-${stripState}`);
+    const stripIcon = strip.querySelector(".health-icon i");
+    if (stripIcon) stripIcon.className = { ok: "ri-check-line", warn: "ri-arrow-up-line", danger: "ri-error-warning-line" }[stripState];
+  }
   renderIssues(preview?.issues || []);
   renderSkills(state.status?.skills || []);
   renderAgents(state.doctor?.agents || []);
@@ -577,11 +606,25 @@ function switchView(view) {
   loadActiveView().catch(error => toast(error.message, true));
 }
 
+const REPAIRABLE_ISSUE_TYPES=new Set(["stale-render","missing-render","tampered-render","wrong-link","broken-link","missing","partial","conflict"]);
+function issueActionHtml(issue){
+  const name=issue?.skill;
+  if(!name||!(state?.status?.skills||[]).some(skill=>skill.name===name))return "";
+  const action=REPAIRABLE_ISSUE_TYPES.has(issue.type)?"issue-repair":"issue-detail";
+  const label=action==="issue-repair"?"去修复":"查看详情";
+  return `<span class="issue-actions"><button type="button" data-action="${action}" data-skill-name="${escapeHtml(name)}">${label}</button></span>`;
+}
 function renderIssues(issues) {
   const box = $("#issue-list"); box.classList.toggle("hidden", !issues.length);
-  const issueRow=issue=>`<div class="issue-row"><i class="ri-error-warning-line"></i><strong>${escapeHtml(issueTitle(issue))}</strong><span>${escapeHtml(issue.detail || issue.skill || "需要检查")}</span></div>`;
+  const issueRow=issue=>`<div class="issue-row"><i class="ri-error-warning-line"></i><strong>${escapeHtml(issueTitle(issue))}</strong><span>${escapeHtml(issue.detail || issue.skill || "需要检查")}</span>${issueActionHtml(issue)}</div>`;
   const visible=issues.slice(0,4),remaining=issues.slice(4);
   box.innerHTML=visible.map(issueRow).join("")+(remaining.length?`<details class="issue-overflow"><summary>查看其余 ${remaining.length} 项问题</summary>${remaining.map(issueRow).join("")}</details>`:"");
+}
+function handleIssueClick(event){
+  const target=delegatedActionTarget(event),name=target?.dataset?.skillName;
+  if(!name)return;
+  if(target.dataset.action==="issue-repair"){event.stopPropagation();repairSkill(name,target);return;}
+  if(target.dataset.action==="issue-detail"){event.stopPropagation();openDetail(name,target);}
 }
 
 function managedDataReady(){return loadedViews.has("managed")||Boolean(state?.managed&&!state?.loaded_views);}
@@ -624,6 +667,11 @@ function renderInventoryControls(skills){
   const agentOptions=[...agents];
   if(!readyAgents&&inventoryFilters.agent!=="all"&&!agentOptions.some(agent=>agent.name===inventoryFilters.agent))agentOptions.push({name:inventoryFilters.agent,display_name:`${inventoryFilters.agent}（加载中）`});
   const counts={synced:0,changed:0,local:0};skills.forEach(skill=>{counts[skillSyncState(skill)]+=1;});
+  // First load only: surface pending local changes unless the user explicitly picked a tab before.
+  if(!defaultTabApplied&&inventoryDataReady()){
+    defaultTabApplied=true;
+    if(!restoredUiContext.statusExplicit&&counts.changed>0)inventoryFilters.status="changed";
+  }
   for(const status of statuses){
     const button=$(`#status-${status}`);button.classList.toggle("active",inventoryFilters.status===status);button.setAttribute("aria-pressed",String(inventoryFilters.status===status));
     $(`#status-${status}-count`).textContent=counts[status];
@@ -649,6 +697,26 @@ function visibleSkills(skills) {
   });
 }
 
+function coverageHtml(skill,agents){
+  if(!agents.length)return '<span class="coverage-empty">暂无已检测 Agent</span>';
+  const entries=agents.map(agent=>({agent,state:skill.agents?.[agent.name]}));
+  const allOk=entries.every(entry=>["linked","copied"].includes(entry.state));
+  if(allOk){
+    const detail=entries.map(entry=>`${entry.agent.display_name}：${agentStateLabel(entry.state)}`).join(" · ");
+    return `<span class="agent-coverage coverage-summary ok" title="${escapeHtml(detail)}" aria-label="${escapeHtml(`${entries.length} 个 Agent 全部正常：${detail}`)}"><i aria-hidden="true"></i><span>${entries.length}/${entries.length} 正常</span></span>`;
+  }
+  return entries.map(({agent,state:agentState})=>`<span class="agent-coverage ${agentStateClass(agentState)}" aria-label="${escapeHtml(agent.display_name)}：${escapeHtml(agentStateLabel(agentState))}"><i aria-hidden="true"></i><span>${escapeHtml(agent.display_name)}</span><small>${escapeHtml(agentStateLabel(agentState))}</small></span>`).join("");
+}
+function emptyStateHtml(icon,title,description,actionHtml=""){
+  return `<div class="empty-state"><i class="${icon}" aria-hidden="true"></i><strong>${escapeHtml(title)}</strong><p>${escapeHtml(description)}</p>${actionHtml}</div>`;
+}
+function skillListEmptyHtml(skills){
+  if(!skills.length)return emptyStateHtml("ri-inbox-line","还没有 Skill","去「导入」视图把本地 Skill 加入全局库，之后就能在这里管理并同步。",'<button type="button" class="empty-action" data-action="goto-imports">前往导入</button>');
+  const filtered=Boolean($("#search").value.trim())||inventoryFilters.source!=="all"||inventoryFilters.agent!=="all";
+  if(filtered)return emptyStateHtml("ri-search-line","没有匹配的 Skill","试试调整搜索关键词或筛选条件。",'<button type="button" class="empty-action" data-action="clear-filters-empty">清除筛选</button>');
+  const tabText={synced:"还没有已同步的 Skill",changed:"没有待推送的本地修改",local:"所有 Skill 都已加入同步"}[inventoryFilters.status]||"这个分类没有 Skill";
+  return emptyStateHtml("ri-checkbox-circle-line",tabText,"切换到其它分类查看，或点击「刷新状态」重新读取。","");
+}
 function renderSkills(skills) {
   const previousFocus=captureSkillListFocus();
   let selectionChanged=false;
@@ -658,10 +726,10 @@ function renderSkills(skills) {
   const shown = visibleSkills(skills);
   const agents = inventoryAgents();
   $("#skill-list").innerHTML = shown.map(skill => {
-    const coverage = agents.length?agents.map(agent=>{const agentState=skill.agents?.[agent.name];return `<span class="agent-coverage ${agentStateClass(agentState)}" aria-label="${escapeHtml(agent.display_name)}：${escapeHtml(agentStateLabel(agentState))}"><i aria-hidden="true"></i><span>${escapeHtml(agent.display_name)}</span><small>${escapeHtml(agentStateLabel(agentState))}</small></span>`;}).join(""):'<span class="coverage-empty">暂无已检测 Agent</span>';
+    const coverage=coverageHtml(skill,agents);
     const stateLabel=skillStateLabel(skill),stateClass=skillHasConflict(skill)?"conflict":skillHasLocalChange(skill)||skillHasRemoteChange(skill)?"pending":"";
-    return `<article class="skill-row ${detailSkill === skill.name ? "focused" : ""}" tabindex="-1" data-action="open-detail" data-skill-name="${escapeHtml(skill.name)}" data-detail-trigger="row"><input type="checkbox" data-action="toggle-skill" data-skill-name="${escapeHtml(skill.name)}" aria-label="选择 ${escapeHtml(skill.name)}" ${selected.has(skill.name)?"checked":""} ${hasBusyOperation()?"disabled":""}><span class="file-icon"><i class="ri-file-text-line" aria-hidden="true"></i></span><span class="skill-identity"><strong>${escapeHtml(skill.name)}</strong><span class="skill-metadata"><code title="${escapeHtml(skill.local_hash||"")}">${escapeHtml(shortHash(skill.local_hash))}</code>${skillBadgesHtml(skill)}</span></span><span class="coverage">${coverage}</span><span class="row-status ${stateClass}">${escapeHtml(stateLabel)}</span><button type="button" class="icon-button" data-action="open-detail" data-skill-name="${escapeHtml(skill.name)}" data-detail-trigger="button" aria-label="查看 ${escapeHtml(skill.name)} 详情"><i class="ri-more-2-fill" aria-hidden="true"></i></button></article>`;
-  }).join("") || `<p class="empty">这个分类中没有符合条件的 Skill</p>`;
+    return `<article class="skill-row ${detailSkill === skill.name ? "focused" : ""}" tabindex="-1" data-action="open-detail" data-skill-name="${escapeHtml(skill.name)}" data-detail-trigger="row"><input type="checkbox" data-action="toggle-skill" data-skill-name="${escapeHtml(skill.name)}" aria-label="选择 ${escapeHtml(skill.name)}" ${selected.has(skill.name)?"checked":""} ${hasBusyOperation()?"disabled":""}><span class="file-icon"><i class="ri-file-text-line" aria-hidden="true"></i></span><span class="skill-identity"><strong>${escapeHtml(skill.name)}</strong><span class="skill-metadata"><code title="${escapeHtml(skill.local_hash||"")}">${escapeHtml(shortHash(skill.local_hash))}</code>${skillBadgesHtml(skill)}</span></span><span class="coverage">${coverage}</span><span class="row-status ${stateClass}">${escapeHtml(stateLabel)}</span><button type="button" class="icon-button" data-action="open-detail" data-skill-name="${escapeHtml(skill.name)}" data-detail-trigger="button" aria-label="查看 ${escapeHtml(skill.name)} 详情"><i class="ri-arrow-right-s-line" aria-hidden="true"></i></button></article>`;
+  }).join("") || skillListEmptyHtml(skills);
   updateSkillSelectionUi(skills,shown);
   const categoryTotal=skills.filter(skill=>skillSyncState(skill)===inventoryFilters.status).length;
   $("#visible-count").textContent=`显示 ${shown.length} / ${categoryTotal}`;
@@ -685,14 +753,24 @@ function updateSkillSelectionUi(skills,shown=visibleSkills(skills)){
   for(const checkbox of $("#skill-list")?.querySelectorAll?.('[data-action="toggle-skill"]')||[])checkbox.checked=selected.has(checkbox.dataset.skillName);
   const picked=skills.filter(skill=>selected.has(skill.name)),pickedAllSynced=picked.length>0&&picked.every(skill=>skill.selected);
   $("#select-selected").innerHTML=pickedAllSynced?'<i class="ri-subtract-line" aria-hidden="true"></i><span>取消同步</span>':'<i class="ri-add-circle-line" aria-hidden="true"></i><span>加入同步</span>';
-  $("#select-selected").dataset.mode=pickedAllSynced?"deselect":"select";updateSelectionBar();
+  $("#select-selected").dataset.mode=pickedAllSynced?"deselect":"select";
+  $("#select-selected").classList.toggle("deselect-mode",pickedAllSynced);
+  updateSelectionBar(shown);
 }
 
+function agentCoverageStats(agentName){
+  const rows=(state?.doctor?.matrix||[]).filter(row=>row.agent===agentName);
+  if(!rows.length)return "";
+  const synced=rows.filter(row=>["linked","copied"].includes(row.state)).length;
+  const abnormal=rows.filter(row=>!["linked","copied","missing","disabled","not-detected"].includes(row.state)).length;
+  return `<p class="agent-stats">${synced} 个 Skill 已同步${abnormal?` · <em>${abnormal} 个异常</em>`:""}</p>`;
+}
 function renderAgents(agents) {
   $("#agent-list").innerHTML = agents.map(agent => {
     const busy = isBusy(`agent:${agent.name}`);
     const unavailable=(!agent.detected&&agent.enabled)||hasBusyOperation();
-    return `<article class="agent-row"><span class="agent-icon"><i class="${agentIcon(agent.name)}" aria-hidden="true"></i></span><div><strong>${escapeHtml(agent.display_name)}</strong><p>${agent.detected ? escapeHtml(agent.skills_dir) : "未检测到此 Agent"}</p></div><span class="connection-state ${agent.detected && agent.enabled ? "online" : ""}"><i aria-hidden="true"></i>${agent.enabled ? (agent.detected ? "已连接" : "等待检测") : "已停用"}</span><button type="button" ${unavailable ? "disabled" : ""} aria-busy="${busy}" data-action="toggle-agent" data-agent-action="${escapeHtml(agent.name)}" data-enabled="${String(agent.enabled)}">${busy ? (agent.enabled ? "正在停用…" : "正在启用…") : (agent.enabled ? "停用" : "启用")}</button></article>`;
+    const toggleHint=agent.enabled?"停用后移除该 Agent 下所有 Skill 链接，Skill 文件保留在全局库中":"启用后重新为该 Agent 创建 Skill 链接";
+    return `<article class="agent-row"><span class="agent-icon"><i class="${agentIcon(agent.name)}" aria-hidden="true"></i></span><div><strong>${escapeHtml(agent.display_name)}</strong><p>${agent.detected ? escapeHtml(agent.skills_dir) : "未检测到此 Agent"}</p>${agentCoverageStats(agent.name)}</div><span class="connection-state ${agent.detected && agent.enabled ? "online" : ""}"><i aria-hidden="true"></i>${agent.enabled ? (agent.detected ? "已连接" : "等待检测") : "已停用"}</span><button type="button" ${unavailable ? "disabled" : ""} aria-busy="${busy}" title="${escapeHtml(toggleHint)}" data-action="toggle-agent" data-agent-action="${escapeHtml(agent.name)}" data-enabled="${String(agent.enabled)}">${busy ? (agent.enabled ? "正在停用…" : "正在启用…") : (agent.enabled ? "停用" : "启用")}</button></article>`;
   }).join("");
 }
 
@@ -701,7 +779,7 @@ function renderImports(items) {
   for (const key of [...selectedImports]) if (!items.some(item => importKey(item) === key)) selectedImports.delete(key);
   $("#import-tabs").innerHTML = sources.map(agent => `<button type="button" class="source-tab ${activeImportAgent===agent?"active":""}" data-action="set-import-agent" data-agent="${agent}" ${hasBusyOperation()?"disabled":""}><i class="${agentIcon(agent)}" aria-hidden="true"></i><span>${titles[agent]}</span><b>${items.filter(item=>item.agent===agent).length}</b></button>`).join("");
   const group=items.filter(item=>item.agent===activeImportAgent);
-  $("#imports").innerHTML = group.map(item => `<article class="import-row"><input type="checkbox" data-action="toggle-import" data-agent="${escapeHtml(item.agent)}" data-skill-name="${escapeHtml(item.name)}" aria-label="选择 ${escapeHtml(item.name)}" ${selectedImports.has(importKey(item))?"checked":""} ${item.state==="conflict" || hasBusyOperation()?"disabled":""}><span class="file-icon"><i class="ri-file-text-line" aria-hidden="true"></i></span><strong>${escapeHtml(item.name)}</strong><code title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</code>${item.state==="conflict"?'<span class="conflict-label"><i class="ri-error-warning-line" aria-hidden="true"></i>名称冲突</span>':""}</article>`).join("") || `<p class="empty">这个 Agent 中没有可导入的 Skill</p>`;
+  $("#imports").innerHTML = group.map(item => `<article class="import-row"><input type="checkbox" data-action="toggle-import" data-agent="${escapeHtml(item.agent)}" data-skill-name="${escapeHtml(item.name)}" aria-label="选择 ${escapeHtml(item.name)}" ${selectedImports.has(importKey(item))?"checked":""} ${item.state==="conflict" || hasBusyOperation()?"disabled":""}><span class="file-icon"><i class="ri-file-text-line" aria-hidden="true"></i></span><strong>${escapeHtml(item.name)}</strong><code title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</code>${item.state==="conflict"?`<span class="conflict-cell"><span class="conflict-label"><i class="ri-error-warning-line" aria-hidden="true"></i>名称冲突</span><button type="button" class="import-conflict-action" data-action="open-global-detail" data-skill-name="${escapeHtml(item.name)}">查看冲突</button></span>`:""}</article>`).join("") || emptyStateHtml("ri-download-2-line","该 Agent 没有可导入的 Skill","本地没有检测到可导入的 Skill，或全部已在全局库中。");
   const selectable=group.filter(item=>item.state!=="conflict");
   $("#select-all-imports").checked=selectable.length>0 && selectable.every(item=>selectedImports.has(importKey(item)));
   updateImportBar();
@@ -718,6 +796,26 @@ function deploymentLabel(skill,client){if(clientHasConflict(skill,client))return
 function deploymentDetail(skill,client){if(clientHasConflict(skill,client))return "Skill 内容存在同步冲突";if(client.link_state==="stale-render")return "链接仍指向旧版本";if(client.link_state==="conflict")return "目标位置已有其他内容";if(client.link_state==="wrong-link")return "链接指向其他位置";if(client.link_state==="broken-link")return "链接已失效";if(client.link_state==="tampered-render"||client.deployment_state==="tampered")return "部署内容被修改";if(client.link_state==="missing-render")return "部署文件已丢失";if(client.link_state==="missing")return "尚未创建链接";if(client.deployment_state!=="valid")return "需要重新构建";return "已连接当前版本";}
 function deploymentClass(skill,client){if(clientHasConflict(skill,client))return "danger";return deploymentLabel(skill,client)==="正常"?"ok":"warn";}
 function editScopeLabel(scope,target){if(scope==="base")return "全部客户端（Base）";if(scope==="family")return `${familyDisplayName(target)} 系列`;return clientDisplayName(target);}
+function editAgentLabel(agent){return ({codex:"Codex","kimi-code":"Kimi Code"})[agent]||agent;}
+function editAgentCapability(agent){return (state?.managed?.edit_agents?.agents||[]).find(item=>item.agent===agent)||null;}
+function editAgentUnavailableLabel(capability){
+  if(!capability)return "尚未读取安装状态，请刷新";
+  if(capability.reason==="not-installed")return `未安装（未找到 ${capability.executable_name||editAgentLabel(capability.agent)}）`;
+  if(capability.reason==="terminal-unsupported")return "已安装，但当前系统暂不支持打开终端会话";
+  if(capability.reason==="terminal-missing")return "已安装，但未找到 macOS Terminal 启动器";
+  return "当前不可用";
+}
+function editAgentAvailabilityLabel(capability){return capability?.available?`已安装 · ${capability.executable_path}`:editAgentUnavailableLabel(capability);}
+function firstAvailableEditAgent(){return (state?.managed?.edit_agents?.agents||[]).find(item=>item.available)?.agent||null;}
+function editAgentLaunchButton(agent,sessionId){
+  const capability=editAgentCapability(agent),available=Boolean(capability?.available),name=editAgentLabel(agent),label=available?`在 ${name} 中打开`:capability?.installed?`${name} 不可用`:`${name} 未安装`,title=available?`使用 ${capability.executable_path} 打开受管编辑会话`:editAgentUnavailableLabel(capability);
+  const icon=agent==="codex"?"ri-code-box-line":"ri-sparkling-line";
+  return `<button type="button" data-action="launch-edit-agent" data-agent="${escapeHtml(agent)}" data-session-id="${escapeHtml(sessionId)}" title="${escapeHtml(title)}" ${available?"":"disabled"}><i class="${icon}" aria-hidden="true"></i>${escapeHtml(label)}</button>`;
+}
+function editSessionDeleteButton(session){
+  const blocked=["applying","needs-recovery"].includes(session.status),reason=session.status==="applying"?"应用进行中，暂时不能删除":"会话需要恢复，处理完成前不能删除";
+  return `<button type="button" class="danger" data-action="delete-edit" data-session-id="${escapeHtml(session.session_id)}" ${blocked?`disabled title="${escapeHtml(reason)}"`:""}><i class="ri-delete-bin-line" aria-hidden="true"></i>删除会话</button>`;
+}
 function activeSessionForSkill(name){return sessionsForSkill(name).find(session=>session.status==="active")||null;}
 function editChangeLabel(value){return ({added:"新增",modified:"修改",deleted:"删除"})[value]||value||"变更";}
 function editClientActionLabel(value){return ({rebuild:"重新构建并更新",relink:"更新链接",noop:"无需部署变更",disabled:"客户端已停用",undetected:"本机未检测到",blocked:"暂时无法应用"})[value]||value||"检查";}
@@ -733,6 +831,27 @@ function editInspectionHtml(inspection){
   const clientHtml=clients.length?`<ul class="edit-client-list">${clients.map(client=>`<li>${escapeHtml(clientDisplayName(client.client))}：${escapeHtml(editClientActionLabel(client.action))}</li>`).join("")}</ul>`:'<p class="edit-check-meta">没有检测到需要更新的客户端</p>';
   const blockers=(inspection?.blockers||[]).map(editBlockerLabel);
   return `<div class="edit-inspection"><div class="edit-check"><header><strong>工作区改动</strong><em class="${diff?.changed?"warn":"neutral"}">${escapeHtml(changeSummary)}</em></header>${filesHtml}${resolvedHtml}</div><div class="edit-check"><header><strong>内容校验</strong><em class="${validation?.valid?"ok":"danger"}">${validation?.valid?"通过":"未通过"}</em></header>${issueHtml}</div><div class="edit-check"><header><strong>客户端影响</strong><em class="${impact?.blocked?"danger":"ok"}">${impact?.blocked?"已阻止":`${impact?.summary?.affected||0} 个受影响`}</em></header>${clientHtml}</div>${blockers.length?`<div class="mutation-finding"><strong>应用前需要处理</strong>：${escapeHtml([...new Set(blockers)].join("；"))}</div>`:""}</div>`;
+}
+async function launchEditAgent(sessionId,agent,announce=true){
+  const name=editAgentLabel(agent),key=`edit-launch:${sessionId}:${agent}`;
+  return runOperation(key,async()=>{
+    if(announce)toast(`正在打开 ${name}…`);
+    try{
+      const response=await postWithToken("/api/edit/launch",{session_id:sessionId,agent});
+      const data=await readJsonResponse(response,`${name} 启动结果无法解析`);
+      if(!response.ok){
+        if(response.status===404&&data.error==="unknown action")throw new Error("当前 Skill Sync 服务版本过旧，请重启 skill-sync web 后重试");
+        throw new Error(data.error||`无法打开 ${name}`);
+      }
+      const message=data.result?.instruction||`${name} 已在新终端中打开`;
+      if(announce)toast(message);
+      return {ok:true,message,result:data.result||{}};
+    }catch(error){
+      const message=error.message||`无法打开 ${name}`;
+      if(announce)toast(`打开 ${name} 失败：${message}`,true);
+      return {ok:false,message,error};
+    }
+  });
 }
 async function inspectEditSession(sessionId,announce=true){
   const key=`edit-inspect:${sessionId}`;
@@ -752,18 +871,20 @@ function renderDetailVariants(skill){
   const box=$("#detail-variants");if(!box)return;
   if(!managedDataReady()){box.innerHTML='<p class="detail-empty">正在读取 Variant…</p>';return;}
   const variants=variantsForSkill(skill.name);
-  box.innerHTML=variants.length?variants.map(variant=>`<div class="detail-item"><span><i class="ri-git-branch-line"></i><b>${escapeHtml(variant.target)}</b><small>${escapeHtml((variant.target_kinds||[]).join(" / ")||"客户端差异")} · ${variant.overlay_file_count??"?"} 个覆盖文件</small></span><em class="${variantStateClass(skill,variant)}">${escapeHtml(variantStateLabel(skill,variant))}</em></div>`).join(""):'<p class="detail-empty">所有客户端使用同一份内容</p>';
+  $("#detail-variants-section")?.classList.toggle("hidden",!variants.length);
+  box.innerHTML=variants.map(variant=>`<div class="detail-item"><span><i class="ri-git-branch-line"></i><b>${escapeHtml(variant.target)}</b><small>${escapeHtml((variant.target_kinds||[]).join(" / ")||"客户端差异")} · ${variant.overlay_file_count??"?"} 个覆盖文件</small></span><em class="${variantStateClass(skill,variant)}">${escapeHtml(variantStateLabel(skill,variant))}</em></div>`).join("");
 }
 function renderDetailSessions(skill){
   const box=$("#detail-sessions");if(!box)return;
   if(!managedDataReady()){box.innerHTML='<p class="detail-empty">正在读取会话…</p>';return;}
   const sessions=sessionsForSkill(skill.name);
-  box.innerHTML=sessions.length?sessions.map(session=>{
+  $("#detail-sessions-section")?.classList.toggle("hidden",!sessions.length);
+  box.innerHTML=sessions.map(session=>{
     const scope=session.target_scope?.kind||session.scope||"base",target=session.target_scope?.target||session.target||null,active=session.status==="active",inspection=editInspections.get(session.session_id),inspectedSession=inspection?.session||{};
-    if(!active)return `<div class="detail-item"><span><i class="ri-edit-line"></i><b>${escapeHtml(editScopeLabel(scope,target))}</b><small>${escapeHtml(session.session_id||"")}</small></span><em class="${sessionStatusClass(session.status)}">${escapeHtml(sessionStatusLabel(session.status))}</em></div>`;
+    if(!active)return `<div class="detail-item edit-session-history"><span><i class="ri-edit-line"></i><b>${escapeHtml(editScopeLabel(scope,target))}</b><small>${escapeHtml(session.session_id||"")}</small></span><span class="edit-session-history-actions"><em class="${sessionStatusClass(session.status)}">${escapeHtml(sessionStatusLabel(session.status))}</em>${editSessionDeleteButton(session)}</span></div>`;
     const workspace=inspectedSession.workspace_path;
-    return `<article class="edit-session-card"><div class="edit-session-head"><span><strong>${escapeHtml(editScopeLabel(scope,target))}</strong><small>${escapeHtml(session.session_id)}</small></span><em class="${sessionStatusClass(session.status)}">${escapeHtml(sessionStatusLabel(session.status))}</em></div>${workspace?`<div class="edit-session-path"><span>只在这个工作区修改文件</span><code>${escapeHtml(workspace)}</code></div>`:'<p class="detail-empty">检查工作区后显示编辑路径</p>'}${inspection?editInspectionHtml(inspection):'<p class="detail-empty">修改工作区文件后，点击“检查更改”查看差异和影响。</p>'}<div class="edit-session-actions"><button type="button" data-action="inspect-edit" data-session-id="${escapeHtml(session.session_id)}">${inspection?"重新检查":"检查更改"}</button><button type="button" class="primary" data-action="apply-edit" data-session-id="${escapeHtml(session.session_id)}" ${inspection?.can_apply?"":"disabled"}>应用更改</button><button type="button" class="danger" data-action="abort-edit" data-session-id="${escapeHtml(session.session_id)}">中止会话</button></div></article>`;
-  }).join(""):'<p class="detail-empty">没有编辑会话</p>';
+    return `<article class="edit-session-card"><div class="edit-session-head"><span><strong>${escapeHtml(editScopeLabel(scope,target))}</strong><small>${escapeHtml(session.session_id)}</small></span><em class="${sessionStatusClass(session.status)}">${escapeHtml(sessionStatusLabel(session.status))}</em></div>${workspace?`<div class="edit-session-path"><span>本次编辑只应修改这个工作区</span><code>${escapeHtml(workspace)}</code></div>`:'<p class="detail-empty">打开 Agent 或检查工作区后显示编辑路径</p>'}${inspection?editInspectionHtml(inspection):'<p class="detail-empty">在 Agent 中完成修改后，点击“检查更改”查看差异和影响。</p>'}<div class="edit-session-actions">${editAgentLaunchButton("codex",session.session_id)}${editAgentLaunchButton("kimi-code",session.session_id)}<button type="button" data-action="inspect-edit" data-session-id="${escapeHtml(session.session_id)}">${inspection?"重新检查":"检查更改"}</button><button type="button" class="primary" data-action="apply-edit" data-session-id="${escapeHtml(session.session_id)}" ${inspection?.can_apply?"":"disabled"}>应用更改</button><button type="button" class="danger" data-action="abort-edit" data-session-id="${escapeHtml(session.session_id)}">中止会话</button>${editSessionDeleteButton(session)}</div></article>`;
+  }).join("");
 }
 function renderDetailDeployments(skill){
   const box=$("#detail-deployments");if(!box)return;
@@ -772,7 +893,7 @@ function renderDetailDeployments(skill){
   if(!clients.length){box.innerHTML='<p class="detail-empty">没有检测到可部署的 client</p>';return;}
   const groups=new Map();clients.forEach(client=>{const family=client.agent||"other";if(!groups.has(family))groups.set(family,[]);groups.get(family).push(client);});
   const order=["codex","workbuddy","kimi","claude"];
-  box.innerHTML=[...groups].sort((a,b)=>(order.indexOf(a[0])<0?99:order.indexOf(a[0]))-(order.indexOf(b[0])<0?99:order.indexOf(b[0]))).map(([family,rows])=>`<section class="deployment-family"><header><strong>${escapeHtml(familyDisplayName(family))}</strong><span>${rows.length} 个客户端</span></header>${rows.sort((a,b)=>a.client.localeCompare(b.client)).map(client=>`<div class="deployment-client"><span><b>${escapeHtml(clientDisplayName(client.client))}</b><small>${escapeHtml(deploymentDetail(skill,client))}</small></span><em class="${deploymentClass(skill,client)}"><i></i>${escapeHtml(deploymentLabel(skill,client))}</em></div>`).join("")}</section>`).join("");
+  box.innerHTML=[...groups].sort((a,b)=>(order.indexOf(a[0])<0?99:order.indexOf(a[0]))-(order.indexOf(b[0])<0?99:order.indexOf(b[0]))).map(([family,rows])=>`<section class="deployment-family"><header><strong>${escapeHtml(familyDisplayName(family))}</strong><span>家族 · ${rows.length} 个客户端</span></header>${rows.sort((a,b)=>a.client.localeCompare(b.client)).map(client=>`<div class="deployment-client"><span><span class="deployment-level">客户端</span><b>${escapeHtml(clientDisplayName(client.client))}</b><small>${escapeHtml(deploymentDetail(skill,client))}</small></span><em class="${deploymentClass(skill,client)}"><i></i>${escapeHtml(deploymentLabel(skill,client))}</em></div>`).join("")}</section>`).join("");
 }
 
 function renderDetail() {
@@ -790,7 +911,10 @@ function renderDetail() {
   $("#detail-status").innerHTML=`<i></i>${escapeHtml(skillStateLabel(skill))}`;
   $("#detail-description").textContent=skill.description||"暂无 description";
   $("#detail-sync").textContent=skill.selected?"已加入同步":"仅保存在本地";
-  $("#detail-hash").textContent=skill.local_hash||"未计算";
+  const fullHash=skill.local_hash||"",hashEl=$("#detail-hash");
+  hashEl.textContent=fullHash?shortHash(fullHash):"未计算";
+  hashEl.dataset.fullValue=fullHash;
+  hashEl.setAttribute("title",fullHash?`点击复制完整内容版本：${fullHash}`:"内容版本未计算");
   $("#detail-path").textContent=skill.local_path;
   renderDetailVariants(skill);
   renderDetailSessions(skill);
@@ -807,7 +931,18 @@ function renderDetail() {
 function toggle(name,checked){checked?selected.add(name):selected.delete(name);persistUiContext();updateSkillSelectionUi(state.status.skills||[]);}
 function toggleVisibleSkills(){const shown=visibleSkills(state.status.skills||[]);const allSelected=shown.length>0&&shown.every(skill=>selected.has(skill.name));shown.forEach(skill=>allSelected ? selected.delete(skill.name) : selected.add(skill.name));persistUiContext();updateSkillSelectionUi(state.status.skills||[],shown);}
 function clearSelection(){selected.clear();persistUiContext();updateSkillSelectionUi(state.status.skills||[]);}
-function updateSelectionBar(){$("#selection-count").textContent=selected.size;$("#selection-bar").classList.toggle("hidden",!selected.size);}
+function updateSelectionBar(shown=null){
+  $("#selection-count").textContent=selected.size;
+  $("#selection-bar").classList.toggle("hidden",!selected.size);
+  $("#skill-list")?.classList.toggle("selection-open",selected.size>0);
+  const hint=$("#selection-context");
+  if(hint){
+    const visibleNames=new Set((shown||[]).map(skill=>skill.name));
+    const offView=selected.size?[...selected].filter(name=>!visibleNames.has(name)).length:0;
+    hint.textContent=offView?`含 ${offView} 项不在当前视图`:"";
+    hint.classList.toggle("hidden",!offView);
+  }
+}
 function selectedNames(){if(!selected.size){toast("请先选择至少一个 Skill",true);return null;}return [...selected];}
 function bulk(path){const skills=selectedNames();return skills&&action(path,{skills});}
 function toggleSelectedSync(){return bulk($("#select-selected").dataset.mode==="deselect"?"/api/deselect":"/api/select");}
@@ -859,7 +994,7 @@ function restoreDetailFromLocation(){
 function inventoryDataReady(){return loadedViews.has("inventory")||Boolean(state?.status?.skills?.length);}
 function agentDataReady(){return loadedViews.has("agents")||Boolean(state?.doctor?.agents?.length);}
 function readUiContext(){
-  const fallback={activeView:"skills",search:"",filters:{status:"synced",source:"all",agent:"all"},selected:[]};
+  const fallback={activeView:"skills",search:"",filters:{status:"synced",source:"all",agent:"all"},selected:[],statusExplicit:false};
   try{
     const parsed=JSON.parse(globalThis.sessionStorage?.getItem(WEB_CONTEXT_STORAGE_KEY)||"null");
     if(!parsed||typeof parsed!=="object")return fallback;
@@ -869,6 +1004,7 @@ function readUiContext(){
       search:typeof parsed.search==="string"?parsed.search:"",
       filters:{status:typeof filters.status==="string"?filters.status:"synced",source:typeof filters.source==="string"?filters.source:"all",agent:typeof filters.agent==="string"?filters.agent:"all"},
       selected:Array.isArray(parsed.selected)?[...new Set(parsed.selected.filter(name=>typeof name==="string"&&name))]:[],
+      statusExplicit:typeof filters.status==="string",
     };
   }catch(_){return fallback;}
 }
@@ -904,42 +1040,98 @@ async function deleteSelected(){const skills=selectedNames();if(!skills)return f
 function editTargetOptions(scope){return scope==="family"?[["codex","Codex"],["workbuddy","WorkBuddy"],["kimi","Kimi Code"],["claude","Claude Code"]]:[["codex","Codex"],["workbuddy","WorkBuddy"],["kimi-code","Kimi Code"],["claude-code","Claude Code"]];}
 function setEditLayer(open){const layer=$("#edit-layer");if(!layer)return;layer.classList.toggle("hidden",!open);layer.setAttribute("aria-hidden",String(!open));if($("#app"))$("#app").inert=open||Boolean(pendingMutation);if($("#setup"))$("#setup").inert=open||Boolean(pendingMutation);}
 function editConfirmationHtml(pending){
-  if(pending.kind==="begin")return `<p><strong>${escapeHtml(pending.skill)}</strong> 将创建 ${escapeHtml(editScopeLabel(pending.scope,pending.target))} 编辑工作区。</p><p>创建后只应修改返回的 workspace；确认不会直接改全局源或客户端部署。</p>`;
+  if(pending.kind==="begin")return `<p><strong>${escapeHtml(pending.skill)}</strong> 将创建 ${escapeHtml(editScopeLabel(pending.scope,pending.target))} 编辑工作区，并在新终端中打开 <strong>${escapeHtml(editAgentLabel(pending.agent))}</strong>。</p><p>Agent 会以这个独立工作区作为工作目录，不会直接打开全局源或客户端部署。完成后仍需回到 Skill Sync 检查并确认应用。</p>`;
   if(pending.kind==="abort")return `<p>将丢弃 <strong>${escapeHtml(editScopeLabel(pending.scope,pending.target))}</strong> 工作区中的未应用改动。</p><p>全局源和客户端部署不会被修改。</p>`;
+  if(pending.kind==="delete"){
+    const effect=pending.previousStatus==="active"?"会永久丢弃工作区中的全部未应用改动。":pending.previousStatus==="applied"?"只删除本机的会话记录、基线和工作副本，不会撤销已经应用的更改。":"会删除本机保留的会话记录和残留副本。";
+    return `<p>将永久删除 <strong>${escapeHtml(editScopeLabel(pending.scope,pending.target))}</strong> 编辑会话。</p><p>${escapeHtml(effect)}</p><p>此操作不会删除 Skill 源或客户端部署，且无法撤销。</p>`;
+  }
   const inspection=pending.inspection,diff=inspection?.diff,impact=inspection?.impact,summary=diff?.summary||{},clients=(impact?.clients||[]).filter(client=>client.scope_affected??client.affected);
   return `<p>将应用 <strong>${summary.added||0} 个新增、${summary.modified||0} 个修改、${summary.deleted||0} 个删除</strong>。</p><p>受影响客户端：${clients.length?clients.map(client=>escapeHtml(clientDisplayName(client.client))).join("、"):"没有客户端部署变化"}</p><p>执行前服务端会再次检查差异、校验、影响范围和源内容是否变化；检查结果不同会停止。</p>`;
 }
 function renderEditDialog(){
   if(!$("#edit-layer"))return;if(!pendingEdit){setEditLayer(false);return;}setEditLayer(true);
   const pending=pendingEdit,working=pending.phase==="running",resultPhase=pending.phase==="result";
-  $("#edit-title").textContent=pending.kind==="begin"?"开始托管编辑":pending.kind==="apply"?"应用编辑更改":"中止编辑会话";
+  $("#edit-title").textContent=pending.kind==="begin"?"使用 Agent 编辑":pending.kind==="apply"?"应用编辑更改":pending.kind==="delete"?"删除编辑会话":"中止编辑会话";
   $("#edit-status").className=`mutation-status ${resultPhase&&!pending.result?.ok?"result-error":working?"running":""}`;
-  $("#edit-status").textContent=pending.phase==="scope"?"选择修改范围":pending.phase==="confirm"?"等待确认":working?(pending.kind==="begin"?"正在创建…":pending.kind==="apply"?"正在应用…":"正在中止…"):(pending.result?.ok?"操作已完成":"操作未完成");
-  $("#edit-summary").textContent=pending.kind==="begin"?(pending.phase==="scope"?"选择最小且准确的修改范围。":"确认后会创建独立工作区，不会立即修改已发布内容。"):(pending.kind==="apply"?"确认应用当前检查过的工作区更改。":"确认丢弃这个会话的工作区更改。");
+  $("#edit-status").textContent=pending.phase==="scope"?"选择修改范围":pending.phase==="confirm"?"等待确认":working?(pending.kind==="begin"?"正在创建…":pending.kind==="apply"?"正在应用…":pending.kind==="delete"?"正在删除…":"正在中止…"):(pending.result?.ok?"操作已完成":"操作未完成");
+  $("#edit-summary").textContent=pending.kind==="begin"?(pending.phase==="scope"?"选择最小且准确的修改范围。":"确认后会创建独立工作区，不会立即修改已发布内容。"):(pending.kind==="apply"?"确认应用当前检查过的工作区更改。":pending.kind==="delete"?"确认永久删除本机上的这个编辑会话。":"确认丢弃这个会话的工作区更改。");
   const scopeBox=$("#edit-scope");scopeBox.classList.toggle("hidden",pending.kind!=="begin"||pending.phase!=="scope");
+  const agentBox=$("#edit-agent");agentBox.classList.toggle("hidden",pending.kind!=="begin"||pending.phase!=="scope");
   for(const input of document.querySelectorAll('input[name="edit-scope"]'))input.checked=input.value===pending.scope;
+  if(pending.kind==="begin"&&pending.phase==="scope"&&!editAgentCapability(pending.agent)?.available)pending.agent=firstAvailableEditAgent();
+  for(const input of document.querySelectorAll('input[name="edit-agent"]')){
+    const capability=editAgentCapability(input.value),available=Boolean(capability?.available);
+    input.disabled=!available;input.checked=input.value===pending.agent;
+    $(`#edit-agent-${input.value}-option`)?.classList.toggle("unavailable",!available);
+    const hint=$(`#edit-agent-${input.value}-hint`);if(hint)hint.textContent=editAgentAvailabilityLabel(capability);
+  }
   const targetWrap=$("#edit-target-wrap"),showTarget=pending.kind==="begin"&&pending.phase==="scope"&&pending.scope!=="base";targetWrap.classList.toggle("hidden",!showTarget);
   if(showTarget){const options=editTargetOptions(pending.scope);updateSelectOptions($("#edit-target"),options.map(([value,label])=>({value,label})));if(!options.some(([value])=>value===pending.target))pending.target=options[0][0];$("#edit-target").value=pending.target;$("#edit-target-label").textContent=pending.scope==="family"?"客户端系列":"具体客户端";}
   const details=$("#edit-confirm-details");details.classList.toggle("hidden",pending.phase==="scope"||resultPhase);details.innerHTML=pending.phase==="scope"||resultPhase?"":editConfirmationHtml(pending);
   const result=$("#edit-result");result.className=`mutation-result ${resultPhase?(pending.result?.ok?"success":"error"):"hidden"}`;result.textContent=resultPhase?(pending.result?.message||"操作结果未知"):"";
   $("#edit-close").disabled=working;$("#edit-cancel").disabled=working;$("#edit-cancel").textContent=resultPhase?"关闭":"取消";
-  const confirm=$("#edit-confirm");confirm.classList.toggle("hidden",resultPhase);confirm.disabled=working||(pending.kind==="apply"&&!pending.inspection?.can_apply);confirm.textContent=working?"正在处理…":pending.phase==="scope"?"下一步":pending.kind==="begin"?"确认开始":pending.kind==="apply"?"确认应用":"确认中止";
+  const confirm=$("#edit-confirm");confirm.classList.toggle("hidden",resultPhase);confirm.disabled=working||(pending.kind==="begin"&&pending.phase==="scope"&&!pending.agent)||(pending.kind==="apply"&&!pending.inspection?.can_apply);confirm.textContent=working?"正在处理…":pending.phase==="scope"?"下一步":pending.kind==="begin"?`确认并打开 ${editAgentLabel(pending.agent)}`:pending.kind==="apply"?"确认应用":pending.kind==="delete"?"确认删除":"确认中止";
   if(pending.focusRequested){pending.focusRequested=false;(pending.phase==="scope"?document.querySelector('input[name="edit-scope"]:checked'):resultPhase?$("#edit-cancel"):confirm)?.focus();}
 }
-function openEditBegin(){if(!detailSkill||pendingEdit||pendingMutation||hasBusyOperation())return false;pendingEdit={kind:"begin",skill:detailSkill,scope:"base",target:null,phase:"scope",result:null,focusRequested:true};renderEditDialog();return true;}
+function openEditBegin(){if(!detailSkill||pendingEdit||pendingMutation||hasBusyOperation())return false;pendingEdit={kind:"begin",skill:detailSkill,scope:"base",target:null,agent:firstAvailableEditAgent(),phase:"scope",result:null,focusRequested:true};renderEditDialog();return true;}
 function sessionById(sessionId){return (state?.managed?.sessions?.sessions||[]).find(session=>session.session_id===sessionId)||null;}
 function openEditApply(sessionId){const session=sessionById(sessionId),inspection=editInspections.get(sessionId);if(!session||!inspection?.can_apply){toast("请先检查并处理工作区问题",true);return false;}pendingEdit={kind:"apply",skill:session.logical_skill||session.skill,sessionId,scope:session.target_scope?.kind||session.scope||"base",target:session.target_scope?.target||session.target||null,inspection,phase:"confirm",result:null,focusRequested:true};renderEditDialog();return true;}
 function openEditAbort(sessionId){const session=sessionById(sessionId);if(!session||session.status!=="active")return false;pendingEdit={kind:"abort",skill:session.logical_skill||session.skill,sessionId,scope:session.target_scope?.kind||session.scope||"base",target:session.target_scope?.target||session.target||null,phase:"confirm",result:null,focusRequested:true};renderEditDialog();return true;}
+function openEditDelete(sessionId){const session=sessionById(sessionId);if(!session||["applying","needs-recovery"].includes(session.status))return false;pendingEdit={kind:"delete",skill:session.logical_skill||session.skill,sessionId,scope:session.target_scope?.kind||session.scope||"base",target:session.target_scope?.target||session.target||null,previousStatus:session.status,phase:"confirm",result:null,focusRequested:true};renderEditDialog();return true;}
+function removeEditSessionLocally(sessionId){
+  const managed=state?.managed,sessions=managed?.sessions?.sessions;if(!Array.isArray(sessions))return;
+  managed.sessions={...managed.sessions,sessions:sessions.filter(session=>session.session_id!==sessionId)};
+  editInspections.delete(sessionId);renderDetail();
+}
+function pollEditDelete(taskId,sessionId){
+  setTimeout(async()=>{
+    try{
+      const response=await fetch(`/api/edit/delete-status?task_id=${encodeURIComponent(taskId)}`),data=await response.json();
+      if(!response.ok)throw new Error(data.error||"无法读取后台任务状态");
+      const task=data.result||{};
+      if(["queued","running"].includes(task.status)){pollEditDelete(taskId,sessionId);return;}
+      await getState(false);
+      if(task.status==="completed"){
+        const pendingCount=task.result?.cleanup_pending?.length||0;
+        toast(pendingCount?`会话已删除，另有 ${pendingCount} 个本地临时目录待清理。`:"编辑会话已删除");
+      }else toast(`删除编辑会话失败：${task.error||"后台任务未完成"}`,true);
+    }catch(error){await getState(false);toast(`无法确认会话删除结果：${error.message}`,true);}
+  },300);
+}
+function startBackgroundEditDelete(pending){
+  const sessionId=pending.sessionId;
+  pendingEdit=null;setEditLayer(false);removeEditSessionLocally(sessionId);
+  focusVisibleControl($("#detail-edit-start"),$("#close-detail"),$("#search"));
+  toast("已提交后台删除，无需在此等待");
+  (async()=>{
+    try{
+      const response=await postWithToken("/api/edit/delete",{session_id:sessionId}),data=await response.json();
+      if(!response.ok)throw new Error(data.error||"无法启动后台删除");
+      const taskId=data.result?.task_id;if(!taskId)throw new Error("服务未返回删除任务编号");
+      pollEditDelete(taskId,sessionId);
+    }catch(error){await getState(false);toast(`删除编辑会话失败：${error.message}`,true);}
+  })();
+  return true;
+}
 async function confirmEditAction(){
   const pending=pendingEdit;if(!pending||pending.phase==="running"||pending.phase==="result")return false;
-  if(pending.phase==="scope"){pending.phase="confirm";pending.focusRequested=true;renderEditDialog();return true;}
+  if(pending.phase==="scope"){if(!pending.agent||!editAgentCapability(pending.agent)?.available){toast("请先安装可用的 Codex 或 Kimi Code",true);return false;}pending.phase="confirm";pending.focusRequested=true;renderEditDialog();return true;}
+  if(pending.kind==="delete")return startBackgroundEditDelete(pending);
   pending.phase="running";renderEditDialog();let outcome=null,body,path;
-  if(pending.kind==="begin"){body={skill:pending.skill,scope:pending.scope,...(pending.scope==="base"?{}:{target:pending.target})};path="/api/edit/begin";}
+  if(pending.kind==="begin"){body={skill:pending.skill,scope:pending.scope,actor:pending.agent,...(pending.scope==="base"?{}:{target:pending.target})};path="/api/edit/begin";}
   else if(pending.kind==="apply"){body={session_id:pending.sessionId,inspection_id:pending.inspection.inspection_id};path="/api/edit/apply";}
   else{body={session_id:pending.sessionId};path="/api/edit/abort";}
   const ok=await action(path,body,{captureResult:value=>{outcome=value;}});if(pendingEdit!==pending)return ok;
   if(!ok&&outcome?.data?.details?.inspection){pending.inspection=outcome.data.details.inspection;editInspections.set(pending.sessionId,pending.inspection);}
-  if(ok&&pending.kind==="begin"){pending.sessionId=outcome?.result?.session_id;if(pending.sessionId)await inspectEditSession(pending.sessionId,false);}
+  if(ok&&pending.kind==="begin"){
+    pending.sessionId=outcome?.result?.session_id;
+    if(pending.sessionId){
+      const launch=await launchEditAgent(pending.sessionId,pending.agent,false);
+      await inspectEditSession(pending.sessionId,false);
+      outcome=launch.ok?{ok:true,message:launch.result?.instruction||`${editAgentLabel(pending.agent)} 已在新终端中打开`,result:launch.result}:{ok:false,message:`编辑工作区已创建，但未能打开 ${editAgentLabel(pending.agent)}：${launch.message}。可在详情中重试。`,result:outcome?.result||{}};
+    }
+  }
   if(ok&&pending.kind!=="begin")editInspections.delete(pending.sessionId);
   pending.phase="result";pending.result=outcome||{ok,message:ok?"操作已完成":"操作未完成"};pending.focusRequested=true;renderDetail();renderEditDialog();return ok;
 }
@@ -955,7 +1147,23 @@ function handleEditKeydown(event){
   else if(!event.shiftKey&&(active===last||!$("#edit-dialog").contains(active))){event.preventDefault();first.focus();}
   return true;
 }
-function handleDetailClick(event){const target=delegatedActionTarget(event),sessionId=target?.dataset?.sessionId;if(!target||!sessionId)return;if(target.dataset.action==="inspect-edit")inspectEditSession(sessionId);if(target.dataset.action==="apply-edit")openEditApply(sessionId);if(target.dataset.action==="abort-edit")openEditAbort(sessionId);}
+async function copyText(value,message){
+  if(!value){toast("没有可复制的内容",true);return false;}
+  if(!globalThis.navigator?.clipboard?.writeText){toast("当前环境不支持自动复制，请手动选择复制",true);return false;}
+  try{await globalThis.navigator.clipboard.writeText(value);toast(message);return true;}
+  catch(_){toast("复制失败，请手动选择复制",true);return false;}
+}
+function handleDetailClick(event){
+  const target=delegatedActionTarget(event);if(!target)return;
+  if(target.dataset.action==="copy-hash"){copyText(target.dataset.fullValue,"已复制完整内容版本");return;}
+  if(target.dataset.action==="copy-path"){copyText($("#detail-path")?.textContent,"已复制路径");return;}
+  const sessionId=target.dataset.sessionId;if(!sessionId)return;
+  if(target.dataset.action==="launch-edit-agent"){launchEditAgent(sessionId,target.dataset.agent);return;}
+  if(target.dataset.action==="inspect-edit")inspectEditSession(sessionId);
+  if(target.dataset.action==="apply-edit")openEditApply(sessionId);
+  if(target.dataset.action==="abort-edit")openEditAbort(sessionId);
+  if(target.dataset.action==="delete-edit")openEditDelete(sessionId);
+}
 function label(value){return({pull:"需要拉取",push:"需要推送","repair-links":"需要修复链接",conflict:"需要手动合并",blocked:"需要先处理",noop:"所有 Agent 已同步"})[value]||value;}
 function previewSummary(value){return({pull:"远端有新的 Skill 变更可拉取。",push:"本地变更等待推送到远端。","repair-links":"Skill 内容一致，部分 Agent 链接需要修复。",conflict:"本地和远端均有修改，需要手动合并。",blocked:"同步仓库需要先处理。",noop:"所有受管 Skill 状态一致。"})[value]||"当前状态已更新。";}
 function viewName(view){return({skills:"技能库",agents:"连接",imports:"导入"})[view]||"当前页面";}
@@ -979,6 +1187,8 @@ function escapeHtml(value){return String(value??"").replace(/[&<>"']/g,c=>({"&":
 function delegatedActionTarget(event){return event.target?.closest?.("[data-action]")||null;}
 function handleSkillListClick(event){
   const target=delegatedActionTarget(event);if(!target)return;
+  if(target.dataset.action==="goto-imports"){switchView("imports");return;}
+  if(target.dataset.action==="clear-filters-empty"){clearInventoryFilters();return;}
   if(target.dataset.action==="toggle-skill")return;
   const name=target.dataset.skillName;if(!name)return;
   if(target.dataset.action==="repair-skill"){event.stopPropagation();repairSkill(name,target);return;}
@@ -991,6 +1201,17 @@ function handleAgentListClick(event){
 }
 function handleImportTabsClick(event){const target=delegatedActionTarget(event);if(target?.dataset.action==="set-import-agent")setImportAgent(target.dataset.agent);}
 function handleImportsChange(event){const target=delegatedActionTarget(event);if(target?.dataset.action==="toggle-import")toggleImport(target.dataset.agent,target.dataset.skillName,target.checked);}
+function handleImportsClick(event){
+  const target=delegatedActionTarget(event);
+  if(target?.dataset.action!=="open-global-detail")return;
+  event.stopPropagation();
+  const name=target.dataset.skillName;
+  if(!(state?.status?.skills||[]).some(skill=>skill.name===name)){toast("全局库中还没有同名 Skill 的详情",true);return;}
+  if(mutationInFlight){toast("请等待当前操作完成");return;}
+  activeView="skills";persistUiContext();showView("skills");
+  loadActiveView().catch(error=>toast(error.message,true));
+  openDetail(name,target);
+}
 function scheduleSearchRender(){
   persistUiContext();if(searchRenderTimer!==null)clearTimeout(searchRenderTimer);
   searchRenderTimer=setTimeout(()=>{searchRenderTimer=null;renderSkills(state.status.skills||[]);},200);
@@ -1000,7 +1221,33 @@ function isEditableTarget(target){return ["INPUT","TEXTAREA","SELECT"].includes(
 document.querySelectorAll(".nav-item[data-view]").forEach(button=>button.onclick=()=>switchView(button.dataset.view));
 $("#search").value=restoredUiContext.search;
 showView(activeView);
-$("#setup-form").onsubmit=async event=>{event.preventDefault();await action("/api/init",Object.fromEntries(new FormData(event.currentTarget)));};
+function repoLooksPlausible(value){
+  const text=String(value||"").trim();
+  if(!text)return true;
+  return /^(git@[\w.-]+:[\w./~@-]+|(ssh|git|https?|file):\/\/\S+|[A-Za-z]:[\\/]\S+|\.{0,2}\/\S+|~\/\S+|\/\S+)/.test(text)||text.endsWith(".git");
+}
+function wireSetupForm(){
+  const form=$("#setup-form");if(!form)return;
+  const errorBox=$("#setup-error"),repoHint=$("#setup-repo-hint");
+  const repoInput=form.querySelector?.('input[name="repo"]')||null;
+  form.onsubmit=async event=>{
+    event.preventDefault();
+    if(errorBox){errorBox.textContent="";errorBox.classList.add("hidden");}
+    let failure=null;
+    const ok=await action("/api/init",Object.fromEntries(new FormData(form)),{silentError:Boolean(errorBox),captureResult:value=>{if(!value.ok)failure=value.message;}});
+    // Keep the entered values; surface the failure inside the form instead of a duplicate toast.
+    if(!ok&&failure&&errorBox){errorBox.textContent=failure;errorBox.classList.remove("hidden");}
+  };
+  if(repoInput&&repoHint){
+    repoInput.onblur=()=>{
+      const plausible=repoLooksPlausible(repoInput.value);
+      repoHint.classList.toggle("hidden",plausible);
+      if(plausible)repoInput.removeAttribute("aria-invalid");else repoInput.setAttribute("aria-invalid","true");
+    };
+    repoInput.oninput=()=>{repoHint.classList.add("hidden");repoInput.removeAttribute("aria-invalid");};
+  }
+}
+wireSetupForm();
 $("#sync").onclick=()=>requestPlannedMutation("sync","/api/sync",{},$("#sync"));$("#repair-all").onclick=repairAllSkills;$("#refresh").onclick=()=>getState(true);
 $("#retry-load").onclick=()=>getState(true);
 $("#search").oninput=scheduleSearchRender;
@@ -1017,10 +1264,17 @@ $("#close-detail").onclick=()=>closeDetail();$("#detail-repair").onclick=()=>det
 if($("#detail-edit-start"))$("#detail-edit-start").onclick=openEditBegin;
 $("#detail-drawer").onkeydown=handleDetailKeydown;$("#detail-drawer").onclick=handleDetailClick;
 $("#skill-list").onclick=handleSkillListClick;$("#skill-list").onchange=handleSkillListChange;
-$("#agent-list").onclick=handleAgentListClick;$("#import-tabs").onclick=handleImportTabsClick;$("#imports").onchange=handleImportsChange;
+$("#issue-list").onclick=handleIssueClick;
+$("#agent-list").onclick=handleAgentListClick;$("#import-tabs").onclick=handleImportTabsClick;$("#imports").onchange=handleImportsChange;$("#imports").onclick=handleImportsClick;
 if(globalThis.addEventListener){
   globalThis.addEventListener("popstate",restoreDetailFromLocation);
-  globalThis.addEventListener("keydown",event=>{if(pendingMutation){handleMutationKeydown(event);return;}if(pendingEdit){handleEditKeydown(event);return;}if(event.key==="Escape"&&detailSkill&&!isEditableTarget(event.target))handleDetailKeydown(event);});
+  globalThis.addEventListener("keydown",event=>{
+    if(pendingMutation){handleMutationKeydown(event);return;}
+    if(pendingEdit){handleEditKeydown(event);return;}
+    if(event.key!=="Escape"||isEditableTarget(event.target))return;
+    if(detailSkill){handleDetailKeydown(event);return;}
+    if(selected.size&&activeView==="skills"){event.preventDefault();clearSelection();}
+  });
 }
 $("#select-all-imports").onchange=toggleAllImports;$("#clear-imports").onclick=()=>{selectedImports.clear();renderImports(state.import_candidates||[]);};$("#import-selected").onclick=importSelected;
 if($("#mutation-confirm"))$("#mutation-confirm").onclick=confirmPendingMutation;
@@ -1030,12 +1284,13 @@ if($("#mutation-retry"))$("#mutation-retry").onclick=retryPendingMutation;
 if($("#mutation-partial"))$("#mutation-partial").onclick=planSafeRepairSubset;
 if($("#mutation-delete-input"))$("#mutation-delete-input").oninput=updateMutationConfirmState;
 if($("#mutation-delete-input"))$("#mutation-delete-input").onkeydown=event=>{if(event.key==="Enter"&&!$("#mutation-confirm").disabled){event.preventDefault();confirmPendingMutation();}};
-if($("#mutation-dialog"))$("#mutation-dialog").onkeydown=handleMutationKeydown;
+// Dialog keyboard handling lives only in the global keydown listener above;
+// a per-dialog handler would double-process Tab/Escape as the event bubbles.
 if($("#edit-confirm"))$("#edit-confirm").onclick=confirmEditAction;
 if($("#edit-cancel"))$("#edit-cancel").onclick=cancelEditAction;
 if($("#edit-close"))$("#edit-close").onclick=cancelEditAction;
 if($("#edit-scope"))$("#edit-scope").onchange=event=>{if(event.target?.name!=="edit-scope"||!pendingEdit)return;pendingEdit.scope=event.target.value;pendingEdit.target=null;renderEditDialog();};
+if($("#edit-agent"))$("#edit-agent").onchange=event=>{if(event.target?.name!=="edit-agent"||!pendingEdit)return;pendingEdit.agent=event.target.value;renderEditDialog();};
 if($("#edit-target"))$("#edit-target").onchange=event=>{if(pendingEdit)pendingEdit.target=event.currentTarget.value;};
-if($("#edit-dialog"))$("#edit-dialog").onkeydown=handleEditKeydown;
 if($("#toast-close"))$("#toast-close").onclick=dismissToast;
 if (!globalThis.SKILL_SYNC_TEST) getState(false).catch(error=>toast(error.message,true));

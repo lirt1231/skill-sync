@@ -598,6 +598,43 @@ class EditSessionStore:
             _fsync_directory(paths.root)
             return aborted
 
+    def delete(self, session_id: str) -> tuple[EditSessionMetadata, Path | None]:
+        """Remove one deletable machine-local session and all of its local copies.
+
+        Applying and recovery sessions remain durable evidence for transactional
+        recovery. Other states, including active workspaces, may be explicitly
+        discarded by the caller.
+        """
+
+        initial = self.load(session_id)
+        with self.skill_lock(initial.logical_skill):
+            current = self.load(session_id)
+            if current.status in {
+                EditSessionStatus.APPLYING,
+                EditSessionStatus.NEEDS_RECOVERY,
+            }:
+                raise InvalidEditSessionTransition(
+                    f"edit session cannot be deleted while {current.status.value}"
+                )
+            paths = self.paths(session_id)
+            _assert_real_directory(paths.root, "edit session deletion tree")
+            detached = self.data_root / (
+                f".edit-session-delete-{session_id}-{uuid.uuid4().hex}"
+            )
+            if detached.exists() or is_link_or_reparse(detached):
+                raise EditSessionMetadataError(
+                    f"unexpected edit session deletion path: {detached}"
+                )
+            rename_no_replace(paths.root, detached)
+            _fsync_directory(self.root)
+
+        try:
+            _remove_real_tree(detached)
+        except (EditSessionMetadataError, OSError):
+            return current, detached
+        _fsync_directory(self.data_root)
+        return current, None
+
     def load(self, session_id: str) -> EditSessionMetadata:
         """Load one session, failing closed on malformed or displaced metadata."""
 
@@ -947,6 +984,10 @@ def _assert_real_directory(path: Path, label: str) -> None:
         if is_link_or_reparse(child):
             raise EditSessionMetadataError(
                 f"{label} must not contain a link or reparse point: {child}"
+            )
+        if not child.is_dir() and not child.is_file():
+            raise EditSessionMetadataError(
+                f"{label} must contain only regular files and directories: {child}"
             )
 
 

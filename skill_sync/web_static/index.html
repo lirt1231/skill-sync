@@ -17,9 +17,10 @@
     <h1 id="setup-title">让你的 Skills 跟着你走</h1>
     <p>连接一个私有 Git 仓库，在所有 Agent 之间安全同步。</p>
     <form id="setup-form">
-      <label>Git 仓库地址<input name="repo" required placeholder="git@github.com:you/agent-skills.git"></label>
+      <label>Git 仓库地址<input name="repo" required placeholder="git@github.com:you/agent-skills.git" aria-describedby="setup-repo-hint"><small id="setup-repo-hint" class="field-hint hidden">这看起来不像 Git 仓库地址或本地路径，请确认后再提交（仍可继续）。</small></label>
       <label>分支<input name="branch" value="main"></label>
       <details><summary>高级设置</summary><label>全局 Skill 目录<input name="skills_root" placeholder="~/.agents/skills"></label><label>本地仓库目录<input name="sync_dir" placeholder="默认本地数据目录"></label></details>
+      <p id="setup-error" class="setup-error hidden" role="alert"></p>
       <button id="setup-submit" class="primary" type="submit">连接并开始使用</button>
     </form>
     <small>不会保存 Git 密码或令牌，认证由系统 Git 凭据处理。</small>
@@ -52,7 +53,7 @@
           <div id="status-tabs" class="status-tabs" role="group" aria-label="按同步状态查看">
             <button id="status-synced" class="status-tab active" type="button" aria-pressed="true"><span>已同步</span><b id="status-synced-count">0</b></button>
             <button id="status-changed" class="status-tab" type="button" aria-pressed="false"><span>本地待推送</span><b id="status-changed-count">0</b></button>
-            <button id="status-local" class="status-tab" type="button" aria-pressed="false"><span>没有加入同步</span><b id="status-local-count">0</b></button>
+            <button id="status-local" class="status-tab" type="button" aria-pressed="false"><span class="tab-label-full">没有加入同步</span><span class="tab-label-short">未同步</span><b id="status-local-count">0</b></button>
           </div>
           <div class="table-tools">
             <label id="search-wrap" class="search-wrap"><i class="ri-search-line"></i><input id="search" type="search" placeholder="搜索名称或 description" aria-label="搜索 Skill"></label>
@@ -68,6 +69,7 @@
         </section>
         <div id="selection-bar" class="selection-bar hidden">
           <strong><span id="selection-count">0</span> 项已选择</strong>
+          <small id="selection-context" class="selection-context hidden"></small>
           <button id="select-selected"><i class="ri-loop-right-line"></i><span>更新同步</span></button>
           <div class="copy-control"><button id="copy-selected"><i class="ri-file-copy-line"></i>复制到</button><select id="copy-agent" aria-label="复制目标 Agent"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="workbuddy">WorkBuddy</option></select></div>
           <details class="more-menu"><summary><i class="ri-more-line"></i>更多</summary><div><button id="link-selected">修复链接</button><button id="delete-selected" class="danger">删除所选</button></div></details>
@@ -96,19 +98,20 @@
       <div class="detail-icon"><i class="ri-file-text-line"></i></div>
       <h2 id="detail-name"></h2><p id="detail-status" class="detail-status"></p>
       <p id="detail-description" class="detail-description"></p>
-      <section><h3>概览</h3><dl><div><dt>来源</dt><dd>全局库</dd></div><div><dt>同步状态</dt><dd id="detail-sync"></dd></div><div><dt>内容版本</dt><dd><code id="detail-hash"></code></dd></div></dl></section>
-      <section><h3>客户端差异</h3><div id="detail-variants" class="detail-stack"></div></section>
-      <section>
-        <div class="detail-section-heading"><h3>编辑会话</h3><button id="detail-edit-start" type="button"><i class="ri-edit-line"></i>开始编辑</button></div>
+      <div class="detail-actions">
+        <button id="detail-edit-start" type="button" class="primary"><i class="ri-edit-line" aria-hidden="true"></i>使用 Agent 编辑</button>
+        <button id="detail-repair" type="button" class="hidden"><i class="ri-tools-line" aria-hidden="true"></i>一键修复部署</button>
+        <button id="detail-backup" type="button">创建本地备份</button>
+      </div>
+      <section><h3>概览</h3><dl><div><dt>来源</dt><dd>全局库</dd></div><div><dt>同步状态</dt><dd id="detail-sync"></dd></div><div><dt>内容版本</dt><dd><button type="button" id="detail-hash" class="copy-chip" data-action="copy-hash"></button></dd></div></dl></section>
+      <section id="detail-variants-section"><h3>客户端差异</h3><div id="detail-variants" class="detail-stack"></div></section>
+      <section id="detail-sessions-section">
+        <h3>编辑会话</h3>
         <div id="detail-sessions" class="detail-stack"></div>
       </section>
       <section><h3>客户端部署</h3><div id="detail-deployments" class="deployment-matrix"></div></section>
       <section><h3>客户端覆盖</h3><div id="detail-agents"></div></section>
-      <section><h3>位置</h3><code id="detail-path"></code></section>
-      <div class="detail-actions">
-        <button id="detail-repair" class="primary hidden"><i class="ri-tools-line"></i>一键修复部署</button>
-        <button id="detail-backup">创建本地备份</button>
-      </div>
+      <section><h3>位置</h3><div class="detail-path-row"><code id="detail-path"></code><button id="detail-copy-path" class="icon-button" type="button" data-action="copy-path" aria-label="复制路径" title="复制路径"><i class="ri-file-copy-line" aria-hidden="true"></i></button></div></section>
     </aside>
   </div>
   <section id="mutation-layer" class="mutation-layer hidden" aria-hidden="true">
@@ -137,7 +140,7 @@
     <article id="edit-dialog" class="mutation-dialog edit-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-title" tabindex="-1">
       <button id="edit-close" class="icon-button mutation-close" type="button" aria-label="关闭编辑会话操作"><i class="ri-close-line"></i></button>
       <p id="edit-status" class="mutation-status"></p>
-      <h2 id="edit-title">开始托管编辑</h2>
+      <h2 id="edit-title">使用 Agent 编辑</h2>
       <p id="edit-summary" class="mutation-summary"></p>
       <fieldset id="edit-scope" class="edit-scope">
         <legend>修改范围</legend>
@@ -145,6 +148,11 @@
         <label><input type="radio" name="edit-scope" value="family"><span><strong>客户端系列</strong><small>修改一个系列共用的差异层</small></span></label>
         <label><input type="radio" name="edit-scope" value="client"><span><strong>单个客户端</strong><small>只修改一个具体客户端</small></span></label>
         <label id="edit-target-wrap" class="edit-target hidden"><span id="edit-target-label">目标</span><select id="edit-target"></select></label>
+      </fieldset>
+      <fieldset id="edit-agent" class="edit-agent">
+        <legend>使用哪个 Agent</legend>
+        <label id="edit-agent-codex-option"><input type="radio" name="edit-agent" value="codex"><span><i class="ri-code-box-line" aria-hidden="true"></i><strong>Codex</strong><small id="edit-agent-codex-hint">正在检测安装状态…</small></span></label>
+        <label id="edit-agent-kimi-code-option"><input type="radio" name="edit-agent" value="kimi-code"><span><i class="ri-sparkling-line" aria-hidden="true"></i><strong>Kimi Code</strong><small id="edit-agent-kimi-code-hint">正在检测安装状态…</small></span></label>
       </fieldset>
       <div id="edit-confirm-details" class="edit-confirm-details hidden"></div>
       <section id="edit-result" class="mutation-result hidden" aria-live="polite"></section>

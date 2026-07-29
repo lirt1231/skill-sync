@@ -1031,8 +1031,10 @@ Variant/session/deployment badges，详情按 family 分组但逐 concrete clien
 状态，Kimi Code 的具体问题不再被 family 汇总掩盖。搜索、筛选、选择、空状态、渐进
 加载、焦点回退及 stale/tampered/source-conflict 矩阵均有自动化测试。desktop 和
 400px 响应式视图已通过 Microsoft Edge 实机截图审计。Web 详情现可按 Base、family
-或 concrete client 创建托管编辑工作区，聚合展示 diff、validate 和 impact，并在明确
-确认后 apply 或 abort。apply 会在服务端重算检查结果并校验 fingerprint；基线变化、
+或 concrete client 创建托管编辑工作区，选择 Codex 或 Kimi Code 后在新终端中启动
+受管工作区会话，聚合展示 diff、validate 和 impact，并在明确确认后 apply 或 abort。
+Agent 启动失败不会丢弃已创建的编辑会话，详情页可重试。apply 会在服务端重算检查结果
+并校验 fingerprint；基线变化、
 校验失败、影响阻断、无改动或作用域漂移都会在写入前停止，页面不提供 canonical source
 或 deployment 的直接编辑入口。
 
@@ -1043,7 +1045,7 @@ Variant/session/deployment badges，详情按 family 分组但逐 concrete clien
 | 10.1 | `add deployment and session web read models` | 在 Step 6B 通用 Web 状态层上增加 Variant、Deployment 和 Session 只读模型；不改页面 | Web/CLI 同输入输出一致，普通请求不 fetch |
 | 10.2 | `show managed skill inventory` | inventory、source hash、deployment/session/variant badges | 搜索、选择和空状态测试 |
 | 10.3 | `show family client deployment matrix` | client matrix、Kimi 分组、stale/tampered/conflict 状态 | 具体 client 问题不被 family 汇总掩盖 |
-| 10.4 | `add managed edit session interface` | begin/diff/validate/impact/apply/abort UI | mutation 都显示 plan/result，不能写 deployment |
+| 10.4 | `add managed edit session interface` | begin、启动 Codex/Kimi Code 会话、diff/validate/impact/apply/abort UI | mutation 都显示 plan/result，不能写 deployment；启动失败可重试且不丢会话 |
 | 10.5 | `add tamper recovery interface` | capture/discard recovery UI | 高风险动作确认、错误时保留恢复信息 |
 | 10.6 | `cache web inventory hashes` | 在 6.5 view-scoped loading 上增加 affected-only refresh 和持久 hash cache；不改变业务状态 | 100 Skill 完整缓存刷新目标小于 300 ms |
 

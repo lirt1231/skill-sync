@@ -30,9 +30,9 @@ class Element {
   getAttribute(name) { return this.attributes[name]; }
   focus() { document.activeElement = this; }
   closest(selector) { return selector === ".hidden" && this.classList.contains("hidden") ? this : null; }
-  contains(item) { return Object.values(elements).includes(item) || radios.includes(item); }
+  contains(item) { return Object.values(elements).includes(item) || radios.includes(item) || agentRadios.includes(item); }
   querySelectorAll() {
-    if (this.id === "edit-dialog") return [elements["edit-close"], ...radios, elements["edit-target"], elements["edit-cancel"], elements["edit-confirm"]].filter(item => !item.disabled && !item.classList.contains("hidden"));
+    if (this.id === "edit-dialog") return [elements["edit-close"], ...radios, ...agentRadios, elements["edit-target"], elements["edit-cancel"], elements["edit-confirm"]].filter(item => !item.disabled && !item.classList.contains("hidden"));
     return [];
   }
 }
@@ -44,10 +44,11 @@ const ids = [
   "agent-list","import-tabs","imports","select-all-imports","clear-imports","import-selected","import-count","import-bar",
   "detail-drawer","detail-name","detail-status","detail-description","detail-sync","detail-hash","detail-path","detail-agents","detail-variants","detail-sessions","detail-deployments","detail-repair","detail-backup","detail-edit-start","close-detail",
   "load-failure","retry-load","toast","toast-close","mutation-layer","mutation-dialog","mutation-close","mutation-title","mutation-status","mutation-summary","mutation-findings","mutation-targets","mutation-steps","mutation-effects","mutation-recovery","mutation-delete-confirmation","mutation-delete-phrase","mutation-delete-input","mutation-result","mutation-cancel","mutation-retry","mutation-partial","mutation-confirm",
-  "edit-layer","edit-dialog","edit-close","edit-status","edit-title","edit-summary","edit-scope","edit-target-wrap","edit-target-label","edit-target","edit-confirm-details","edit-result","edit-cancel","edit-confirm",
+  "edit-layer","edit-dialog","edit-close","edit-status","edit-title","edit-summary","edit-scope","edit-agent","edit-agent-codex-option","edit-agent-codex-hint","edit-agent-kimi-code-option","edit-agent-kimi-code-hint","edit-target-wrap","edit-target-label","edit-target","edit-confirm-details","edit-result","edit-cancel","edit-confirm",
 ];
 const elements = Object.fromEntries(ids.map(id => [id, new Element(id)]));
 const radios = ["base", "family", "client"].map(value => { const item = new Element(); item.name = "edit-scope"; item.value = value; item.checked = value === "base"; return item; });
+const agentRadios = ["codex", "kimi-code"].map(value => { const item = new Element(); item.name = "edit-agent"; item.value = value; item.checked = value === "codex"; return item; });
 const views = ["skills", "agents", "imports"].map(name => { const item = new Element(`view-${name}`); item.dataset.view = name; return item; });
 const nav = ["skills", "agents", "imports"].map(name => { const item = new Element(); item.dataset.view = name; return item; });
 document = {
@@ -55,12 +56,14 @@ document = {
   querySelector(selector) {
     if (selector.startsWith("#")) return elements[selector.slice(1)];
     if (selector === 'input[name="edit-scope"]:checked') return radios.find(item => item.checked) || null;
+    if (selector === 'input[name="edit-agent"]:checked') return agentRadios.find(item => item.checked) || null;
     return null;
   },
   querySelectorAll(selector) {
     if (selector === ".view") return views;
     if (selector === ".nav-item[data-view]") return nav;
     if (selector === 'input[name="edit-scope"]') return radios;
+    if (selector === 'input[name="edit-agent"]') return agentRadios;
     if (selector === "[data-agent-action]" || selector === "[data-skill-name]") return [];
     return [];
   },
@@ -81,9 +84,10 @@ vm.runInContext(appSource + `
 globalThis.testApi={
   setState(value){state=value;detailSkill="alpha";render();},setToken(value){token=value;},
   setEditScope(value){pendingEdit.scope=value;pendingEdit.target=null;renderEditDialog();},
+  setEditAgent(value){pendingEdit.agent=value;renderEditDialog();},
   setEditTarget(value){pendingEdit.target=value;document.querySelector("#edit-target").value=value;},
-  openEditBegin,openEditApply,openEditAbort,confirmEditAction,cancelEditAction,inspectEditSession,handleEditKeydown,
-  snapshot(){return {pending:pendingEdit&&{kind:pendingEdit.kind,phase:pendingEdit.phase,scope:pendingEdit.scope,target:pendingEdit.target,result:pendingEdit.result},inspection:editInspections.get("session-1")||null};}
+  openEditBegin,openEditApply,openEditAbort,openEditDelete,confirmEditAction,cancelEditAction,inspectEditSession,launchEditAgent,handleEditKeydown,
+  snapshot(){return {pending:pendingEdit&&{kind:pendingEdit.kind,phase:pendingEdit.phase,scope:pendingEdit.scope,target:pendingEdit.target,agent:pendingEdit.agent,result:pendingEdit.result},inspection:editInspections.get("session-1")||null};}
 };`, context, {filename: appPath});
 const api = context.testApi;
 
@@ -91,7 +95,10 @@ function session() {
   return {session_id: "session-1", logical_skill: "alpha", status: "active", target_scope: {kind: "client", target: "kimi-code"}};
 }
 function baseState(active = null) {
-  return {initialized: true, preview: {action: "noop", issues: []}, status: {skills: [{name: "alpha", selected: true, changed_local: false, local_path: "/skills/alpha", agents: {}}]}, doctor: {agents: [], matrix: [], issues: []}, managed: {variants: {variants: []}, deployments: {skills: []}, sessions: {sessions: active ? [active] : []}}, import_candidates: []};
+  return {initialized: true, preview: {action: "noop", issues: []}, status: {skills: [{name: "alpha", selected: true, changed_local: false, local_path: "/skills/alpha", agents: {}}]}, doctor: {agents: [], matrix: [], issues: []}, managed: {variants: {variants: []}, deployments: {skills: []}, sessions: {sessions: active ? [active] : []}, edit_agents: {agents: [
+    {agent: "codex", display_name: "Codex", executable_name: "codex", executable_path: "/opt/homebrew/bin/codex", installed: true, available: true, reason: null},
+    {agent: "kimi-code", display_name: "Kimi Code", executable_name: "kimi", executable_path: "/Users/test/.kimi-code/bin/kimi", installed: true, available: true, reason: null},
+  ]}}, import_candidates: []};
 }
 function inspection({canApply = true, changed = true} = {}) {
   return {
@@ -106,7 +113,7 @@ function inspection({canApply = true, changed = true} = {}) {
 function response(data, {ok = true, status = 200} = {}) { return {ok, status, json: async () => data}; }
 
 function assertContract() {
-  for (const id of ["detail-edit-start", "edit-layer", "edit-dialog", "edit-scope", "edit-target", "edit-confirm", "edit-cancel"]) assert.match(htmlSource, new RegExp(`id="${id}"`));
+  for (const id of ["detail-edit-start", "edit-layer", "edit-dialog", "edit-scope", "edit-agent", "edit-target", "edit-confirm", "edit-cancel"]) assert.match(htmlSource, new RegExp(`id="${id}"`));
   assert.doesNotMatch(appSource, /on(?:click|change)="/, "dynamic markup must not contain inline handlers");
 }
 
@@ -115,18 +122,73 @@ async function testBeginHasScopeStepAndExplicitConfirmation() {
   fetchImpl = async (url, options) => {
     const body = JSON.parse(options.body); calls.push([url, body]);
     if (url === "/api/edit/begin") return response({result: {...session(), skill: "alpha", scope: "client", target: "kimi-code"}, state: baseState(session())});
+    if (url === "/api/edit/launch") return response({result: {session_id: "session-1", agent: "kimi-code", launched: true, instruction: "Kimi Code 已在受管工作区中打开。请在会话中说明要修改的内容。"}});
     if (url === "/api/edit/inspect") return response({inspection: inspection({canApply: false, changed: false})});
     throw new Error("unexpected URL");
   };
   assert.equal(api.openEditBegin(), true); assert.equal(api.snapshot().pending.phase, "scope"); assert.equal(calls.length, 0);
-  api.setEditScope("client"); api.setEditTarget("kimi-code");
+  assert.match(elements["edit-agent-codex-hint"].textContent, /已安装.*codex/);
+  api.setEditScope("client"); api.setEditTarget("kimi-code"); api.setEditAgent("kimi-code");
   await api.confirmEditAction(); assert.equal(api.snapshot().pending.phase, "confirm"); assert.equal(calls.length, 0);
-  assert.match(elements["edit-confirm-details"].innerHTML, /Kimi Code/);
+  assert.match(elements["edit-confirm-details"].innerHTML, /新终端中打开 <strong>Kimi Code/);
   await api.confirmEditAction();
-  assert.deepEqual(calls.map(item => item[0]), ["/api/edit/begin", "/api/edit/inspect"]);
-  assert.deepEqual(calls[0][1], {skill: "alpha", scope: "client", target: "kimi-code", views: ["summary", "inventory", "agents", "managed"]});
+  assert.deepEqual(calls.map(item => item[0]), ["/api/edit/begin", "/api/edit/launch", "/api/edit/inspect"]);
+  assert.deepEqual(calls[0][1], {skill: "alpha", scope: "client", actor: "kimi-code", target: "kimi-code", views: ["summary", "inventory", "agents", "managed"]});
+  assert.deepEqual(calls[1][1], {session_id: "session-1", agent: "kimi-code"});
   assert.equal(api.snapshot().pending.phase, "result");
+  assert.match(elements["edit-result"].textContent, /在会话中说明要修改的内容/);
   assert.match(elements["detail-sessions"].innerHTML, /\/data\/edit-sessions\/session-1\/workspace/);
+  assert.match(elements["detail-sessions"].innerHTML, /data-action="launch-edit-agent" data-agent="codex"/);
+  assert.match(elements["detail-sessions"].innerHTML, /data-agent="kimi-code"/);
+}
+
+async function testUnavailableAgentsAreDisabledBeforeConfirmation() {
+  api.cancelEditAction(); const onlyKimi = baseState();
+  onlyKimi.managed.edit_agents.agents[0] = {...onlyKimi.managed.edit_agents.agents[0], executable_path: null, installed: false, available: false, reason: "not-installed"};
+  api.setState(onlyKimi); api.setToken("token");
+  assert.equal(api.openEditBegin(), true);
+  assert.equal(api.snapshot().pending.agent, "kimi-code");
+  assert.equal(agentRadios[0].disabled, true);
+  assert.match(elements["edit-agent-codex-hint"].textContent, /未安装/);
+  assert.equal(agentRadios[1].disabled, false);
+  assert.match(elements["detail-sessions"].innerHTML, /^$/);
+
+  api.cancelEditAction(); const neither = baseState();
+  neither.managed.edit_agents.agents = neither.managed.edit_agents.agents.map(item=>({...item, executable_path: null, installed: false, available: false, reason: "not-installed"}));
+  api.setState(neither); api.openEditBegin();
+  assert.equal(api.snapshot().pending.agent, null);
+  assert.equal(elements["edit-confirm"].disabled, true);
+  assert.equal(await api.confirmEditAction(), false);
+  assert.equal(api.snapshot().pending.phase, "scope");
+}
+
+async function testLaunchFailureKeepsSessionAndRetryWorks() {
+  api.cancelEditAction(); api.setState(baseState()); api.setToken("token"); const calls = [];
+  fetchImpl = async (url, options) => {
+    calls.push([url, JSON.parse(options.body)]);
+    if (url === "/api/edit/begin") return response({result: {...session(), actor: "codex"}, state: baseState(session())});
+    if (url === "/api/edit/launch") return response({error: "Terminal denied"}, {ok: false, status: 400});
+    if (url === "/api/edit/inspect") return response({inspection: inspection({canApply: false, changed: false})});
+    throw new Error("unexpected URL");
+  };
+  api.openEditBegin(); await api.confirmEditAction(); await api.confirmEditAction();
+  assert.equal(api.snapshot().pending.phase, "result");
+  assert.equal(api.snapshot().pending.result.ok, false);
+  assert.match(elements["edit-result"].textContent, /工作区已创建，但未能打开 Codex/);
+  assert.match(elements["detail-sessions"].innerHTML, /在 Codex 中打开/);
+  const retry = await api.launchEditAgent("session-1", "codex", false);
+  assert.equal(retry.ok, false);
+  assert.equal(calls.filter(item => item[0] === "/api/edit/launch").length, 2);
+}
+
+async function testOldBackendHasActionableRestartMessage() {
+  api.cancelEditAction(); api.setState(baseState(session())); api.setToken("token");
+  fetchImpl = async url => url === "/api/edit/launch"
+    ? response({error: "unknown action"}, {ok: false, status: 404})
+    : response({inspection: inspection({canApply: false, changed: false})});
+  const result = await api.launchEditAgent("session-1", "codex", false);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /服务版本过旧，请重启 skill-sync web/);
 }
 
 async function testInspectionControlsApplyAndShowsConcreteImpact() {
@@ -161,6 +223,29 @@ async function testApplyAndAbortWaitForConfirmation() {
   await api.confirmEditAction(); assert.deepEqual(calls.map(item => item[0]), ["/api/edit/abort"]);
 }
 
+async function testDeleteWaitsForConfirmationAndBlocksRecoverySession() {
+  api.cancelEditAction(); api.setState(baseState(session())); api.setToken("token"); const calls = [];
+  fetchImpl = async (url, options) => {
+    calls.push([url, JSON.parse(options.body)]);
+    if (url === "/api/edit/delete") return response({result: {task_id: "task-1", session_id: "session-1", status: "queued"}}, {status: 202});
+    throw new Error("unexpected URL");
+  };
+  assert.equal(api.openEditDelete("session-1"), true);
+  assert.equal(api.snapshot().pending.kind, "delete");
+  assert.equal(calls.length, 0);
+  assert.match(elements["edit-confirm-details"].innerHTML, /永久丢弃工作区中的全部未应用改动/);
+  assert.equal(elements["edit-confirm"].textContent, "确认删除");
+  await api.confirmEditAction();
+  assert.deepEqual(calls.map(item => item[0]), ["/api/edit/delete"]);
+  assert.equal(api.snapshot().pending, null);
+  assert.doesNotMatch(elements["detail-sessions"].innerHTML, /session-1/);
+
+  api.cancelEditAction(); const recovery = {...session(), status: "needs-recovery"};
+  api.setState(baseState(recovery));
+  assert.equal(api.openEditDelete("session-1"), false);
+  assert.match(elements["detail-sessions"].innerHTML, /data-action="delete-edit"[^>]*disabled/);
+}
+
 async function testFreshnessFailureRemainsActionable() {
   api.cancelEditAction(); api.setState(baseState(session())); api.setToken("token"); const first = inspection(), changed = inspection({canApply: false});
   fetchImpl = async (url) => url === "/api/edit/inspect" ? response({inspection: first}) : response({error: "检查结果已变化", code: "edit_inspection_changed", details: {inspection: changed}}, {ok: false, status: 400});
@@ -174,8 +259,12 @@ async function testFreshnessFailureRemainsActionable() {
 (async () => {
   assertContract();
   await testBeginHasScopeStepAndExplicitConfirmation();
+  await testUnavailableAgentsAreDisabledBeforeConfirmation();
+  await testLaunchFailureKeepsSessionAndRetryWorks();
+  await testOldBackendHasActionableRestartMessage();
   await testInspectionControlsApplyAndShowsConcreteImpact();
   await testApplyAndAbortWaitForConfirmation();
+  await testDeleteWaitsForConfirmationAndBlocksRecoverySession();
   await testFreshnessFailureRemainsActionable();
   process.stdout.write("web ui edit session tests passed\n");
 })().catch(error => { console.error(error); process.exitCode = 1; });

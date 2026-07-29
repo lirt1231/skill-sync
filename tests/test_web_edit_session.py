@@ -1,11 +1,13 @@
 import json
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest import mock
 
+from skill_sync.errors import SkillSyncError
 from skill_sync.web import _edit_inspection, _handler_factory
 
 
@@ -42,6 +44,10 @@ class WebEditSessionTest(unittest.TestCase):
             method="POST",
         )
         with urlopen(request) as response:
+            return response.status, json.loads(response.read())
+
+    def get(self, path: str):
+        with urlopen(f"http://127.0.0.1:{self.server.server_port}{path}") as response:
             return response.status, json.loads(response.read())
 
     @staticmethod
@@ -90,13 +96,64 @@ class WebEditSessionTest(unittest.TestCase):
     def test_edit_posts_require_csrf_token(self):
         for path in (
             "/api/edit/begin",
+            "/api/edit/launch",
             "/api/edit/inspect",
             "/api/edit/apply",
             "/api/edit/abort",
+            "/api/edit/delete",
         ):
             with self.subTest(path=path), self.assertRaises(HTTPError) as raised:
                 self.post(path, {}, token=None)
             self.assertEqual(raised.exception.code, 403)
+
+    def test_launch_validates_request_and_returns_without_state_refresh(self):
+        result = {
+            "session_id": "session-1",
+            "skill": "alpha",
+            "agent": "codex",
+            "workspace_path": "/tmp/workspace",
+            "launched": True,
+            "terminal": "macos-terminal",
+        }
+        with mock.patch("skill_sync.web.core.launch_edit_agent", return_value=result) as launch, mock.patch(
+            "skill_sync.web._state"
+        ) as state:
+            status, body = self.post(
+                "/api/edit/launch", {"session_id": "session-1", "agent": "codex"}
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"result": result})
+        launch.assert_called_once_with(
+            "session-1", "codex", config_path="/tmp/config.json"
+        )
+        state.assert_not_called()
+
+    def test_launch_rejects_unknown_fields_before_core_and_does_not_abort_on_failure(self):
+        for request_body in (
+            {"session_id": "session-1"},
+            {"session_id": "session-1", "agent": "codex", "workspace_path": "/tmp/evil"},
+        ):
+            with self.subTest(body=request_body), mock.patch(
+                "skill_sync.web.core.launch_edit_agent"
+            ) as launch, self.assertRaises(HTTPError) as raised:
+                self.post("/api/edit/launch", request_body)
+            self.assertEqual(raised.exception.code, 400)
+            launch.assert_not_called()
+
+        with mock.patch(
+            "skill_sync.web.core.launch_edit_agent",
+            side_effect=SkillSyncError("Terminal denied", code="edit_agent_terminal_launch_failed"),
+        ), mock.patch("skill_sync.web.core.edit_abort") as abort, self.assertRaises(HTTPError) as raised:
+            self.post(
+                "/api/edit/launch", {"session_id": "session-1", "agent": "codex"}
+            )
+        self.assertEqual(raised.exception.code, 400)
+        self.assertEqual(
+            json.loads(raised.exception.read())["code"],
+            "edit_agent_terminal_launch_failed",
+        )
+        abort.assert_not_called()
 
     def test_begin_validates_request_and_refreshes_managed_state(self):
         result = {
@@ -257,6 +314,83 @@ class WebEditSessionTest(unittest.TestCase):
             )
         self.assertEqual(body["result"]["status"], "aborted")
         abort.assert_called_once_with("session-1", config_path="/tmp/config.json")
+
+    def test_delete_returns_before_background_work_and_exposes_task_status(self):
+        result = {
+            "session_id": "session-1",
+            "skill": "alpha",
+            "scope": "base",
+            "previous_status": "aborted",
+            "deleted": True,
+            "cleanup_pending": [],
+        }
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_delete(*args, **kwargs):
+            started.set()
+            self.assertTrue(release.wait(timeout=2))
+            return result
+
+        session = {"session_id": "session-1", "status": "aborted"}
+        with mock.patch(
+            "skill_sync.web.core.edit_session_status", return_value=session
+        ), mock.patch("skill_sync.web.core.edit_delete", side_effect=blocking_delete) as delete, mock.patch(
+            "skill_sync.web._state"
+        ) as state:
+            status, body = self.post(
+                "/api/edit/delete",
+                {"session_id": "session-1"},
+            )
+
+            self.assertEqual(status, 202)
+            self.assertIn(body["result"]["status"], {"queued", "running"})
+            task_id = body["result"]["task_id"]
+            self.assertTrue(started.wait(timeout=1))
+            state.assert_not_called()
+            release.set()
+            for _ in range(100):
+                _, task_body = self.get(f"/api/edit/delete-status?task_id={task_id}")
+                if task_body["result"]["status"] == "completed":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("background delete did not complete")
+
+        self.assertEqual(task_body["result"]["result"], result)
+        delete.assert_called_once_with("session-1", config_path="/tmp/config.json")
+
+        with mock.patch("skill_sync.web.core.edit_delete") as delete, self.assertRaises(
+            HTTPError
+        ) as raised:
+            self.post(
+                "/api/edit/delete",
+                {"session_id": "session-1", "unexpected": True},
+            )
+        self.assertEqual(raised.exception.code, 400)
+        delete.assert_not_called()
+
+    def test_delete_background_failure_remains_observable(self):
+        session = {"session_id": "session-fail", "status": "active"}
+        failure = SkillSyncError("workspace is unsafe", code="unsafe_edit_session")
+        with mock.patch(
+            "skill_sync.web.core.edit_session_status", return_value=session
+        ), mock.patch("skill_sync.web.core.edit_delete", side_effect=failure):
+            status, body = self.post(
+                "/api/edit/delete", {"session_id": "session-fail"}
+            )
+            self.assertEqual(status, 202)
+            task_id = body["result"]["task_id"]
+            for _ in range(100):
+                _, task_body = self.get(f"/api/edit/delete-status?task_id={task_id}")
+                if task_body["result"]["status"] == "failed":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("background delete failure was not reported")
+
+        self.assertEqual(task_body["result"]["code"], "unsafe_edit_session")
+        self.assertEqual(task_body["result"]["error"], "workspace is unsafe")
 
 
 if __name__ == "__main__":

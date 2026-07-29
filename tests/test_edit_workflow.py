@@ -8,7 +8,7 @@ from unittest import mock
 
 import skill_sync.edit_session as edit_session_module
 from skill_sync.config import empty_config, save_config
-from skill_sync.core import edit_abort, edit_begin, edit_session_paths
+from skill_sync.core import edit_abort, edit_begin, edit_delete, edit_session_paths
 from skill_sync.edit_session import EditSessionStatus, EditSessionStore
 from skill_sync.errors import SkillSyncError
 from skill_sync.hash import hash_skill_dir
@@ -159,6 +159,53 @@ class EditWorkflowTest(unittest.TestCase):
         self.assertEqual(source_after, source_before)
         metadata = EditSessionStore(self.root / "data").load(result["session_id"])
         self.assertEqual(metadata.status, EditSessionStatus.ABORTED)
+
+    def test_delete_removes_active_session_without_changing_canonical(self):
+        result = edit_begin("alpha", config_path=self.config_path)
+        workspace = Path(result["workspace_path"])
+        (workspace / "SKILL.md").write_text("# discard me\n", encoding="utf-8")
+        canonical_before = (self.skill / "SKILL.md").read_bytes()
+
+        deleted = edit_delete(result["session_id"], config_path=self.config_path)
+
+        self.assertTrue(deleted["deleted"])
+        self.assertEqual(deleted["previous_status"], "active")
+        self.assertEqual(deleted["cleanup_pending"], [])
+        self.assertFalse(workspace.parent.exists())
+        self.assertEqual((self.skill / "SKILL.md").read_bytes(), canonical_before)
+        self.assertEqual(EditSessionStore(self.root / "data").list_metadata(), [])
+        replacement = edit_begin("alpha", config_path=self.config_path)
+        self.assertEqual(replacement["status"], "active")
+
+    def test_delete_blocks_recovery_states_and_rejects_linked_content(self):
+        result = edit_begin("alpha", config_path=self.config_path)
+        store = EditSessionStore(self.root / "data")
+        store.transition(result["session_id"], EditSessionStatus.APPLYING)
+        with self.assertRaises(SkillSyncError) as blocked:
+            edit_delete(result["session_id"], config_path=self.config_path)
+        self.assertEqual(blocked.exception.code, "edit_delete_blocked")
+        self.assertTrue(Path(result["workspace_path"]).exists())
+
+        store.transition(result["session_id"], EditSessionStatus.NEEDS_RECOVERY)
+        with self.assertRaises(SkillSyncError) as recovery_blocked:
+            edit_delete(result["session_id"], config_path=self.config_path)
+        self.assertEqual(recovery_blocked.exception.code, "edit_delete_blocked")
+        store.transition(result["session_id"], EditSessionStatus.ACTIVE)
+        linked = Path(result["workspace_path"]) / "outside"
+        linked.symlink_to(self.skill, target_is_directory=True)
+        with self.assertRaises(SkillSyncError) as unsafe:
+            edit_delete(result["session_id"], config_path=self.config_path)
+        self.assertEqual(unsafe.exception.code, "unsafe_edit_session")
+        self.assertTrue(Path(result["workspace_path"]).exists())
+
+    def test_delete_removes_aborted_session_history(self):
+        result = edit_begin("alpha", config_path=self.config_path)
+        edit_abort(result["session_id"], config_path=self.config_path)
+
+        deleted = edit_delete(result["session_id"], config_path=self.config_path)
+
+        self.assertEqual(deleted["previous_status"], "aborted")
+        self.assertFalse(Path(result["workspace_path"]).parent.exists())
 
     def test_begin_rejects_source_change_during_snapshot_without_publishing_session(self):
         store = EditSessionStore(self.root / "data")

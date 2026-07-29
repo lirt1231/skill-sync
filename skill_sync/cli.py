@@ -295,6 +295,15 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_edit_abort,
         protocol_command="edit abort",
     )
+    edit_delete_parser = edit_subparsers.add_parser(
+        "delete", help="permanently delete a machine-local edit session"
+    )
+    edit_delete_parser.add_argument("session_id", help="edit session UUID")
+    edit_delete_parser.add_argument("--json", action="store_true", help="print JSON output")
+    edit_delete_parser.set_defaults(
+        handler=_handle_edit_delete,
+        protocol_command="edit delete",
+    )
     edit_diff_parser = edit_subparsers.add_parser(
         "diff", help="show authored-layer and resolved client changes"
     )
@@ -768,6 +777,18 @@ def _handle_edit_abort(args: argparse.Namespace) -> Any:
     if args.json:
         return result
     return f"Aborted edit session: {result['session_id']} ({result['skill']})"
+
+
+def _handle_edit_delete(args: argparse.Namespace) -> Any:
+    result = core.edit_delete(args.session_id, config_path=args.config)
+    if args.json:
+        return result
+    summary = f"Deleted edit session: {result['session_id']} ({result['skill']})"
+    if result.get("cleanup_pending"):
+        summary += "\nLocal cleanup remains pending: " + ", ".join(
+            result["cleanup_pending"]
+        )
+    return summary
 
 
 def _handle_edit_diff(args: argparse.Namespace) -> Any:

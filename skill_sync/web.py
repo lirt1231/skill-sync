@@ -27,6 +27,73 @@ STATE_VIEWS = (
 )
 
 
+class _EditDeleteTasks:
+    """Run local edit-session deletion without holding an HTTP response open."""
+
+    def __init__(self, config_path: str | None) -> None:
+        self.config_path = config_path
+        self._lock = threading.Lock()
+        self._tasks: dict[str, dict[str, Any]] = {}
+        self._by_session: dict[str, str] = {}
+
+    def enqueue(self, session_id: str) -> dict[str, Any]:
+        session = core.edit_session_status(session_id, config_path=self.config_path)
+        if session.get("status") in {"applying", "needs-recovery"}:
+            raise SkillSyncError(
+                f"edit session cannot be deleted while {session.get('status')}",
+                code="edit_delete_blocked",
+                details={"session_id": session_id, "status": session.get("status")},
+            )
+        with self._lock:
+            existing_id = self._by_session.get(session_id)
+            existing = self._tasks.get(existing_id or "")
+            if existing and existing["status"] in {"queued", "running"}:
+                return dict(existing)
+            task_id = secrets.token_urlsafe(18)
+            task = {
+                "task_id": task_id,
+                "session_id": session_id,
+                "status": "queued",
+                "result": None,
+                "error": None,
+                "code": None,
+            }
+            self._tasks[task_id] = task
+            self._by_session[session_id] = task_id
+        threading.Thread(
+            target=self._run,
+            args=(task_id, session_id),
+            name=f"skill-sync-edit-delete-{session_id[:8]}",
+            daemon=True,
+        ).start()
+        return dict(task)
+
+    def get(self, task_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            return dict(task) if task else None
+
+    def _run(self, task_id: str, session_id: str) -> None:
+        self._update(task_id, status="running")
+        try:
+            result = core.edit_delete(session_id, config_path=self.config_path)
+        except Exception as exc:  # Background failures must remain observable.
+            self._update(
+                task_id,
+                status="failed",
+                error=str(exc),
+                code=exc.code if isinstance(exc, SkillSyncError) else "edit_delete_failed",
+            )
+            return
+        self._update(task_id, status="completed", result=result)
+
+    def _update(self, task_id: str, **values: Any) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None:
+                task.update(values)
+
+
 def serve(host: str = "127.0.0.1", port: int = 8765, config_path: str | None = None, open_browser: bool = True) -> None:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise SkillSyncError("Web UI may only bind to a loopback address")
@@ -45,6 +112,8 @@ def serve(host: str = "127.0.0.1", port: int = 8765, config_path: str | None = N
 
 
 def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPRequestHandler]:
+    edit_delete_tasks = _EditDeleteTasks(config_path)
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -62,6 +131,17 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                 return
             if path == "/api/token":
                 self._json({"token": token})
+                return
+            if path == "/api/edit/delete-status":
+                task_ids = parse_qs(parsed.query).get("task_id", [])
+                if len(task_ids) != 1 or not task_ids[0]:
+                    self._json({"error": "task_id is required"}, HTTPStatus.BAD_REQUEST)
+                    return
+                task = edit_delete_tasks.get(task_ids[0])
+                if task is None:
+                    self._json({"error": "delete task not found"}, HTTPStatus.NOT_FOUND)
+                    return
+                self._json({"result": task})
                 return
             filename = "index.html" if path == "/" else path.lstrip("/")
             if filename not in {"index.html", "app.js", "style.css", "remixicon.css", "remixicon.woff2"}:
@@ -105,6 +185,33 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                     )
                     self._json(
                         {"inspection": _edit_inspection(request["session_id"], config_path)}
+                    )
+                    return
+                if path == "/api/edit/launch":
+                    request = _edit_request(
+                        body,
+                        allowed={"session_id", "agent"},
+                        required={"session_id", "agent"},
+                    )
+                    self._json(
+                        {
+                            "result": core.launch_edit_agent(
+                                request["session_id"],
+                                request["agent"],
+                                config_path=config_path,
+                            )
+                        }
+                    )
+                    return
+                if path == "/api/edit/delete":
+                    request = _edit_request(
+                        body,
+                        allowed={"session_id"},
+                        required={"session_id"},
+                    )
+                    self._json(
+                        {"result": edit_delete_tasks.enqueue(request["session_id"])},
+                        HTTPStatus.ACCEPTED,
                     )
                     return
                 views = _body_views(body.get("views"))
@@ -208,7 +315,11 @@ def _handler_factory(config_path: str | None, token: str) -> type[BaseHTTPReques
                         result = core.disable_agent_sync(body.get("agent", ""), config_path=config_path)
                 elif path == "/api/backup":
                     result = core.backup_global_skill(body.get("skill", ""), config_path=config_path)
-                elif path in {"/api/edit/begin", "/api/edit/apply", "/api/edit/abort"}:
+                elif path in {
+                    "/api/edit/begin",
+                    "/api/edit/apply",
+                    "/api/edit/abort",
+                }:
                     pass
                 else:
                     self._json({"error": "unknown action"}, HTTPStatus.NOT_FOUND)
@@ -474,6 +585,7 @@ def _state(
                     "recovery_required": False,
                 },
                 "sessions": {"sessions": []},
+                "edit_agents": core.edit_agent_capabilities(),
             }
         if "import-candidates" in requested:
             result["import_candidates"] = []
@@ -504,6 +616,7 @@ def _managed_state(config_path: str | None) -> dict[str, Any]:
         "variants": variant_source.list_variants(config_path=config_path),
         "deployments": core.deploy_status(config_path=config_path),
         "sessions": core.list_edit_sessions(config_path=config_path),
+        "edit_agents": core.edit_agent_capabilities(),
     }
 
 

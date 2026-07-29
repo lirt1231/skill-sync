@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from skill_sync import git, portable_sync, variant_source
+from skill_sync import agent_session, git, portable_sync, variant_source
 from skill_sync.agents import (
     AGENT_FAMILIES,
     aggregate_agent_targets,
@@ -67,6 +67,7 @@ from skill_sync.edit_session import (
     EditSessionScopeKind,
     EditSessionStatus,
     EditSessionStore,
+    InvalidEditSessionTransition,
 )
 from skill_sync.edit_validation import (
     EditTreeInspectionError,
@@ -184,6 +185,34 @@ def edit_session_paths(
         "baseline_path": str(paths.baseline.absolute()),
         "workspace_path": str(paths.workspace.absolute()),
     }
+
+
+def launch_edit_agent(
+    session_id: str,
+    agent: str,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Launch an interactive Agent using only paths from the trusted session store."""
+
+    agent_session.validate_agent(agent)
+    session = edit_session_status(session_id, config_path=config_path)
+    paths = edit_session_paths(session_id, config_path=config_path)
+    target_scope = session.get("target_scope") or {"kind": "base", "target": None}
+    return agent_session.launch_agent(
+        session_id=session_id,
+        skill=session["logical_skill"],
+        status=session["status"],
+        workspace_path=paths["workspace_path"],
+        agent=agent,
+        scope=target_scope.get("kind", "base"),
+        target=target_scope.get("target"),
+    )
+
+
+def edit_agent_capabilities() -> dict[str, Any]:
+    """Return local CLI and Terminal availability for managed Web edits."""
+
+    return agent_session.detect_agent_capabilities()
 
 
 def is_initialized(config_path: str | Path | None = None) -> bool:
@@ -1318,6 +1347,57 @@ def edit_abort(
             code="edit_abort_failed",
             details={"session_id": session_id},
         ) from exc
+
+
+def edit_delete(
+    session_id: str,
+    *,
+    config_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Permanently remove one machine-local edit session and its local copies."""
+
+    config = _load_local_config(config_path)
+    store = EditSessionStore(_data_root(config))
+    try:
+        metadata, cleanup_pending = store.delete(session_id)
+    except FileNotFoundError as exc:
+        raise SkillSyncError(
+            f"edit session does not exist: {session_id}",
+            code="edit_session_not_found",
+            details={"session_id": session_id},
+        ) from exc
+    except InvalidEditSessionTransition as exc:
+        raise SkillSyncError(
+            str(exc),
+            code="edit_delete_blocked",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+    except EditSessionMetadataError as exc:
+        raise SkillSyncError(
+            f"could not safely delete edit session: {exc}",
+            code="unsafe_edit_session",
+            exit_code=EXIT_SAFETY,
+            details={"session_id": session_id},
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise SkillSyncError(
+            f"could not delete edit session: {exc}",
+            code="edit_delete_failed",
+            details={"session_id": session_id},
+        ) from exc
+
+    result: dict[str, Any] = {
+        "session_id": metadata.session_id,
+        "skill": metadata.logical_skill,
+        "scope": metadata.target_scope.kind.value,
+        "previous_status": metadata.status.value,
+        "deleted": True,
+        "cleanup_pending": [str(cleanup_pending)] if cleanup_pending else [],
+    }
+    if metadata.target_scope.target is not None:
+        result["target"] = metadata.target_scope.target
+    return result
 
 
 def edit_diff(

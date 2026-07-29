@@ -439,6 +439,28 @@ class CliTest(unittest.TestCase):
         abort.assert_called_once_with(session_id, config_path="/tmp/config.json")
         self.assertIn(f"Aborted edit session: {session_id}", stdout)
 
+    def test_edit_delete_dispatches_and_uses_shared_json_envelope(self):
+        session_id = "4f92500f-832f-40f7-a417-c474f0425ce0"
+        result = {
+            "session_id": session_id,
+            "skill": "alpha",
+            "scope": "base",
+            "previous_status": "aborted",
+            "deleted": True,
+            "cleanup_pending": [],
+        }
+        with mock.patch.object(cli.core, "edit_delete", return_value=result) as delete:
+            code, stdout, stderr = run_cli(
+                ["--config", "/tmp/config.json", "edit", "delete", session_id, "--json"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        delete.assert_called_once_with(session_id, config_path="/tmp/config.json")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["command"], "edit delete")
+        self.assertEqual(payload["result"], result)
+
     def test_edit_begin_json_conflict_uses_full_command_name_and_exit_three(self):
         error = SkillSyncError(
             "already active",

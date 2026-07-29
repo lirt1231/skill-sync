@@ -209,7 +209,8 @@ function testManagedBadgesAndConcreteClientDetail() {
   assert.match(elements["skill-list"].innerHTML, /1 会话/);
   assert.match(elements["skill-list"].innerHTML, /部署异常/);
   assert.match(elements["skill-list"].innerHTML, /data-action="repair-skill"/);
-  assert.equal(elements["detail-hash"].textContent.startsWith("sha256:"), true);
+  assert.equal(elements["detail-hash"].textContent, "alphaaaaaaaa", "drawer shows the shortened content hash");
+  assert.equal(elements["detail-hash"].dataset.fullValue.startsWith("sha256:"), true, "full hash stays available for copy-to-clipboard");
   assert.match(elements["detail-variants"].innerHTML, /kimi-code/);
   assert.match(elements["detail-variants"].innerHTML, /class="danger">冲突/);
   assert.match(elements["detail-sessions"].innerHTML, /session-1/);
