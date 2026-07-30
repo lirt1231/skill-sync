@@ -30,7 +30,7 @@ deployments, backups, and local machine paths are not stored in this project.
 
 | Capability | macOS | Linux | Windows |
 | --- | --- | --- | --- |
-| CLI synchronization and local Web UI | Verified | Blocking CI | Experimental; non-blocking CI has known failures |
+| CLI synchronization and local Web UI | Verified in CI | Not currently in CI | Experimental; not currently in CI |
 | Agent links | Symbolic links | Symbolic links | Symbolic link or directory junction |
 | Open Codex/Kimi Code edit session | Supported | Not yet supported | Not yet supported |
 
@@ -38,9 +38,9 @@ Detected Skill targets are Codex, WorkBuddy, Kimi Code, and Claude Code. Agent
 installation paths vary by client; run `skill-sync doctor --json` before the
 first mutation.
 
-Windows support remains experimental. Its CI matrix is intentionally visible
-but non-blocking while path identity, junction, and transactional recovery
-behavior are brought to parity with macOS and Linux.
+CI currently runs on macOS only. Linux and Windows validation will return after
+their filesystem identity, link, and transactional recovery behavior is
+brought to parity with macOS.
 
 ## Requirements
 
