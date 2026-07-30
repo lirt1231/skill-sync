@@ -26,6 +26,25 @@ The public `skill-sync` tool repository and your private Skill data repository
 are different repositories. Skill content, credentials, edit sessions,
 deployments, backups, and local machine paths are not stored in this project.
 
+## Interface preview
+
+See synchronization state, client coverage, Variants, and active edit sessions
+from one local dashboard. Every network or filesystem mutation still requires
+an explicit preview and confirmation.
+
+![Skill library showing synchronized Skills and Agent coverage](docs/images/skill-library.png)
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/managed-edit.png" alt="Managed Skill edit session with diff, validation, and client impact"></td>
+    <td width="50%"><img src="docs/images/agent-connections.png" alt="Codex, WorkBuddy, Kimi Code, and Claude Code connection status"></td>
+  </tr>
+  <tr>
+    <td><strong>Managed editing</strong><br>Review workspace changes, validation, and affected clients before applying.</td>
+    <td><strong>Agent connections</strong><br>Expose the same selected Skills to Codex, WorkBuddy, Kimi Code, and Claude Code.</td>
+  </tr>
+</table>
+
 ## Platform status
 
 | Capability | macOS | Linux | Windows |

@@ -10,6 +10,9 @@ class ReleaseReadinessTest(unittest.TestCase):
         for relative in (
             "README.md",
             "LICENSE",
+            "docs/images/agent-connections.png",
+            "docs/images/managed-edit.png",
+            "docs/images/skill-library.png",
             "skills/skill-sync-manager/SKILL.md",
             "skills/skill-sync-manager/agents/openai.yaml",
             "SECURITY.md",
@@ -68,6 +71,16 @@ class ReleaseReadinessTest(unittest.TestCase):
         self.assertIn("Use $skill-installer", readme)
         self.assertIn("Use $skill-sync-manager", readme)
         self.assertIn("skill-sync import --agent codex skill-sync-manager", readme)
+
+    def test_readme_product_screenshots_are_publishable_pngs(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for relative in (
+            "docs/images/skill-library.png",
+            "docs/images/managed-edit.png",
+            "docs/images/agent-connections.png",
+        ):
+            self.assertIn(relative, readme)
+            self.assertTrue((ROOT / relative).read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
 
     def test_public_files_do_not_contain_local_home_paths(self):
         for relative in (
